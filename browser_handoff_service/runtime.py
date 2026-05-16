@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from .models import AgentCommandRequest
+from .security import redact_url
+
+
+class RuntimeUnavailable(RuntimeError):
+    pass
+
+
+class BrowserRuntime(Protocol):
+    worker_id: str
+    closed: bool
+    remote_url: str | None
+
+    async def start(self) -> None: ...
+    async def command(self, request: AgentCommandRequest) -> dict[str, Any]: ...
+    async def close(self) -> None: ...
+
+
+class FakeBrowserWorker:
+    def __init__(self, worker_id: str) -> None:
+        self.worker_id = worker_id
+        self.closed = False
+        self.remote_url: str | None = None
+        self.url: str | None = None
+        self.title = "Blank"
+        self.actions: list[dict[str, Any]] = []
+
+    async def start(self) -> None:
+        return None
+
+    async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
+        if self.closed:
+            raise RuntimeError("worker is closed")
+        if request.type == "navigate":
+            url = str(request.args["url"])
+            self.url = url
+            self.title = f"Fixture page at {redact_url(url)[1] or url}"
+            return {"url": redact_url(url)[0], "title": self.title}
+        if request.type in {"click", "type_text", "select", "press_key"}:
+            self.actions.append({"type": request.type, "args": request.args})
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
+        if request.type == "snapshot":
+            return {"nodes": [{"role": "document", "name": self.title}]}
+        if request.type == "screenshot":
+            return {"mime_type": "image/png", "redacted": True}
+        if request.type == "current_page":
+            return {"url": redact_url(self.url)[0] if self.url else None, "title": self.title}
+        if request.type == "close_page":
+            self.url = None
+            self.title = "Blank"
+            return {"closed": True, "url": None, "title": self.title}
+        raise ValueError(f"unsupported command {request.type}")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class PlaywrightBrowserWorker:
+    def __init__(self, worker_id: str, *, headed: bool = False) -> None:
+        self.worker_id = worker_id
+        self.closed = False
+        self.headed = headed
+        self._playwright = None
+        self._browser = None
+        self._page = None
+        self.remote_url: str | None = None
+        self._display: LocalNovncDisplay | None = None
+
+    async def start(self) -> None:
+        try:
+            from playwright.async_api import async_playwright
+
+            env: dict[str, str | float | bool] = dict(os.environ)
+            if self.headed:
+                self._display = LocalNovncDisplay(self.worker_id)
+                self.remote_url = self._display.start()
+                env["DISPLAY"] = self._display.display
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=not self.headed,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                env=env,
+            )
+            self._page = await self._browser.new_page()
+        except Exception as exc:
+            await self.close()
+            raise RuntimeUnavailable(str(exc)) from exc
+
+    async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
+        if self.closed or self._page is None:
+            raise RuntimeError("worker is closed")
+        page = self._page
+        if request.type == "navigate":
+            url = str(request.args["url"])
+            await page.goto(url, wait_until="domcontentloaded")
+            title = await page.title()
+            return {"url": redact_url(page.url)[0], "title": title}
+        if request.type == "click":
+            await page.locator(str(request.args["selector"])).click()
+            return await self._current_page_result({"accepted": True})
+        if request.type == "type_text":
+            await page.locator(str(request.args["selector"])).fill(str(request.args["text"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "select":
+            await page.locator(str(request.args["selector"])).select_option(str(request.args["value"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "press_key":
+            await page.keyboard.press(str(request.args["key"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "snapshot":
+            title = await page.title()
+            body = await page.locator("body").text_content(timeout=1000) or ""
+            return {"nodes": [{"role": "document", "name": title, "text": body[:500]}]}
+        if request.type == "screenshot":
+            await page.screenshot(full_page=False)
+            return {"mime_type": "image/png", "redacted": True}
+        if request.type == "current_page":
+            return {"url": redact_url(page.url)[0], "title": await page.title()}
+        if request.type == "close_page":
+            await page.goto("about:blank")
+            return {"closed": True, "url": None, "title": "Blank"}
+        raise ValueError(f"unsupported command {request.type}")
+
+    async def _current_page_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        if self._page is None:
+            raise RuntimeError("worker is closed")
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            await self._page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except PlaywrightTimeoutError:
+            pass
+        result["url"] = redact_url(self._page.url)[0]
+        result["title"] = await self._page.title()
+        return result
+
+    async def close(self) -> None:
+        self.closed = True
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
+        if self._display is not None:
+            self._display.close()
+            self._display = None
+
+
+@dataclass(frozen=True)
+class RemoteDisplayStatus:
+    available: bool
+    reason: str | None = None
+    novnc_path: str | None = None
+    novnc_web_path: str | None = None
+    websockify_path: str | None = None
+    xvfb_path: str | None = None
+    x11vnc_path: str | None = None
+
+
+class LocalNovncDisplay:
+    def __init__(self, worker_id: str) -> None:
+        self.worker_id = worker_id
+        self.display = ""
+        self.novnc_url: str | None = None
+        self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._procs: list[subprocess.Popen] = []
+
+    def start(self) -> str:
+        status = remote_display_status()
+        if not status.available:
+            raise RuntimeUnavailable(status.reason or "remote display stack unavailable")
+        self._tmpdir = tempfile.TemporaryDirectory(prefix=f"{self.worker_id}_")
+        display_number = _free_display_number()
+        vnc_port = _free_tcp_port()
+        novnc_port = _free_tcp_port()
+        self.display = f":{display_number}"
+        xvfb = subprocess.Popen(
+            [status.xvfb_path or "Xvfb", self.display, "-screen", "0", "1280x720x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(xvfb)
+        x11vnc = subprocess.Popen(
+            [
+                status.x11vnc_path or "x11vnc",
+                "-display",
+                self.display,
+                "-localhost",
+                "-nopw",
+                "-forever",
+                "-shared",
+                "-rfbport",
+                str(vnc_port),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(x11vnc)
+        if not status.novnc_web_path or not status.websockify_path:
+            raise RuntimeUnavailable("noVNC web assets or websockify are unavailable")
+        novnc_cmd = [
+            status.websockify_path,
+            "--web",
+            status.novnc_web_path,
+            f"127.0.0.1:{novnc_port}",
+            f"127.0.0.1:{vnc_port}",
+        ]
+        novnc = subprocess.Popen(novnc_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._procs.append(novnc)
+        self.novnc_url = f"http://127.0.0.1:{novnc_port}/vnc.html?autoconnect=1&resize=remote"
+        return self.novnc_url
+
+    def close(self) -> None:
+        for proc in reversed(self._procs):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self._procs.clear()
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+
+def remote_display_status() -> RemoteDisplayStatus:
+    novnc_path = shutil.which("novnc_proxy") or _find_file("novnc_proxy")
+    novnc_web_path = _find_novnc_web_path(novnc_path)
+    websockify_path = shutil.which("websockify")
+    xvfb_path = shutil.which("Xvfb")
+    x11vnc_path = shutil.which("x11vnc")
+    missing = [
+        name
+        for name, path in {
+            "novnc_proxy": novnc_path,
+            "noVNC web assets": novnc_web_path,
+            "websockify": websockify_path,
+            "Xvfb": xvfb_path,
+            "x11vnc": x11vnc_path,
+        }.items()
+        if not path
+    ]
+    if missing:
+        return RemoteDisplayStatus(
+            available=False,
+            reason=f"missing remote display binaries: {', '.join(missing)}",
+            novnc_path=novnc_path,
+            novnc_web_path=novnc_web_path,
+            websockify_path=websockify_path,
+            xvfb_path=xvfb_path,
+            x11vnc_path=x11vnc_path,
+        )
+    return RemoteDisplayStatus(
+        available=True,
+        novnc_path=novnc_path,
+        novnc_web_path=novnc_web_path,
+        websockify_path=websockify_path,
+        xvfb_path=xvfb_path,
+        x11vnc_path=x11vnc_path,
+    )
+
+
+def make_worker(worker_id: str) -> BrowserRuntime:
+    runtime = os.environ.get("BROWSER_RUNTIME", "playwright").lower()
+    if runtime == "fake":
+        return FakeBrowserWorker(worker_id)
+    return PlaywrightBrowserWorker(worker_id, headed=os.environ.get("BROWSER_HEADED") == "1")
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _free_display_number() -> int:
+    for number in range(90, 200):
+        if not os.path.exists(f"/tmp/.X11-unix/X{number}"):
+            return number
+    raise RuntimeUnavailable("no free X display number found")
+
+
+def _find_file(name: str) -> str | None:
+    for root in ("/usr/share", "/usr/local/share", "/opt", "/workspace"):
+        try:
+            result = subprocess.run(
+                ["find", root, "-name", name, "-type", "f", "-print", "-quit"],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            continue
+        candidate = result.stdout.strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _find_novnc_web_path(novnc_path: str | None) -> str | None:
+    if novnc_path is None:
+        return None
+    from pathlib import Path
+
+    script = Path(novnc_path).resolve()
+    candidates = [
+        script.parent,
+        script.parent.parent,
+        script.parent.parent / "share" / "novnc",
+        Path("/usr/share/novnc"),
+        Path("/usr/local/share/novnc"),
+    ]
+    for candidate in candidates:
+        if (candidate / "vnc.html").exists():
+            return str(candidate)
+    return None

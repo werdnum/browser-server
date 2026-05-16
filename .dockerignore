@@ -1,0 +1,12 @@
+.apt/
+.browser-libs*/
+.git/
+.local-sysroot/
+.playwright-browser-cache/
+.pytest_cache/
+.venv/
+__pycache__/
+node_modules/
+package-lock.json
+playwright-report/
+test-results/

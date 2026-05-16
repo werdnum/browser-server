@@ -1,0 +1,1 @@
+"""Browser handoff service MVP."""

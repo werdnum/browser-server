@@ -1,0 +1,12 @@
+{
+  "name": "browser-handoff-service-ui-tests",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test:user": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}
+

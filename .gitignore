@@ -1,0 +1,12 @@
+.venv/
+node_modules/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+test-results/
+playwright-report/
+package-lock.json
+.apt/
+.local-sysroot/
+.browser-libs*/
+.browser-libs
