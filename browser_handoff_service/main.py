@@ -345,7 +345,7 @@ def novnc_proxy_url(session_id: str, public_base_url: str, remote_url: str) -> s
     query = {
         "autoconnect": remote_query.get("autoconnect", "1"),
         "resize": remote_query.get("resize", "remote"),
-        "path": f"v1/sessions/{session_id}/novnc/websockify",
+        "path": f"/v1/sessions/{session_id}/novnc/websockify",
     }
     public = urlsplit(public_base_url)
     path = f"/v1/sessions/{session_id}/novnc/vnc.html"

@@ -208,5 +208,5 @@ def test_remote_url_uses_authenticated_service_proxy():
 
     assert url == (
         "https://handoff.example/v1/sessions/bs_example/novnc/vnc.html?"
-        "autoconnect=1&resize=remote&path=v1%2Fsessions%2Fbs_example%2Fnovnc%2Fwebsockify"
+        "autoconnect=1&resize=remote&path=%2Fv1%2Fsessions%2Fbs_example%2Fnovnc%2Fwebsockify"
     )
