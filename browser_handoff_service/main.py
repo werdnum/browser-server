@@ -117,6 +117,7 @@ def map_errors(exc: Exception) -> HTTPException:
 
 
 @app.get("/health")
+@app.get("/healthz")
 async def health():
     return {"ok": True, "remote_display": remote_display_status().__dict__}
 
