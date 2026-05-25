@@ -5,7 +5,6 @@ __pycache__/
 .pytest_cache/
 test-results/
 playwright-report/
-package-lock.json
 .apt/
 .local-sysroot/
 .browser-libs*/
