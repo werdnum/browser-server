@@ -53,7 +53,7 @@ jobs:
       - name: Run pytest
         run: python -m pytest -q
       - name: Install Node dependencies
-        run: npm install
+        run: npm ci
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
       - name: Run Playwright tests
