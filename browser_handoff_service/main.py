@@ -188,7 +188,7 @@ def map_errors(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
 async def landing_page():
     return LANDING_PAGE_TEMPLATE.render()
 

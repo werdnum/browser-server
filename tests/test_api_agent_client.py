@@ -21,8 +21,12 @@ def clear_registry():
 @pytest.mark.asyncio
 async def test_landing_page():
     transport = ASGITransport(app=app)
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.get("/")
+        unauthorized = await client.get("/")
+        assert unauthorized.status_code == 401
+
+        response = await client.get("/", headers=headers)
         assert response.status_code == 200
         assert "Browser Handoff Service" in response.text
         assert "View Sessions" in response.text
