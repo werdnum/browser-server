@@ -33,19 +33,91 @@ templates = Environment(
     undefined=StrictUndefined,
 )
 
+LANDING_PAGE_TEMPLATE = templates.from_string(
+    """<!doctype html>
+<html>
+<head>
+  <title>Browser Handoff Service</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 820px; line-height: 1.5; }
+    nav { margin-bottom: 2rem; }
+    nav a { margin-right: 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Browser Handoff Service</h1>
+    <p>This service manages browser sessions and hands them off between agents and humans safely.</p>
+    <nav>
+      <a href="/sessions">View Sessions</a>
+      <a href="/docs">API Docs</a>
+      <a href="/health">Health Status</a>
+    </nav>
+  </main>
+</body>
+</html>"""
+)
+
+SESSION_LIST_TEMPLATE = templates.from_string(
+    """<!doctype html>
+<html>
+<head>
+  <title>Sessions - Browser Handoff Service</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 820px; line-height: 1.5; }
+    nav { margin-bottom: 2rem; font-size: 0.9em; }
+    nav a { text-decoration: none; color: #0066cc; }
+    nav a:hover { text-decoration: underline; }
+    ul { list-style: none; padding: 0; }
+    li { padding: 0.5rem 0; border-bottom: 1px solid #eee; }
+    li a { font-weight: bold; text-decoration: none; color: #0066cc; margin-right: 1rem; }
+    li a:hover { text-decoration: underline; }
+    .empty { color: #666; font-style: italic; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">← Home</a>
+  </nav>
+  <main>
+    <h1>Sessions</h1>
+    {% if sessions %}
+      <ul>
+        {% for s in sessions %}
+          <li>
+            <a href="/sessions/{{ s.session_id }}">{{ s.session_id }}</a>
+            <span class="state">{{ s.state }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty">No active sessions found.</p>
+    {% endif %}
+  </main>
+</body>
+</html>"""
+)
+
 SESSION_DETAIL_TEMPLATE = templates.from_string(
     """<!doctype html>
 <html>
 <head>
   <title>Browser handoff {{ session.session_id }}</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 820px; }
-    button, input { font: inherit; padding: .55rem .75rem; margin: .25rem; }
-    .viewport { height: 320px; border: 1px solid #bbb; display: grid; place-items: center; margin-top: 1rem; }
-    .status { padding: .75rem; background: #f4f4f4; }
+    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 820px; line-height: 1.5; color: #333; }
+    nav { margin-bottom: 2rem; font-size: 0.9em; }
+    nav a { text-decoration: none; color: #0066cc; }
+    nav a:hover { text-decoration: underline; }
+    button, input { font: inherit; padding: .55rem .75rem; margin: .25rem; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    .viewport { height: 480px; border: 1px solid #bbb; border-radius: 8px; display: grid; place-items: center; margin-top: 1.5rem; background: #fafafa; }
+    .status { padding: .75rem; background: #eef2f5; border-radius: 4px; border: 1px solid #d0d7de; }
   </style>
 </head>
 <body data-session-id="{{ session.session_id }}" data-token="{{ token }}">
+  <nav>
+    <a href="/">Home</a> &gt; <a href="/sessions">Sessions</a> &gt; {{ session.session_id }}
+  </nav>
   <main>
     <h1>Browser handoff</h1>
     <p class="status">State: <strong id="state">{{ session.state }}</strong></p>
@@ -114,6 +186,11 @@ def map_errors(exc: Exception) -> HTTPException:
     if isinstance(exc, (ConflictError, TransitionError)):
         return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def landing_page():
+    return LANDING_PAGE_TEMPLATE.render()
 
 
 @app.get("/health")
@@ -320,10 +397,7 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
 
 @app.get("/sessions", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
 async def session_list():
-    rows = "\n".join(
-        f"<li><a href='/sessions/{s.session_id}'>{s.session_id}</a> {s.state}</li>" for s in registry.list_sessions()
-    )
-    return f"<!doctype html><title>Sessions</title><main><h1>Sessions</h1><ul>{rows}</ul></main>"
+    return SESSION_LIST_TEMPLATE.render(sessions=registry.list_sessions())
 
 
 @app.get("/sessions/{session_id}", response_class=HTMLResponse)
