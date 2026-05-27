@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jwt.types import Options
+
 import os
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -202,7 +207,7 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
         try:
             signing_key = jwks_client.get_signing_key_from_jwt(token)
             audience = os.environ.get(OIDC_AUDIENCE_ENV)
-            options = {"verify_aud": False} if not audience else {}
+            options: Options | None = {"verify_aud": False} if not audience else None
 
             jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options)
             return  # OIDC valid
