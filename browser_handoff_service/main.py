@@ -174,6 +174,7 @@ app = FastAPI(title="Browser Handoff Service", lifespan=lifespan)
 
 OIDC_JWKS_URL_ENV = "BROWSER_HANDOFF_OIDC_JWKS_URL"
 OIDC_AUDIENCE_ENV = "BROWSER_HANDOFF_OIDC_AUDIENCE"
+OIDC_ISSUER_ENV = "BROWSER_HANDOFF_OIDC_ISSUER"
 
 _jwks_client = None
 
@@ -194,10 +195,16 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
 
     jwks_client = _get_jwks_client()
     if jwks_client:
+        issuer = os.environ.get(OIDC_ISSUER_ENV)
+        if not issuer:
+            raise HTTPException(status_code=503, detail="OIDC issuer is not configured")
+
         try:
             signing_key = jwks_client.get_signing_key_from_jwt(token)
             audience = os.environ.get(OIDC_AUDIENCE_ENV)
-            jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=audience)
+            options = {"verify_aud": False} if not audience else {}
+
+            jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options)
             return  # OIDC valid
         except jwt.PyJWTError as e:
             logging.debug(f"OIDC token invalid: {e}")

@@ -55,6 +55,7 @@ def test_require_service_auth_static_token_unconfigured(monkeypatch):
 def test_require_service_auth_oidc_success(monkeypatch):
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
     monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
 
     class MockSigningKey:
@@ -64,7 +65,7 @@ def test_require_service_auth_oidc_success(monkeypatch):
         def get_signing_key_from_jwt(self, token):
             return MockSigningKey()
 
-    def mock_decode(token, key, algorithms, audience):
+    def mock_decode(token, key, algorithms, audience, issuer, options):
         if token == "valid-oidc-token":
             return {"sub": "user123"}
         raise jwt.InvalidTokenError("Invalid token")
@@ -79,6 +80,7 @@ def test_require_service_auth_oidc_success(monkeypatch):
 def test_require_service_auth_oidc_failure_fallback_success(monkeypatch):
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
     monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
 
     class MockSigningKey:
@@ -88,7 +90,7 @@ def test_require_service_auth_oidc_failure_fallback_success(monkeypatch):
         def get_signing_key_from_jwt(self, token):
             return MockSigningKey()
 
-    def mock_decode(token, key, algorithms, audience):
+    def mock_decode(token, key, algorithms, audience, issuer, options):
         raise jwt.InvalidTokenError("Invalid token")
 
     monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
@@ -101,6 +103,7 @@ def test_require_service_auth_oidc_failure_fallback_success(monkeypatch):
 def test_require_service_auth_oidc_failure_fallback_failure(monkeypatch):
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
     monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
 
     class MockSigningKey:
@@ -110,7 +113,7 @@ def test_require_service_auth_oidc_failure_fallback_failure(monkeypatch):
         def get_signing_key_from_jwt(self, token):
             return MockSigningKey()
 
-    def mock_decode(token, key, algorithms, audience):
+    def mock_decode(token, key, algorithms, audience, issuer, options):
         raise jwt.InvalidTokenError("Invalid token")
 
     monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
@@ -120,3 +123,43 @@ def test_require_service_auth_oidc_failure_fallback_failure(monkeypatch):
         require_service_auth("Bearer invalid-token")
     assert exc.value.status_code == 401
     assert exc.value.detail == "invalid service token"
+
+
+def test_require_service_auth_oidc_missing_issuer(monkeypatch):
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
+    monkeypatch.delenv("BROWSER_HANDOFF_OIDC_ISSUER", raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        require_service_auth("Bearer valid-oidc-token")
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "OIDC issuer is not configured"
+
+
+def test_require_service_auth_oidc_success_no_audience(monkeypatch):
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
+    monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
+    monkeypatch.delenv("BROWSER_HANDOFF_OIDC_AUDIENCE", raising=False)
+
+    class MockSigningKey:
+        key = "secret_key"
+
+    class MockJWKClient:
+        def get_signing_key_from_jwt(self, token):
+            return MockSigningKey()
+
+    def mock_decode(token, key, algorithms, audience, issuer, options):
+        if token == "valid-oidc-token":
+            assert options.get("verify_aud") is False
+            assert audience is None
+            assert issuer == "test-issuer"
+            return {"sub": "user123", "iss": "test-issuer"}
+        raise jwt.InvalidTokenError("Invalid token")
+
+    monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
+    monkeypatch.setattr(main.jwt, "decode", mock_decode)
+
+    # Should not raise
+    require_service_auth("Bearer valid-oidc-token")
