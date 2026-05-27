@@ -190,7 +190,7 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing or invalid authorization header format")
 
-    token = authorization[len("Bearer "):]
+    token = authorization[len("Bearer ") :]
 
     jwks_client = _get_jwks_client()
     if jwks_client:
@@ -201,7 +201,7 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
             return  # OIDC valid
         except jwt.PyJWTError as e:
             logging.debug(f"OIDC token invalid: {e}")
-            pass # Try fallback
+            pass  # Try fallback
         except Exception as e:
             logging.error(f"Unexpected error during OIDC validation: {e}")
             raise HTTPException(status_code=500, detail="Internal server error during auth") from e
@@ -209,7 +209,7 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
     service_token = os.environ.get(SERVICE_TOKEN_ENV)
     if not service_token:
         if jwks_client:
-             raise HTTPException(status_code=401, detail="invalid OIDC token and no fallback service token configured")
+            raise HTTPException(status_code=401, detail="invalid OIDC token and no fallback service token configured")
         raise HTTPException(status_code=503, detail="service token is not configured")
     if token != service_token:
         raise HTTPException(status_code=401, detail="invalid service token")
