@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jwt.types import Options
+
 import os
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
+import jwt
 import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -170,11 +177,53 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Browser Handoff Service", lifespan=lifespan)
 
 
+OIDC_JWKS_URL_ENV = "BROWSER_HANDOFF_OIDC_JWKS_URL"
+OIDC_AUDIENCE_ENV = "BROWSER_HANDOFF_OIDC_AUDIENCE"
+OIDC_ISSUER_ENV = "BROWSER_HANDOFF_OIDC_ISSUER"
+
+_jwks_client = None
+
+
+def _get_jwks_client() -> jwt.PyJWKClient | None:
+    global _jwks_client
+    url = os.environ.get(OIDC_JWKS_URL_ENV)
+    if url and _jwks_client is None:
+        _jwks_client = jwt.PyJWKClient(url)
+    return _jwks_client
+
+
 def require_service_auth(authorization: str | None = Header(default=None)) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing or invalid authorization header format")
+
+    token = authorization[len("Bearer ") :]
+
+    jwks_client = _get_jwks_client()
+    if jwks_client:
+        issuer = os.environ.get(OIDC_ISSUER_ENV)
+        if not issuer:
+            raise HTTPException(status_code=503, detail="OIDC issuer is not configured")
+
+        try:
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            audience = os.environ.get(OIDC_AUDIENCE_ENV)
+            options: Options | None = {"verify_aud": False} if not audience else None
+
+            jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options)
+            return  # OIDC valid
+        except jwt.PyJWTError as e:
+            logging.debug(f"OIDC token invalid: {e}")
+            pass  # Try fallback
+        except Exception as e:
+            logging.error(f"Unexpected error during OIDC validation: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error during auth") from e
+
     service_token = os.environ.get(SERVICE_TOKEN_ENV)
     if not service_token:
+        if jwks_client:
+            raise HTTPException(status_code=401, detail="invalid OIDC token and no fallback service token configured")
         raise HTTPException(status_code=503, detail="service token is not configured")
-    if authorization != f"Bearer {service_token}":
+    if token != service_token:
         raise HTTPException(status_code=401, detail="invalid service token")
 
 
