@@ -21,12 +21,8 @@ def clear_registry():
 @pytest.mark.asyncio
 async def test_landing_page():
     transport = ASGITransport(app=app)
-    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        unauthorized = await client.get("/")
-        assert unauthorized.status_code == 401
-
-        response = await client.get("/", headers=headers)
+        response = await client.get("/")
         assert response.status_code == 200
         assert "Browser Handoff Service" in response.text
         assert "View Sessions" in response.text
@@ -166,15 +162,12 @@ async def test_expiry_loop_invokes_registry_reaper(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_session_list_requires_service_auth():
-    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+async def test_session_list_page_loads_without_app_authorization():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        unauthorized = await client.get("/sessions")
-        assert unauthorized.status_code == 401
+        response = await client.get("/sessions")
 
-        authorized = await client.get("/sessions", headers=headers)
-        assert authorized.status_code == 200
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio

@@ -237,7 +237,7 @@ def map_errors(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
+@app.get("/", response_class=HTMLResponse)
 async def landing_page():
     return LANDING_PAGE_TEMPLATE.render()
 
@@ -444,7 +444,7 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
             pass
 
 
-@app.get("/sessions", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
+@app.get("/sessions", response_class=HTMLResponse)
 async def session_list():
     return SESSION_LIST_TEMPLATE.render(sessions=registry.list_sessions())
 
