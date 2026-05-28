@@ -110,6 +110,54 @@ def test_require_service_auth_envoy_access_token_cookie_success(monkeypatch):
     require_service_auth(auth_request({"AccessToken-ffe7bc3e": "valid-oidc-token"}), None)
 
 
+def test_require_service_auth_envoy_bearer_token_cookie_success(monkeypatch):
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
+    monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
+
+    class MockSigningKey:
+        key = "secret_key"
+
+    class MockJWKClient:
+        def get_signing_key_from_jwt(self, token):
+            return MockSigningKey()
+
+    def mock_decode(token, key, algorithms, audience, issuer, options):
+        if token == "valid-oidc-token":
+            return {"sub": "user123"}
+        raise jwt.InvalidTokenError("Invalid token")
+
+    monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
+    monkeypatch.setattr(main.jwt, "decode", mock_decode)
+
+    require_service_auth(auth_request({"BearerToken": "valid-oidc-token"}), None)
+
+
+def test_require_service_auth_envoy_id_token_cookie_success(monkeypatch):
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
+    monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "fallback-token")
+
+    class MockSigningKey:
+        key = "secret_key"
+
+    class MockJWKClient:
+        def get_signing_key_from_jwt(self, token):
+            return MockSigningKey()
+
+    def mock_decode(token, key, algorithms, audience, issuer, options):
+        if token == "valid-oidc-token":
+            return {"sub": "user123"}
+        raise jwt.InvalidTokenError("Invalid token")
+
+    monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
+    monkeypatch.setattr(main.jwt, "decode", mock_decode)
+
+    require_service_auth(auth_request({"IdToken-ffe7bc3e": "valid-oidc-token"}), None)
+
+
 def test_require_service_auth_envoy_access_token_cookie_does_not_fallback_to_service_token(monkeypatch):
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
     monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")

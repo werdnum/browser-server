@@ -180,7 +180,8 @@ app = FastAPI(title="Browser Handoff Service", lifespan=lifespan)
 OIDC_JWKS_URL_ENV = "BROWSER_HANDOFF_OIDC_JWKS_URL"
 OIDC_AUDIENCE_ENV = "BROWSER_HANDOFF_OIDC_AUDIENCE"
 OIDC_ISSUER_ENV = "BROWSER_HANDOFF_OIDC_ISSUER"
-ENVOY_ACCESS_TOKEN_COOKIE_PREFIX = "AccessToken-"
+ENVOY_OIDC_TOKEN_COOKIE_NAMES = ("AccessToken", "BearerToken", "IdToken")
+ENVOY_OIDC_TOKEN_COOKIE_PREFIXES = ("AccessToken-", "BearerToken-", "IdToken-")
 
 _jwks_client = None
 
@@ -217,11 +218,11 @@ def _validate_oidc_token(token: str) -> bool:
         raise HTTPException(status_code=500, detail="Internal server error during auth") from e
 
 
-def _envoy_access_token_cookies(request: Request) -> list[str]:
+def _envoy_oidc_token_cookies(request: Request) -> list[str]:
     return [
         value
         for name, value in sorted(request.cookies.items())
-        if value and (name == "AccessToken" or name.startswith(ENVOY_ACCESS_TOKEN_COOKIE_PREFIX))
+        if value and (name in ENVOY_OIDC_TOKEN_COOKIE_NAMES or name.startswith(ENVOY_OIDC_TOKEN_COOKIE_PREFIXES))
     ]
 
 
@@ -242,7 +243,7 @@ def require_service_auth(request: Request, authorization: str | None = Header(de
             raise HTTPException(status_code=401, detail="invalid service token")
         return
 
-    cookie_tokens = _envoy_access_token_cookies(request)
+    cookie_tokens = _envoy_oidc_token_cookies(request)
     for token in cookie_tokens:
         if _validate_oidc_token(token):
             return
