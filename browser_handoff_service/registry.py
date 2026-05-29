@@ -18,6 +18,7 @@ from .models import (
     LeaseOwner,
     SessionEvent,
     SessionState,
+    form_factor_profile,
     new_session,
     now_utc,
 )
@@ -66,7 +67,13 @@ class SessionRegistry:
         self.sessions[session.session_id] = session
         self.locks[session.session_id] = asyncio.Lock()
         self.events[session.session_id] = []
-        worker = make_worker(session.worker_id or "")
+        profile = form_factor_profile(session.form_factor)
+        worker = make_worker(
+            session.worker_id or "",
+            width=profile.width,
+            height=profile.height,
+            user_agent=profile.user_agent,
+        )
         self.workers[session.worker_id or ""] = worker
         try:
             await worker.start()

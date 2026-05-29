@@ -65,11 +65,26 @@ class FakeBrowserWorker:
         self.closed = True
 
 
+DEFAULT_DISPLAY_WIDTH = 1280
+DEFAULT_DISPLAY_HEIGHT = 720
+
+
 class PlaywrightBrowserWorker:
-    def __init__(self, worker_id: str, *, headed: bool = False) -> None:
+    def __init__(
+        self,
+        worker_id: str,
+        *,
+        headed: bool = False,
+        width: int = DEFAULT_DISPLAY_WIDTH,
+        height: int = DEFAULT_DISPLAY_HEIGHT,
+        user_agent: str | None = None,
+    ) -> None:
         self.worker_id = worker_id
         self.closed = False
         self.headed = headed
+        self.width = width
+        self.height = height
+        self.user_agent = user_agent
         self._playwright = None
         self._browser = None
         self._page = None
@@ -81,17 +96,27 @@ class PlaywrightBrowserWorker:
             from playwright.async_api import async_playwright
 
             env: dict[str, str | float | bool] = dict(os.environ)
+            args = ["--no-sandbox", "--disable-dev-shm-usage"]
             if self.headed:
-                self._display = LocalNovncDisplay(self.worker_id)
+                self._display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
                 self.remote_url = self._display.start()
                 env["DISPLAY"] = self._display.display
+                # Fill the framebuffer so the noVNC view matches the session form factor.
+                args.append(f"--window-size={self.width},{self.height}")
+                args.append("--window-position=0,0")
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(
                 headless=not self.headed,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                args=args,
                 env=env,
             )
-            self._page = await self._browser.new_page()
+            page_kwargs: dict[str, Any] = {"viewport": {"width": self.width, "height": self.height}}
+            if self.user_agent:
+                # A mobile UA plus touch makes sites render their mobile layout.
+                page_kwargs["user_agent"] = self.user_agent
+                page_kwargs["is_mobile"] = True
+                page_kwargs["has_touch"] = True
+            self._page = await self._browser.new_page(**page_kwargs)
         except Exception as exc:
             await self.close()
             raise RuntimeUnavailable(str(exc)) from exc
@@ -169,8 +194,16 @@ class RemoteDisplayStatus:
 
 
 class LocalNovncDisplay:
-    def __init__(self, worker_id: str) -> None:
+    def __init__(
+        self,
+        worker_id: str,
+        *,
+        width: int = DEFAULT_DISPLAY_WIDTH,
+        height: int = DEFAULT_DISPLAY_HEIGHT,
+    ) -> None:
         self.worker_id = worker_id
+        self.width = width
+        self.height = height
         self.display = ""
         self.novnc_url: str | None = None
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
@@ -186,7 +219,15 @@ class LocalNovncDisplay:
         novnc_port = _free_tcp_port()
         self.display = f":{display_number}"
         xvfb = subprocess.Popen(
-            [status.xvfb_path or "Xvfb", self.display, "-screen", "0", "1280x720x24", "-nolisten", "tcp"],
+            [
+                status.xvfb_path or "Xvfb",
+                self.display,
+                "-screen",
+                "0",
+                f"{self.width}x{self.height}x24",
+                "-nolisten",
+                "tcp",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -218,7 +259,9 @@ class LocalNovncDisplay:
         ]
         novnc = subprocess.Popen(novnc_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._procs.append(novnc)
-        self.novnc_url = f"http://127.0.0.1:{novnc_port}/vnc.html?autoconnect=1&resize=remote"
+        # resize=scale keeps the fixed form-factor framebuffer and scales it to fit the
+        # viewport container, which the UI sizes to match the session aspect ratio.
+        self.novnc_url = f"http://127.0.0.1:{novnc_port}/vnc.html?autoconnect=1&resize=scale"
         return self.novnc_url
 
     def close(self) -> None:
@@ -272,11 +315,23 @@ def remote_display_status() -> RemoteDisplayStatus:
     )
 
 
-def make_worker(worker_id: str) -> BrowserRuntime:
+def make_worker(
+    worker_id: str,
+    *,
+    width: int = DEFAULT_DISPLAY_WIDTH,
+    height: int = DEFAULT_DISPLAY_HEIGHT,
+    user_agent: str | None = None,
+) -> BrowserRuntime:
     runtime = os.environ.get("BROWSER_RUNTIME", "playwright").lower()
     if runtime == "fake":
         return FakeBrowserWorker(worker_id)
-    return PlaywrightBrowserWorker(worker_id, headed=os.environ.get("BROWSER_HEADED") == "1")
+    return PlaywrightBrowserWorker(
+        worker_id,
+        headed=os.environ.get("BROWSER_HEADED") == "1",
+        width=width,
+        height=height,
+        user_agent=user_agent,
+    )
 
 
 def _free_tcp_port() -> int:

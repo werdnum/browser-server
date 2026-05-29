@@ -28,6 +28,7 @@ from .models import (
     HandoverRequest,
     HumanActionRequest,
     SessionState,
+    form_factor_profile,
 )
 from .registry import AuthorizationError, ConflictError, NotFoundError, SessionRegistry
 from .runtime import remote_display_status
@@ -73,7 +74,15 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
       const res = await fetch("/v1/sessions", {
         method: "POST",
         headers: {"content-type": "application/json"},
-        body: JSON.stringify({conversation_id: `conv_${Date.now()}`, initial_owner: "human"}),
+        body: JSON.stringify({
+          conversation_id: `conv_${Date.now()}`,
+          initial_owner: "human",
+          // Detect the user's aspect ratio so the session matches their device.
+          client_viewport: {
+            width: window.innerWidth || screen.width,
+            height: window.innerHeight || screen.height,
+          },
+        }),
       });
       const json = await res.json();
       if (!res.ok || !json.session_url) {
@@ -139,7 +148,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     nav a:hover { text-decoration: underline; }
     button, input { font: inherit; padding: .55rem .75rem; margin: .25rem; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; }
     button:hover { background: #f0f0f0; }
-    .viewport { height: 480px; border: 1px solid #bbb; border-radius: 8px; display: grid; place-items: center; margin-top: 1.5rem; background: #fafafa; overflow: hidden; }
+    .viewport { width: {{ viewport_width }}px; height: {{ viewport_height }}px; max-width: 100%; border: 1px solid #bbb; border-radius: 8px; display: grid; place-items: center; margin: 1.5rem auto 0; background: #fafafa; overflow: hidden; }
     .viewport.connected { display: block; }
     .viewport iframe { width: 100%; height: 100%; border: 0; display: block; }
     .status { padding: .75rem; background: #eef2f5; border-radius: 4px; border: 1px solid #d0d7de; }
@@ -571,7 +580,24 @@ async def session_detail(session_id: str, token: str | None = None):
         session = await registry.authorize_handoff_page(session_id, token or "")
     except Exception as exc:
         raise map_errors(exc) from exc
-    return SESSION_DETAIL_TEMPLATE.render(session=session, token=token or "")
+    profile = form_factor_profile(session.form_factor)
+    box_width, box_height = _viewport_box(profile.width, profile.height)
+    return SESSION_DETAIL_TEMPLATE.render(
+        session=session,
+        token=token or "",
+        viewport_width=box_width,
+        viewport_height=box_height,
+    )
+
+
+def _viewport_box(width: int, height: int, max_width: int = 760, max_height: int = 620) -> tuple[int, int]:
+    """Scale the session framebuffer into a bounding box, preserving its aspect ratio.
+
+    Keeps the on-page viewport matching the session form factor (portrait for mobile,
+    landscape for desktop) without exceeding the page layout.
+    """
+    scale = min(max_width / width, max_height / height, 1.0)
+    return round(width * scale), round(height * scale)
 
 
 async def _expiry_loop() -> None:
@@ -588,7 +614,7 @@ def novnc_proxy_url(session_id: str, public_base_url: str, remote_url: str) -> s
     remote_query = dict(parse_qsl(urlsplit(remote_url).query, keep_blank_values=True))
     query = {
         "autoconnect": remote_query.get("autoconnect", "1"),
-        "resize": remote_query.get("resize", "remote"),
+        "resize": remote_query.get("resize", "scale"),
         "path": websockify_path,
     }
     return urlunsplit((public.scheme, public.netloc, novnc_path, urlencode(query), ""))
