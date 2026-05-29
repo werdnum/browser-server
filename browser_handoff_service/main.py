@@ -581,15 +581,17 @@ async def _expiry_loop() -> None:
 
 
 def novnc_proxy_url(session_id: str, public_base_url: str, remote_url: str) -> str:
+    public = urlsplit(public_base_url)
+    prefix = public.path.rstrip("/")
+    novnc_path = f"{prefix}/v1/sessions/{session_id}/novnc/vnc.html"
+    websockify_path = f"{prefix}/v1/sessions/{session_id}/novnc/websockify"
     remote_query = dict(parse_qsl(urlsplit(remote_url).query, keep_blank_values=True))
     query = {
         "autoconnect": remote_query.get("autoconnect", "1"),
         "resize": remote_query.get("resize", "remote"),
-        "path": f"/v1/sessions/{session_id}/novnc/websockify",
+        "path": websockify_path,
     }
-    public = urlsplit(public_base_url)
-    path = f"/v1/sessions/{session_id}/novnc/vnc.html"
-    return urlunsplit((public.scheme, public.netloc, path, urlencode(query), ""))
+    return urlunsplit((public.scheme, public.netloc, novnc_path, urlencode(query), ""))
 
 
 def _novnc_cookie_name(session_id: str) -> str:

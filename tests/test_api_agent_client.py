@@ -99,6 +99,24 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
         )
         assert "secure" in forwarded_remote.headers["set-cookie"].lower()
 
+        forwarded_prefixed_remote = await client.get(
+            f"/v1/sessions/{session_id}/remote",
+            params={"token": control_token},
+            headers={
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "browser.andrewgarrett.dev",
+                "x-forwarded-prefix": "/browser",
+            },
+        )
+        assert forwarded_prefixed_remote.status_code == 200, forwarded_prefixed_remote.text
+        assert forwarded_prefixed_remote.json()["novnc_url"].startswith(
+            f"https://browser.andrewgarrett.dev/browser/v1/sessions/{session_id}/novnc/vnc.html?"
+        )
+        assert (
+            f"path=%2Fbrowser%2Fv1%2Fsessions%2F{session_id}%2Fnovnc%2Fwebsockify"
+            in forwarded_prefixed_remote.json()["novnc_url"]
+        )
+
         completed = await client.post(
             f"/v1/sessions/{session_id}/complete",
             json={"token": control_token, "outcome": "paid"},
@@ -319,6 +337,19 @@ def test_remote_url_uses_authenticated_service_proxy():
     url = novnc_proxy_url(
         "bs_example",
         "https://handoff.example/base/",
+        "http://127.0.0.1:34147/vnc.html?autoconnect=1&resize=remote",
+    )
+
+    assert url == (
+        "https://handoff.example/base/v1/sessions/bs_example/novnc/vnc.html?"
+        "autoconnect=1&resize=remote&path=%2Fbase%2Fv1%2Fsessions%2Fbs_example%2Fnovnc%2Fwebsockify"
+    )
+
+
+def test_remote_url_uses_authenticated_service_proxy_without_prefix():
+    url = novnc_proxy_url(
+        "bs_example",
+        "https://handoff.example/",
         "http://127.0.0.1:34147/vnc.html?autoconnect=1&resize=remote",
     )
 
