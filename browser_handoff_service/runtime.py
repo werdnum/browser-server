@@ -211,11 +211,29 @@ class FakeBrowserWorker:
         if request.type == "current_page":
             return {"url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "extract":
-            return {"url": redact_url(self.url)[0] if self.url else None, "html": f"<html><body><h1>{self.title}</h1></body></html>"}
+            return {
+                "url": redact_url(self.url)[0] if self.url else None,
+                "html": f"<html><body><h1>{self.title}</h1></body></html>",
+            }
         if request.type == "exec":
             return {"result": self.title, "url": redact_url(self.url)[0] if self.url else None}
         if request.type == "wait":
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
+        if request.type in {
+            "mouse_click",
+            "mouse_move",
+            "mouse_down",
+            "mouse_up",
+            "mouse_wheel",
+            "keyboard_type",
+            "keyboard_press",
+        }:
+            self.actions.append({"type": request.type, "args": request.args})
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None}
+        if request.type == "navigate_back":
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None}
+        if request.type == "navigate_forward":
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None}
         if request.type == "close_page":
             self.url = None
             self.title = "Blank"
@@ -348,6 +366,33 @@ class PlaywrightBrowserWorker:
             return {"accepted": True, "url": redact_url(page.url)[0], "title": await page.title()}
         if request.type == "current_page":
             return {"url": redact_url(page.url)[0], "title": await page.title()}
+        if request.type == "mouse_click":
+            await page.mouse.click(float(request.args["x"]), float(request.args["y"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "mouse_move":
+            await page.mouse.move(float(request.args["x"]), float(request.args["y"]))
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "mouse_down":
+            await page.mouse.down()
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "mouse_up":
+            await page.mouse.up()
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "mouse_wheel":
+            await page.mouse.wheel(float(request.args["delta_x"]), float(request.args["delta_y"]))
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "keyboard_type":
+            await page.keyboard.type(str(request.args["text"]))
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "keyboard_press":
+            await page.keyboard.press(str(request.args["keys"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "navigate_back":
+            await page.go_back()
+            return await self._current_page_result({"accepted": True})
+        if request.type == "navigate_forward":
+            await page.go_forward()
+            return await self._current_page_result({"accepted": True})
         if request.type == "close_page":
             await page.goto("about:blank")
             return {"closed": True, "url": None, "title": "Blank"}
@@ -579,4 +624,3 @@ def _find_novnc_web_path(novnc_path: str | None) -> str | None:
         if (candidate / "vnc.html").exists():
             return str(candidate)
     return None
-
