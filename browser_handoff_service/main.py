@@ -158,6 +158,11 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     <button id="handover">Hand over to agent</button>
     <button id="complete">Complete</button>
     <button id="cancel">Cancel</button>
+    <div id="handover-result" hidden>
+      <p>Give this one-time token to your agent so it can take over the session:</p>
+      <p><code id="handover-token"></code></p>
+      <p>The agent claims it with <code>POST <span id="handover-claim-url"></span></code> and <code>{"token": "&lt;token&gt;"}</code>.</p>
+    </div>
     <div class="viewport" id="viewport">Remote viewport not connected</div>
   </main>
   <script>
@@ -182,7 +187,12 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     };
     document.querySelector("#extend").onclick = () => post(`/v1/sessions/${sid}/extend`, {token, minutes: 5});
     document.querySelector("#sensitive").onclick = () => post(`/v1/sessions/${sid}/mark-sensitive`, {token});
-    document.querySelector("#handover").onclick = () => post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
+    document.querySelector("#handover").onclick = async () => {
+      const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
+      document.querySelector("#handover-token").textContent = result.handover_token;
+      document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
+      document.querySelector("#handover-result").hidden = false;
+    };
     document.querySelector("#complete").onclick = () => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"});
     document.querySelector("#cancel").onclick = () => post(`/v1/sessions/${sid}/cancel`, {token, outcome: "cancelled"});
     if (token && document.querySelector("#state").textContent.trim() === "human_active") {
@@ -406,9 +416,25 @@ async def cancel(session_id: str, req: HumanActionRequest):
 
 
 @app.post("/v1/sessions/{session_id}/handover")
-async def handover(session_id: str, req: HandoverRequest):
+async def handover(session_id: str, req: HandoverRequest, request: Request):
     try:
-        return await registry.handover(session_id, req.token, req.handoff_note)
+        session, handover_token = await registry.handover(session_id, req.token, req.handoff_note)
+        base_url = str(request.base_url).rstrip("/")
+        return {
+            "session_id": session.session_id,
+            "state": session.state,
+            "handover_token": handover_token,
+            "agent_claim_url": f"{base_url}/v1/sessions/{session.session_id}/agent-claim",
+            "expires_at": session.idle_expires_at,
+        }
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/sessions/{session_id}/agent-claim", dependencies=[Depends(require_service_auth)])
+async def agent_claim(session_id: str, req: ClaimRequest):
+    try:
+        return await registry.agent_claim(session_id, req.token)
     except Exception as exc:
         raise map_errors(exc) from exc
 

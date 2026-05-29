@@ -18,7 +18,17 @@ test("user can start a browser session and hand it over to an agent", async ({ p
 
   await page.locator("#handover-note").fill("Search for flights");
   await page.getByRole("button", { name: "Hand over to agent" }).click();
-  await expect(page.locator("#state")).toHaveText("agent_active");
+  await expect(page.locator("#state")).toHaveText("handover_requested");
+
+  // The UI surfaces a one-time token the user gives to their agent.
+  await expect(page.locator("#handover-result")).toBeVisible();
+  const handoverToken = await page.locator("#handover-token").textContent();
+  expect(handoverToken).toBeTruthy();
+
+  // The agent claims the session with that token plus its service credentials.
+  const claim = await api(`/v1/sessions/${session.session_id}/agent-claim`, { token: handoverToken });
+  expect(claim.status).toBe(200);
+  expect((await claim.json()).state).toBe("agent_active");
 
   // The agent now owns the lease and can drive the browser the user set up.
   const command = await api(`/v1/sessions/${session.session_id}/agent-command`, { type: "current_page" });

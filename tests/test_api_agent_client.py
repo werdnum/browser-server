@@ -126,13 +126,40 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
         assert page.status_code == 200
         assert "Hand over to agent" in page.text
 
+        # The user hands over: this parks the session and mints a token for the agent.
         handover = await client.post(
             f"/v1/sessions/{session_id}/handover",
             json={"token": control_token, "handoff_note": "Search for flights"},
         )
         assert handover.status_code == 200, handover.text
-        assert handover.json()["state"] == "agent_active"
-        assert handover.json()["lease_owner"] == "agent"
+        handover_body = handover.json()
+        assert handover_body["state"] == "handover_requested"
+        handover_token = handover_body["handover_token"]
+        assert handover_body["agent_claim_url"].endswith(f"/v1/sessions/{session_id}/agent-claim")
+
+        # The agent has no lease until it claims with the handover token.
+        not_yet = await client.post(
+            f"/v1/sessions/{session_id}/agent-command",
+            headers=headers,
+            json={"type": "current_page"},
+        )
+        assert not_yet.status_code == 403
+
+        # Claiming requires service auth in addition to the handover token.
+        unauth_claim = await client.post(
+            f"/v1/sessions/{session_id}/agent-claim",
+            json={"token": handover_token},
+        )
+        assert unauth_claim.status_code == 401
+
+        claimed = await client.post(
+            f"/v1/sessions/{session_id}/agent-claim",
+            headers=headers,
+            json={"token": handover_token},
+        )
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["state"] == "agent_active"
+        assert claimed.json()["lease_owner"] == "agent"
 
         # The agent can now drive the browser the human set up.
         nav = await client.post(
@@ -142,12 +169,13 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
         )
         assert nav.status_code == 200, nav.text
 
-        # The handed-over control token is revoked for further human actions.
+        # The handover token is one-time.
         reused = await client.post(
-            f"/v1/sessions/{session_id}/handover",
-            json={"token": control_token, "handoff_note": "again"},
+            f"/v1/sessions/{session_id}/agent-claim",
+            headers=headers,
+            json={"token": handover_token},
         )
-        assert reused.status_code == 403
+        assert reused.status_code == 409
 
 
 @pytest.mark.asyncio

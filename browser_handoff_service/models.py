@@ -15,6 +15,7 @@ def now_utc() -> datetime:
 class SessionState(StrEnum):
     AGENT_ACTIVE = "agent_active"
     HANDOFF_REQUESTED = "handoff_requested"
+    HANDOVER_REQUESTED = "handover_requested"
     HUMAN_ACTIVE = "human_active"
     HUMAN_SENSITIVE = "human_sensitive"
     SANITIZE_PENDING = "sanitize_pending"

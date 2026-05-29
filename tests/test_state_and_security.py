@@ -181,30 +181,43 @@ async def test_human_started_session_can_be_handed_over_to_agent():
     with pytest.raises(AuthorizationError):
         await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
 
-    handed = await registry.handover(session.session_id, control_token, "Finish the booking")
+    pending, handover_token = await registry.handover(session.session_id, control_token, "Finish the booking")
 
-    assert handed.state == SessionState.AGENT_ACTIVE
-    assert handed.lease_owner == LeaseOwner.AGENT
-    assert handed.handoff_note == "Finish the booking"
+    # Handover mints a one-time token and parks the session until the agent claims it.
+    assert pending.state == SessionState.HANDOVER_REQUESTED
+    assert pending.lease_owner == LeaseOwner.SERVICE
+    assert pending.handoff_note == "Finish the booking"
+    with pytest.raises(AuthorizationError):
+        await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
+
+    claimed = await registry.agent_claim(session.session_id, handover_token)
+
+    assert claimed.state == SessionState.AGENT_ACTIVE
+    assert claimed.lease_owner == LeaseOwner.AGENT
     response = await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
     assert response.ok is True
 
 
 @pytest.mark.asyncio
-async def test_handover_revokes_human_control_token():
+async def test_handover_token_is_one_time_and_revokes_human_control_token():
     registry = SessionRegistry()
     session, control_token = await registry.create_session(
         CreateSessionRequest(conversation_id="conv_1", initial_owner="human")
     )
     assert control_token is not None
 
-    await registry.handover(session.session_id, control_token, "")
+    _, handover_token = await registry.handover(session.session_id, control_token, "")
 
     # The consumed control token can no longer drive the session as a human.
     with pytest.raises(AuthorizationError):
         await registry.authorize_remote(session.session_id, control_token)
+
+    # A wrong token cannot claim, and the real token works exactly once.
     with pytest.raises(AuthorizationError):
-        await registry.handover(session.session_id, control_token, "")
+        await registry.agent_claim(session.session_id, "wrong")
+    await registry.agent_claim(session.session_id, handover_token)
+    with pytest.raises(ConflictError):
+        await registry.agent_claim(session.session_id, handover_token)
 
 
 @pytest.mark.asyncio
