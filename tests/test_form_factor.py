@@ -2,6 +2,7 @@ import pytest
 from browser_handoff_service.main import _viewport_box, app, registry
 from browser_handoff_service.models import (
     DEFAULT_FORM_FACTOR,
+    ClientViewport,
     CreateSessionRequest,
     form_factor_profile,
     new_session,
@@ -30,9 +31,39 @@ def clear_registry():
 def test_sessions_default_to_mobile_form_factor():
     assert DEFAULT_FORM_FACTOR == "mobile"
     req = CreateSessionRequest(conversation_id="conv_default")
-    assert req.form_factor == "mobile"
+    # The request defaults to auto-detection, which falls back to mobile with no client info.
+    assert req.form_factor == "auto"
+    assert req.resolved_form_factor() == "mobile"
     session = new_session(req)
     assert session.form_factor == "mobile"
+
+
+def test_auto_detects_desktop_from_landscape_client():
+    req = CreateSessionRequest(
+        conversation_id="conv_landscape",
+        client_viewport=ClientViewport(width=1920, height=1080),
+    )
+    assert req.form_factor == "auto"
+    assert req.resolved_form_factor() == "desktop"
+    assert new_session(req).form_factor == "desktop"
+
+
+def test_auto_detects_mobile_from_portrait_client():
+    req = CreateSessionRequest(
+        conversation_id="conv_portrait",
+        client_viewport=ClientViewport(width=390, height=844),
+    )
+    assert req.resolved_form_factor() == "mobile"
+    assert new_session(req).form_factor == "mobile"
+
+
+def test_explicit_form_factor_overrides_client_aspect_ratio():
+    req = CreateSessionRequest(
+        conversation_id="conv_override",
+        form_factor="mobile",
+        client_viewport=ClientViewport(width=1920, height=1080),
+    )
+    assert req.resolved_form_factor() == "mobile"
 
 
 def test_mobile_profile_is_portrait_with_mobile_user_agent():
@@ -112,6 +143,28 @@ async def test_create_session_records_requested_form_factor():
         )
         assert desktop.status_code == 200, desktop.text
         assert desktop.json()["form_factor"] == "desktop"
+
+
+@pytest.mark.asyncio
+async def test_create_session_auto_detects_form_factor_from_client_viewport():
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        landscape = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_landscape", "client_viewport": {"width": 1440, "height": 900}},
+        )
+        assert landscape.status_code == 200, landscape.text
+        assert landscape.json()["form_factor"] == "desktop"
+
+        portrait = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_portrait", "client_viewport": {"width": 414, "height": 896}},
+        )
+        assert portrait.status_code == 200, portrait.text
+        assert portrait.json()["form_factor"] == "mobile"
 
 
 @pytest.mark.asyncio

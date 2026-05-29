@@ -74,7 +74,15 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
       const res = await fetch("/v1/sessions", {
         method: "POST",
         headers: {"content-type": "application/json"},
-        body: JSON.stringify({conversation_id: `conv_${Date.now()}`, initial_owner: "human"}),
+        body: JSON.stringify({
+          conversation_id: `conv_${Date.now()}`,
+          initial_owner: "human",
+          // Detect the user's aspect ratio so the session matches their device.
+          client_viewport: {
+            width: window.innerWidth || screen.width,
+            height: window.innerHeight || screen.height,
+          },
+        }),
       });
       const json = await res.json();
       if (!res.ok || !json.session_url) {

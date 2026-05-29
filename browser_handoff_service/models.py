@@ -15,7 +15,11 @@ def now_utc() -> datetime:
 
 FormFactorName = Literal["mobile", "desktop"]
 
-# Default new sessions to a mobile-friendly portrait aspect ratio.
+# Requested form factor: a concrete profile, or "auto" to detect from the client.
+RequestedFormFactor = Literal["mobile", "desktop", "auto"]
+
+# Fallback when the form factor is "auto" and no client aspect ratio is available
+# (e.g. agent-created sessions with no browser to measure).
 DEFAULT_FORM_FACTOR: FormFactorName = "mobile"
 
 # Modern Chrome-on-Android user agent so sites serve their mobile layout.
@@ -45,6 +49,18 @@ FORM_FACTORS: dict[str, FormFactor] = {
 def form_factor_profile(name: str) -> FormFactor:
     """Resolve a form factor name to its display profile, falling back to the default."""
     return FORM_FACTORS.get(name, FORM_FACTORS[DEFAULT_FORM_FACTOR])
+
+
+class ClientViewport(BaseModel):
+    """The aspect ratio of the client device, as measured in the browser."""
+
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+def form_factor_for_aspect_ratio(width: int, height: int) -> FormFactorName:
+    """Pick a form factor from a client's aspect ratio: portrait -> mobile, landscape -> desktop."""
+    return "mobile" if height >= width else "desktop"
 
 
 class SessionState(StrEnum):
@@ -83,7 +99,17 @@ class CreateSessionRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     interface_type: str = "research"
     initial_owner: Literal["agent", "human"] = "agent"
-    form_factor: FormFactorName = DEFAULT_FORM_FACTOR
+    # "auto" detects the form factor from client_viewport (the browser UI sends this);
+    # an explicit "mobile"/"desktop" always wins.
+    form_factor: RequestedFormFactor = "auto"
+    client_viewport: ClientViewport | None = None
+
+    def resolved_form_factor(self) -> FormFactorName:
+        if self.form_factor != "auto":
+            return self.form_factor
+        if self.client_viewport is not None:
+            return form_factor_for_aspect_ratio(self.client_viewport.width, self.client_viewport.height)
+        return DEFAULT_FORM_FACTOR
 
 
 class HandoffRequest(BaseModel):
@@ -181,7 +207,7 @@ def new_session(req: CreateSessionRequest) -> BrowserSession:
         session_id=f"bs_{uuid4().hex}",
         conversation_id=req.conversation_id,
         interface_type=req.interface_type,
-        form_factor=req.form_factor,
+        form_factor=req.resolved_form_factor(),
         state=SessionState.HUMAN_ACTIVE if human_first else SessionState.AGENT_ACTIVE,
         lease_owner=LeaseOwner.HUMAN if human_first else LeaseOwner.AGENT,
         worker_id=f"worker_{uuid4().hex}",
