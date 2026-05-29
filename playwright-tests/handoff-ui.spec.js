@@ -8,6 +8,20 @@ test("human can claim, extend, mark sensitive, and complete from the handoff UI"
     headers: { ...serviceHeaders, "content-type": "application/json" },
     body: JSON.stringify(body)
   });
+  await page.route("**/v1/sessions/*/remote?**", async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ novnc_url: `${baseURL}/mock-novnc.html` })
+    });
+  });
+  await page.route("**/mock-novnc.html", async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<!doctype html><title>Mock noVNC</title>"
+    });
+  });
   const created = await api("/v1/sessions", { conversation_id: "conv_ui" });
   expect(created.ok).toBeTruthy();
   const session = await created.json();
@@ -23,6 +37,7 @@ test("human can claim, extend, mark sensitive, and complete from the handoff UI"
   await expect(page.locator("#state")).toHaveText("handoff_requested");
   await page.getByRole("button", { name: "Claim" }).click();
   await expect(page.locator("#state")).toHaveText("human_active");
+  await expect(page.locator("#viewport iframe")).toHaveAttribute("src", `${baseURL}/mock-novnc.html`);
 
   await page.getByRole("button", { name: "Extend" }).click();
   await expect(page.locator("#state")).toHaveText("human_active");

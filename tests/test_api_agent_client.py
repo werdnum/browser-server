@@ -88,6 +88,17 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
         assert "34147" not in remote.json()["novnc_url"]
         assert f"novnc_{session_id}=" in remote.headers["set-cookie"]
 
+        forwarded_remote = await client.get(
+            f"/v1/sessions/{session_id}/remote",
+            params={"token": control_token},
+            headers={"x-forwarded-proto": "https,http", "x-forwarded-host": "browser.andrewgarrett.dev"},
+        )
+        assert forwarded_remote.status_code == 200, forwarded_remote.text
+        assert forwarded_remote.json()["novnc_url"].startswith(
+            f"https://browser.andrewgarrett.dev/v1/sessions/{session_id}/novnc/vnc.html?"
+        )
+        assert "secure" in forwarded_remote.headers["set-cookie"].lower()
+
         completed = await client.post(
             f"/v1/sessions/{session_id}/complete",
             json={"token": control_token, "outcome": "paid"},
@@ -103,7 +114,11 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         created = await client.post(
             "/v1/sessions",
-            headers=headers,
+            headers={
+                **headers,
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "browser.andrewgarrett.dev",
+            },
             json={"conversation_id": "conv_human_first", "initial_owner": "human"},
         )
         assert created.status_code == 200, created.text
@@ -112,7 +127,7 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
         assert body["lease_owner"] == "human"
         session_id = body["session_id"]
         control_token = body["control_token"]
-        assert body["session_url"].endswith(f"/sessions/{session_id}?token={control_token}")
+        assert body["session_url"] == (f"https://browser.andrewgarrett.dev/sessions/{session_id}?token={control_token}")
 
         # The agent has no lease while the human drives the freshly started session.
         denied = await client.post(

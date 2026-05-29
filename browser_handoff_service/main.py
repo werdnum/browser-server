@@ -139,7 +139,9 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     nav a:hover { text-decoration: underline; }
     button, input { font: inherit; padding: .55rem .75rem; margin: .25rem; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; }
     button:hover { background: #f0f0f0; }
-    .viewport { height: 480px; border: 1px solid #bbb; border-radius: 8px; display: grid; place-items: center; margin-top: 1.5rem; background: #fafafa; }
+    .viewport { height: 480px; border: 1px solid #bbb; border-radius: 8px; display: grid; place-items: center; margin-top: 1.5rem; background: #fafafa; overflow: hidden; }
+    .viewport.connected { display: block; }
+    .viewport iframe { width: 100%; height: 100%; border: 0; display: block; }
     .status { padding: .75rem; background: #eef2f5; border-radius: 4px; border: 1px solid #d0d7de; }
   </style>
 </head>
@@ -177,8 +179,26 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       return json;
     }
     async function connectViewport() {
+      const viewport = document.querySelector("#viewport");
+      viewport.classList.remove("connected");
+      viewport.textContent = "Connecting remote viewport...";
       const remote = await fetch(`/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
-      document.querySelector("#viewport").textContent = remote.ok ? "noVNC viewport authorized" : "Remote viewport unavailable";
+      let json = {};
+      try {
+        json = await remote.json();
+      } catch {
+        json = {};
+      }
+      if (!remote.ok || !json.novnc_url) {
+        viewport.textContent = json.detail || "Remote viewport unavailable";
+        return;
+      }
+      const frame = document.createElement("iframe");
+      frame.title = "noVNC remote browser session";
+      frame.src = json.novnc_url;
+      frame.allow = "clipboard-read; clipboard-write";
+      viewport.replaceChildren(frame);
+      viewport.classList.add("connected");
     }
     document.querySelector("#claim").onclick = async () => {
       const claim = await post(`/v1/sessions/${sid}/claim`, {token});
@@ -283,6 +303,22 @@ def map_errors(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=str(exc))
 
 
+def public_base_url(request: Request) -> str:
+    scheme = _first_forwarded_value(request.headers.get("x-forwarded-proto")) or request.url.scheme
+    host = _first_forwarded_value(request.headers.get("x-forwarded-host")) or request.url.netloc
+    prefix = _first_forwarded_value(request.headers.get("x-forwarded-prefix")) or request.scope.get("root_path", "")
+    normalized_prefix = prefix.strip("/") if prefix else ""
+    path = f"/{normalized_prefix}/" if normalized_prefix else "/"
+    return urlunsplit((scheme, host, path, "", ""))
+
+
+def _first_forwarded_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    first = value.split(",", 1)[0].strip()
+    return first or None
+
+
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
 async def landing_page():
     return LANDING_PAGE_TEMPLATE.render()
@@ -303,7 +339,9 @@ async def create_session(req: CreateSessionRequest, request: Request):
         return session
     response = session.model_dump(mode="json")
     response["control_token"] = control_token
-    response["session_url"] = f"{str(request.base_url).rstrip('/')}/sessions/{session.session_id}?token={control_token}"
+    response["session_url"] = (
+        f"{public_base_url(request).rstrip('/')}/sessions/{session.session_id}?token={control_token}"
+    )
     return response
 
 
@@ -328,7 +366,7 @@ async def agent_command(session_id: str, req: AgentCommandRequest):
 )
 async def handoff(session_id: str, req: HandoffRequest, request: Request):
     try:
-        session, url = await registry.handoff(session_id, req, str(request.base_url))
+        session, url = await registry.handoff(session_id, req, public_base_url(request))
         return {
             "session_id": session.session_id,
             "state": session.state,
@@ -397,7 +435,7 @@ async def cancel(session_id: str, req: HumanActionRequest):
 async def handover(session_id: str, req: HandoverRequest, request: Request):
     try:
         session, handover_token = await registry.handover(session_id, req.token, req.handoff_note)
-        base_url = str(request.base_url).rstrip("/")
+        base_url = public_base_url(request).rstrip("/")
         return {
             "session_id": session.session_id,
             "state": session.state,
@@ -446,18 +484,20 @@ async def remote(session_id: str, token: str, request: Request):
     remote_url = getattr(worker, "remote_url", None)
     if not remote_url:
         raise HTTPException(status_code=503, detail="session was not started with headed noVNC runtime")
+    base_url = public_base_url(request)
     response = JSONResponse(
         {
             "session_id": session_id,
-            "novnc_url": novnc_proxy_url(session_id, str(request.base_url), remote_url),
+            "novnc_url": novnc_proxy_url(session_id, base_url, remote_url),
         }
     )
+    secure_cookie = urlsplit(base_url).scheme == "https"
     response.set_cookie(
         _novnc_cookie_name(session_id),
         token,
         httponly=True,
         samesite="lax",
-        secure=request.url.scheme == "https",
+        secure=secure_cookie,
         path=f"/v1/sessions/{session_id}/novnc",
     )
     return response
@@ -476,12 +516,13 @@ async def novnc_http_proxy(session_id: str, asset_path: str, request: Request, t
     query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "token"]
     response = await _proxy_novnc_http(remote_url, asset_path, query_items)
     if token:
+        secure_cookie = urlsplit(public_base_url(request)).scheme == "https"
         response.set_cookie(
             _novnc_cookie_name(session_id),
             token,
             httponly=True,
             samesite="lax",
-            secure=request.url.scheme == "https",
+            secure=secure_cookie,
             path=f"/v1/sessions/{session_id}/novnc",
         )
     return response
