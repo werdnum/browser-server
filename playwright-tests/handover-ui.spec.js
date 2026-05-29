@@ -8,6 +8,20 @@ test("user can start a browser session and hand it over to an agent", async ({ p
     headers: { ...serviceHeaders, "content-type": "application/json" },
     body: JSON.stringify(body)
   });
+  await page.route("**/v1/sessions/*/remote?**", async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ novnc_url: `${baseURL}/mock-novnc.html` })
+    });
+  });
+  await page.route("**/mock-novnc.html", async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<!doctype html><title>Mock noVNC</title>"
+    });
+  });
   const created = await api("/v1/sessions", { conversation_id: "conv_human_ui", initial_owner: "human" });
   expect(created.ok).toBeTruthy();
   const session = await created.json();
@@ -15,6 +29,7 @@ test("user can start a browser session and hand it over to an agent", async ({ p
 
   await page.goto(session.session_url);
   await expect(page.locator("#state")).toHaveText("human_active");
+  await expect(page.locator("#viewport iframe")).toHaveAttribute("src", `${baseURL}/mock-novnc.html`);
 
   await page.locator("#handover-note").fill("Search for flights");
   await page.getByRole("button", { name: "Hand over to agent" }).click();
