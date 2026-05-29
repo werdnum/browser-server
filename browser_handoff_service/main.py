@@ -17,6 +17,7 @@ import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, StrictUndefined, select_autoescape
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .models import (
     AgentCommandRequest,
@@ -182,9 +183,14 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
           },
         }),
       });
-      const json = await res.json();
+      let json = {};
+      try {
+        json = await res.json();
+      } catch {
+        json = {};
+      }
       if (!res.ok || !json.session_url) {
-        status.textContent = json.detail || "Could not start a session";
+        status.textContent = json.detail || "Could not start a session.";
         return;
       }
       window.location.href = json.session_url;
@@ -297,6 +303,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           <p class="muted">The agent claims it with <code>POST <span id="handover-claim-url"></span></code> and <code>{"token": "&lt;token&gt;"}</code>.</p>
         </div>
         <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and cannot be redisplayed. Click Cancel to abort and start over.</p>
+        <p id="action-error" class="notice error" role="alert" hidden></p>
       </div>
       <div class="viewport" id="viewport">Remote viewport not connected</div>
     </main>
@@ -304,11 +311,36 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
   <script>
     const sid = document.body.dataset.sessionId;
     let token = document.body.dataset.token;
+    function showError(message) {
+      const el = document.querySelector("#action-error");
+      el.textContent = message || "Something went wrong.";
+      el.hidden = false;
+    }
+    function clearError() {
+      const el = document.querySelector("#action-error");
+      el.hidden = true;
+      el.textContent = "";
+    }
+    function action(fn) {
+      return async () => {
+        try {
+          clearError();
+          await fn();
+        } catch (err) {
+          showError(err && err.message ? err.message : "Something went wrong.");
+        }
+      };
+    }
     async function post(path, body) {
       const res = await fetch(path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.detail || res.statusText);
-      document.querySelector("#state").textContent = json.state;
+      let json = {};
+      try {
+        json = await res.json();
+      } catch {
+        json = {};
+      }
+      if (!res.ok) throw new Error(json.detail || res.statusText || "Request failed");
+      if (json.state) document.querySelector("#state").textContent = json.state;
       return json;
     }
     async function connectViewport() {
@@ -333,22 +365,22 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       viewport.replaceChildren(frame);
       viewport.classList.add("connected");
     }
-    document.querySelector("#claim").onclick = async () => {
+    document.querySelector("#claim").onclick = action(async () => {
       const claim = await post(`/v1/sessions/${sid}/claim`, {token});
       token = claim.control_token;
       document.body.dataset.token = token;
       await connectViewport();
-    };
-    document.querySelector("#extend").onclick = () => post(`/v1/sessions/${sid}/extend`, {token, minutes: 5});
-    document.querySelector("#sensitive").onclick = () => post(`/v1/sessions/${sid}/mark-sensitive`, {token});
-    document.querySelector("#handover").onclick = async () => {
+    });
+    document.querySelector("#extend").onclick = action(() => post(`/v1/sessions/${sid}/extend`, {token, minutes: 5}));
+    document.querySelector("#sensitive").onclick = action(() => post(`/v1/sessions/${sid}/mark-sensitive`, {token}));
+    document.querySelector("#handover").onclick = action(async () => {
       const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
       document.querySelector("#handover-token").textContent = result.handover_token;
       document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
       document.querySelector("#handover-result").hidden = false;
-    };
-    document.querySelector("#complete").onclick = () => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"});
-    document.querySelector("#cancel").onclick = () => post(`/v1/sessions/${sid}/cancel`, {token, outcome: "cancelled"});
+    });
+    document.querySelector("#complete").onclick = action(() => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"}));
+    document.querySelector("#cancel").onclick = action(() => post(`/v1/sessions/${sid}/cancel`, {token, outcome: "cancelled"}));
     const initialState = document.querySelector("#state").textContent.trim();
     if (token && initialState === "human_active") {
       connectViewport();
@@ -357,6 +389,29 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       document.querySelector("#handover-pending").hidden = false;
     }
   </script>
+</body>
+</html>"""
+)
+
+ERROR_PAGE_TEMPLATE = templates.from_string(
+    _html_head("{{ status_code }} · Browser Handoff Service")
+    + """<body>
+  <div class="wrap">
+    """
+    + _BRAND
+    + """
+    <main>
+      <div class="card">
+        <span class="badge">Error {{ status_code }}</span>
+        <h1 style="margin:.7rem 0 0">{{ title }}</h1>
+        <p class="lead">{{ message }}</p>
+        <div class="actions">
+          <a class="btn btn-primary" href="/">Back to home</a>
+          <a class="btn" href="/sessions">View Sessions</a>
+        </div>
+      </div>
+    </main>
+  </div>
 </body>
 </html>"""
 )
@@ -374,6 +429,43 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Browser Handoff Service", lifespan=lifespan)
+
+
+ERROR_TITLES = {
+    400: "Bad request",
+    401: "Sign in required",
+    403: "Access denied",
+    404: "Not found",
+    409: "Session conflict",
+    410: "Session expired",
+    503: "Service unavailable",
+}
+
+
+def _renders_html_page(request: Request) -> bool:
+    """The browser-facing pages live at /, /sessions and /sessions/{id}.
+
+    Errors there should be a styled HTML page; everything else (the /v1 API,
+    health checks, proxied assets) keeps returning JSON.
+    """
+    path = request.url.path
+    return path == "/" or path == "/sessions" or path.startswith("/sessions/")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> Response:
+    detail = exc.detail if isinstance(exc.detail, str) and exc.detail else "Something went wrong."
+    if _renders_html_page(request):
+        message = detail[:1].upper() + detail[1:]
+        if message and message[-1] not in ".!?":
+            message += "."
+        html = ERROR_PAGE_TEMPLATE.render(
+            status_code=exc.status_code,
+            title=ERROR_TITLES.get(exc.status_code, "Something went wrong"),
+            message=message,
+        )
+        return HTMLResponse(html, status_code=exc.status_code, headers=exc.headers)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
 
 
 OIDC_JWKS_URL_ENV = "BROWSER_HANDOFF_OIDC_JWKS_URL"
