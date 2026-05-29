@@ -221,6 +221,24 @@ async def test_handover_token_is_one_time_and_revokes_human_control_token():
 
 
 @pytest.mark.asyncio
+async def test_human_can_cancel_a_pending_handover_with_control_token():
+    registry = SessionRegistry()
+    session, control_token = await registry.create_session(
+        CreateSessionRequest(conversation_id="conv_1", initial_owner="human")
+    )
+    assert control_token is not None
+    _, handover_token = await registry.handover(session.session_id, control_token, "")
+
+    # The control token still works for cancelling while the agent has not claimed.
+    cancelled = await registry.human_cancel(session.session_id, control_token, "changed mind")
+
+    assert cancelled.state == SessionState.CANCELLED
+    # The cancelled session is terminal, so the agent can no longer claim it.
+    with pytest.raises(ConflictError):
+        await registry.agent_claim(session.session_id, handover_token)
+
+
+@pytest.mark.asyncio
 async def test_agent_started_session_cannot_be_handed_over():
     registry = SessionRegistry()
     session, control_token = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
