@@ -196,7 +196,7 @@ class FakeBrowserWorker:
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "snapshot":
             return {
-                "url": self.url or "about:blank",
+                "url": redact_url(self.url)[0] if self.url else "about:blank",
                 "title": self.title,
                 "forms": 0,
                 "elements": 1,
@@ -211,9 +211,9 @@ class FakeBrowserWorker:
         if request.type == "current_page":
             return {"url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "extract":
-            return {"url": self.url, "html": f"<html><body><h1>{self.title}</h1></body></html>"}
+            return {"url": redact_url(self.url)[0] if self.url else None, "html": f"<html><body><h1>{self.title}</h1></body></html>"}
         if request.type == "exec":
-            return {"result": self.title, "url": self.url}
+            return {"result": self.title, "url": redact_url(self.url)[0] if self.url else None}
         if request.type == "wait":
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "close_page":
@@ -304,7 +304,9 @@ class PlaywrightBrowserWorker:
             await page.keyboard.press(str(request.args["key"]))
             return await self._current_page_result({"accepted": True})
         if request.type == "snapshot":
-            return await page.evaluate(_SNAPSHOT_JS)
+            result = await page.evaluate(_SNAPSHOT_JS)
+            result["url"] = redact_url(result.get("url", ""))[0]
+            return result
         if request.type == "screenshot":
             png = await page.screenshot(type="png", full_page=False)
             return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}
@@ -314,15 +316,15 @@ class PlaywrightBrowserWorker:
                 html = await page.locator(str(selector)).inner_html()
             else:
                 html = await page.content()
-            return {"url": page.url, "html": html, "selector": selector}
+            return {"url": redact_url(page.url)[0], "html": html, "selector": selector}
         if request.type == "exec":
             from playwright.async_api import Error as PlaywrightError
 
             try:
                 result = await page.evaluate(_wrap_exec_code(str(request.args.get("code", ""))))
             except PlaywrightError as exc:
-                return {"error": str(exc), "url": page.url}
-            return {"result": result, "url": page.url}
+                return {"error": str(exc), "url": redact_url(page.url)[0]}
+            return {"result": result, "url": redact_url(page.url)[0]}
         if request.type == "wait":
             from typing import Literal, cast
 
@@ -577,3 +579,4 @@ def _find_novnc_web_path(novnc_path: str | None) -> str | None:
         if (candidate / "vnc.html").exists():
             return str(candidate)
     return None
+
