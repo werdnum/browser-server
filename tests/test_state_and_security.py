@@ -17,7 +17,7 @@ from browser_handoff_service.transitions import TransitionError, transition
 @pytest.mark.asyncio
 async def test_agent_loses_all_command_access_after_handoff_request():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     await registry.agent_command(
         session.session_id,
         AgentCommandRequest(type="navigate", args={"url": "https://example.test/path?secret=hidden"}),
@@ -40,7 +40,7 @@ async def test_agent_loses_all_command_access_after_handoff_request():
 @pytest.mark.asyncio
 async def test_handoff_token_is_one_time():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     _, url = await registry.handoff(
         session.session_id,
         HandoffRequest(reason="other", handoff_note="Review"),
@@ -65,7 +65,7 @@ async def test_handoff_token_is_one_time():
 @pytest.mark.asyncio
 async def test_pending_handoff_token_cannot_extend_claim_timeout():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     _, url = await registry.handoff(
         session.session_id,
         HandoffRequest(reason="other", handoff_note="Review"),
@@ -88,7 +88,7 @@ async def test_pending_handoff_token_cannot_extend_claim_timeout():
 @pytest.mark.asyncio
 async def test_payment_handoff_rejects_resume_policy():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     with pytest.raises(ConflictError):
         await registry.handoff(
             session.session_id,
@@ -100,7 +100,7 @@ async def test_payment_handoff_rejects_resume_policy():
 @pytest.mark.asyncio
 async def test_handoff_expected_origin_must_match_current_origin():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
 
     with pytest.raises(ConflictError):
         await registry.handoff(
@@ -131,7 +131,7 @@ async def test_handoff_expected_origin_must_match_current_origin():
 @pytest.mark.asyncio
 async def test_low_risk_handoff_can_return_agent_resumable_after_sanitize():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     await registry.agent_command(
         session.session_id,
         AgentCommandRequest(type="navigate", args={"url": "https://example.test/captcha?secret=human"}),
@@ -155,7 +155,7 @@ async def test_low_risk_handoff_can_return_agent_resumable_after_sanitize():
 @pytest.mark.asyncio
 async def test_expiry_reaper_closes_runtime_and_denies_commands():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     session.idle_expires_at = now_utc() - timedelta(seconds=1)
 
     expired = await registry.reap_expired()
@@ -167,15 +167,66 @@ async def test_expiry_reaper_closes_runtime_and_denies_commands():
         await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
 
 
+@pytest.mark.asyncio
+async def test_human_started_session_can_be_handed_over_to_agent():
+    registry = SessionRegistry()
+    session, control_token = await registry.create_session(
+        CreateSessionRequest(conversation_id="conv_1", initial_owner="human")
+    )
+
+    assert session.state == SessionState.HUMAN_ACTIVE
+    assert session.lease_owner == LeaseOwner.HUMAN
+    assert control_token is not None
+    # The human owns the lease, so the agent cannot act yet.
+    with pytest.raises(AuthorizationError):
+        await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
+
+    handed = await registry.handover(session.session_id, control_token, "Finish the booking")
+
+    assert handed.state == SessionState.AGENT_ACTIVE
+    assert handed.lease_owner == LeaseOwner.AGENT
+    assert handed.handoff_note == "Finish the booking"
+    response = await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
+    assert response.ok is True
+
+
+@pytest.mark.asyncio
+async def test_handover_revokes_human_control_token():
+    registry = SessionRegistry()
+    session, control_token = await registry.create_session(
+        CreateSessionRequest(conversation_id="conv_1", initial_owner="human")
+    )
+    assert control_token is not None
+
+    await registry.handover(session.session_id, control_token, "")
+
+    # The consumed control token can no longer drive the session as a human.
+    with pytest.raises(AuthorizationError):
+        await registry.authorize_remote(session.session_id, control_token)
+    with pytest.raises(AuthorizationError):
+        await registry.handover(session.session_id, control_token, "")
+
+
+@pytest.mark.asyncio
+async def test_agent_started_session_cannot_be_handed_over():
+    registry = SessionRegistry()
+    session, control_token = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+
+    assert session.state == SessionState.AGENT_ACTIVE
+    assert control_token is None
+    with pytest.raises(AuthorizationError):
+        await registry.handover(session.session_id, "any-token", "")
+
+
 def test_invalid_state_transitions_are_rejected():
     with pytest.raises(TransitionError):
-        transition(SessionState.HUMAN_ACTIVE, LeaseOwner.HUMAN, SessionState.AGENT_ACTIVE)
+        transition(SessionState.HUMAN_SENSITIVE, LeaseOwner.HUMAN, SessionState.AGENT_ACTIVE)
 
 
 @pytest.mark.asyncio
 async def test_navigation_origin_tracks_final_worker_url_after_redirect():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
 
     class RedirectWorker(FakeBrowserWorker):
         async def command(self, request):
@@ -202,7 +253,7 @@ async def test_navigation_origin_tracks_final_worker_url_after_redirect():
 @pytest.mark.asyncio
 async def test_location_changing_click_refreshes_current_origin():
     registry = SessionRegistry()
-    session = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     await registry.agent_command(
         session.session_id,
         AgentCommandRequest(type="navigate", args={"url": "https://merchant.test/checkout"}),

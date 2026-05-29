@@ -22,6 +22,7 @@ ALLOWED_TRANSITIONS = {
     (SessionState.AGENT_RESUMABLE, SessionState.HANDOFF_REQUESTED): LeaseOwner.SERVICE,
     (SessionState.HANDOFF_REQUESTED, SessionState.HUMAN_ACTIVE): LeaseOwner.HUMAN,
     (SessionState.HUMAN_ACTIVE, SessionState.HUMAN_SENSITIVE): LeaseOwner.HUMAN,
+    (SessionState.HUMAN_ACTIVE, SessionState.AGENT_ACTIVE): LeaseOwner.AGENT,
     (SessionState.HUMAN_ACTIVE, SessionState.COMPLETED): LeaseOwner.NONE,
     (SessionState.HUMAN_SENSITIVE, SessionState.COMPLETED): LeaseOwner.NONE,
     (SessionState.HANDOFF_REQUESTED, SessionState.CANCELLED): LeaseOwner.NONE,

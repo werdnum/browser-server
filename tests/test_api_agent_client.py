@@ -97,6 +97,60 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_human_started_session_hands_over_to_agent_through_http_api():
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_human_first", "initial_owner": "human"},
+        )
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert body["state"] == "human_active"
+        assert body["lease_owner"] == "human"
+        session_id = body["session_id"]
+        control_token = body["control_token"]
+        assert body["session_url"].endswith(f"/sessions/{session_id}?token={control_token}")
+
+        # The agent has no lease while the human drives the freshly started session.
+        denied = await client.post(
+            f"/v1/sessions/{session_id}/agent-command",
+            headers=headers,
+            json={"type": "current_page"},
+        )
+        assert denied.status_code == 403
+
+        page = await client.get(f"/sessions/{session_id}", params={"token": control_token})
+        assert page.status_code == 200
+        assert "Hand over to agent" in page.text
+
+        handover = await client.post(
+            f"/v1/sessions/{session_id}/handover",
+            json={"token": control_token, "handoff_note": "Search for flights"},
+        )
+        assert handover.status_code == 200, handover.text
+        assert handover.json()["state"] == "agent_active"
+        assert handover.json()["lease_owner"] == "agent"
+
+        # The agent can now drive the browser the human set up.
+        nav = await client.post(
+            f"/v1/sessions/{session_id}/agent-command",
+            headers=headers,
+            json={"type": "navigate", "args": {"url": "https://example.test/flights"}},
+        )
+        assert nav.status_code == 200, nav.text
+
+        # The handed-over control token is revoked for further human actions.
+        reused = await client.post(
+            f"/v1/sessions/{session_id}/handover",
+            json={"token": control_token, "handoff_note": "again"},
+        )
+        assert reused.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_service_auth_fails_closed_when_token_unset(monkeypatch):
     monkeypatch.delenv("BROWSER_HANDOFF_SERVICE_TOKEN", raising=False)
     transport = ASGITransport(app=app)

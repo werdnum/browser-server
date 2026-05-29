@@ -61,7 +61,7 @@ class SessionRegistry:
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
 
-    async def create_session(self, req: CreateSessionRequest) -> BrowserSession:
+    async def create_session(self, req: CreateSessionRequest) -> tuple[BrowserSession, str | None]:
         session = new_session(req)
         self.sessions[session.session_id] = session
         self.locks[session.session_id] = asyncio.Lock()
@@ -75,9 +75,19 @@ class SessionRegistry:
             session.lease_owner = LeaseOwner.NONE
             session.closed_at = now_utc()
             self._event(session, "worker_failed", "service", metadata={"reason": str(exc)[:500]})
-            return session
+            return session, None
+        if session.lease_owner == LeaseOwner.HUMAN:
+            control_token = mint_token()
+            self.tokens[hash_token(control_token)] = TokenRecord(
+                session_id=session.session_id,
+                token_hash=hash_token(control_token),
+                token_type="control",
+                expires_at=session.expires_at,
+            )
+            self._event(session, "session_created", "human")
+            return session, control_token
         self._event(session, "session_created", "agent")
-        return session
+        return session, None
 
     def get(self, session_id: str) -> BrowserSession:
         try:
@@ -166,6 +176,24 @@ class SessionRegistry:
             await self._cleanup_locked(session)
             session.updated_at = now_utc()
             self._event(session, "handoff_cancelled", "human", metadata={"outcome": outcome or "cancelled"})
+            return session
+
+    async def handover(self, session_id: str, token: str, handoff_note: str) -> BrowserSession:
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            record = self._authorize_token_locked(session, token, token_type="control")
+            if session.state != SessionState.HUMAN_ACTIVE:
+                raise ConflictError("only an active human session can be handed over to an agent")
+            session.lease_owner = transition(session.state, session.lease_owner, SessionState.AGENT_ACTIVE)
+            session.state = SessionState.AGENT_ACTIVE
+            session.handoff_reason = None
+            session.allowed_resume = "never"
+            session.handoff_note = handoff_note
+            record.consumed_at = now_utc()
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
+            session.updated_at = now_utc()
+            self._event(session, "handover_to_agent", "human")
             return session
 
     async def extend(self, session_id: str, token: str, minutes: int) -> BrowserSession:

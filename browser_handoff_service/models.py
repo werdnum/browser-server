@@ -46,6 +46,7 @@ OBSERVATION_COMMANDS = {"snapshot", "screenshot", "current_page"}
 class CreateSessionRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     interface_type: str = "research"
+    initial_owner: Literal["agent", "human"] = "agent"
 
 
 class HandoffRequest(BaseModel):
@@ -73,6 +74,11 @@ class AgentCommandRequest(BaseModel):
 
 class ClaimRequest(BaseModel):
     token: str
+
+
+class HandoverRequest(BaseModel):
+    token: str
+    handoff_note: str = Field(default="", max_length=1000)
 
 
 class HumanActionRequest(BaseModel):
@@ -132,12 +138,13 @@ class AgentCommandResponse(BaseModel):
 
 def new_session(req: CreateSessionRequest) -> BrowserSession:
     created = now_utc()
+    human_first = req.initial_owner == "human"
     return BrowserSession(
         session_id=f"bs_{uuid4().hex}",
         conversation_id=req.conversation_id,
         interface_type=req.interface_type,
-        state=SessionState.AGENT_ACTIVE,
-        lease_owner=LeaseOwner.AGENT,
+        state=SessionState.HUMAN_ACTIVE if human_first else SessionState.AGENT_ACTIVE,
+        lease_owner=LeaseOwner.HUMAN if human_first else LeaseOwner.AGENT,
         worker_id=f"worker_{uuid4().hex}",
         created_at=created,
         updated_at=created,
