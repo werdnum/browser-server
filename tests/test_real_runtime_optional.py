@@ -1,3 +1,4 @@
+import base64
 import os
 
 import pytest
@@ -28,9 +29,31 @@ async def test_real_local_chromium_runtime_smoke(monkeypatch):
         )
         assert result["title"] == "fixture"
         snapshot = await worker.command(AgentCommandRequest(type="snapshot"))
-        assert "Checkout" in snapshot["nodes"][0]["text"]
+        assert snapshot["title"] == "fixture"
+        assert snapshot["elements"] >= 1
+        names = _collect_names(snapshot["roots"])
+        assert any("Checkout" in name for name in names)
+        assert all(node["ref"].startswith("e") for node in snapshot["roots"])
+
+        screenshot = await worker.command(AgentCommandRequest(type="screenshot"))
+        assert screenshot["mime_type"] == "image/png"
+        assert base64.b64decode(screenshot["image_base64"])[:8] == b"\x89PNG\r\n\x1a\n"
+
+        extracted = await worker.command(AgentCommandRequest(type="extract"))
+        assert "Checkout" in extracted["html"]
+
+        executed = await worker.command(AgentCommandRequest(type="exec", args={"code": "document.title"}))
+        assert executed["result"] == "fixture"
     finally:
         await worker.close()
+
+
+def _collect_names(nodes: list[dict]) -> list[str]:
+    names: list[str] = []
+    for node in nodes:
+        names.append(node.get("name", ""))
+        names.extend(_collect_names(node.get("children", [])))
+    return names
 
 
 def test_novnc_stack_readiness_is_reported_from_real_binaries():

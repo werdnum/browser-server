@@ -39,7 +39,18 @@ class ConflictError(RuntimeError):
     pass
 
 
-PAGE_STATE_COMMANDS = {"navigate", "click", "type_text", "select", "press_key", "current_page", "close_page"}
+PAGE_STATE_COMMANDS = {
+    "navigate",
+    "click",
+    "type_text",
+    "select",
+    "press_key",
+    "current_page",
+    "close_page",
+    "wait",
+    "exec",
+    "extract",
+}
 
 
 @dataclass
