@@ -260,7 +260,9 @@ class SessionRegistry:
             if session.state == SessionState.HANDOFF_REQUESTED:
                 self._authorize_token_locked(session, token, token_type="handoff")
             else:
-                self._authorize_human_token_locked(session, token)
+                # allow_pending lets the page reload while a handover is pending: the human
+                # still holds their control token and can see state / cancel from the UI.
+                self._authorize_human_token_locked(session, token, allow_pending=True)
             return session
 
     async def agent_command(self, session_id: str, req: AgentCommandRequest) -> AgentCommandResponse:

@@ -163,6 +163,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       <p><code id="handover-token"></code></p>
       <p>The agent claims it with <code>POST <span id="handover-claim-url"></span></code> and <code>{"token": "&lt;token&gt;"}</code>.</p>
     </div>
+    <p id="handover-pending" hidden>Handover pending — the one-time token was shown once and cannot be redisplayed. Click Cancel to abort and start over.</p>
     <div class="viewport" id="viewport">Remote viewport not connected</div>
   </main>
   <script>
@@ -195,8 +196,12 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     };
     document.querySelector("#complete").onclick = () => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"});
     document.querySelector("#cancel").onclick = () => post(`/v1/sessions/${sid}/cancel`, {token, outcome: "cancelled"});
-    if (token && document.querySelector("#state").textContent.trim() === "human_active") {
+    const initialState = document.querySelector("#state").textContent.trim();
+    if (token && initialState === "human_active") {
       connectViewport();
+    }
+    if (initialState === "handover_requested") {
+      document.querySelector("#handover-pending").hidden = false;
     }
   </script>
 </body>

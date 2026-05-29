@@ -239,6 +239,22 @@ async def test_human_can_cancel_a_pending_handover_with_control_token():
 
 
 @pytest.mark.asyncio
+async def test_pending_handover_page_reloads_with_control_token():
+    registry = SessionRegistry()
+    session, control_token = await registry.create_session(
+        CreateSessionRequest(conversation_id="conv_1", initial_owner="human")
+    )
+    assert control_token is not None
+    await registry.handover(session.session_id, control_token, "")
+
+    # Reopening the session page while the handover is pending must keep working.
+    page = await registry.authorize_handoff_page(session.session_id, control_token)
+    assert page.state == SessionState.HANDOVER_REQUESTED
+    with pytest.raises(AuthorizationError):
+        await registry.authorize_handoff_page(session.session_id, "wrong")
+
+
+@pytest.mark.asyncio
 async def test_agent_started_session_cannot_be_handed_over():
     registry = SessionRegistry()
     session, control_token = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))

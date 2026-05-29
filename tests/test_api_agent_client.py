@@ -137,6 +137,11 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
         handover_token = handover_body["handover_token"]
         assert handover_body["agent_claim_url"].endswith(f"/v1/sessions/{session_id}/agent-claim")
 
+        # The session page still loads (state + cancel) if the user reloads while pending.
+        pending_page = await client.get(f"/sessions/{session_id}", params={"token": control_token})
+        assert pending_page.status_code == 200
+        assert "Handover pending" in pending_page.text
+
         # The agent has no lease until it claims with the handover token.
         not_yet = await client.post(
             f"/v1/sessions/{session_id}/agent-command",
