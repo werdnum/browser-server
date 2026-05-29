@@ -25,6 +25,7 @@ from .models import (
     ExtendRequest,
     HandoffRequest,
     HandoffResponse,
+    HandoverRequest,
     HumanActionRequest,
     SessionState,
 )
@@ -55,12 +56,33 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
   <main>
     <h1>Browser Handoff Service</h1>
     <p>This service manages browser sessions and hands them off between agents and humans safely.</p>
+    <p>
+      <button id="start">Start a browser session</button>
+      <span id="start-status"></span>
+    </p>
     <nav>
       <a href="/sessions">View Sessions</a>
       <a href="/docs">API Docs</a>
       <a href="/health">Health Status</a>
     </nav>
   </main>
+  <script>
+    document.querySelector("#start").onclick = async () => {
+      const status = document.querySelector("#start-status");
+      status.textContent = "Starting…";
+      const res = await fetch("/v1/sessions", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({conversation_id: `conv_${Date.now()}`, initial_owner: "human"}),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.session_url) {
+        status.textContent = json.detail || "Could not start a session";
+        return;
+      }
+      window.location.href = json.session_url;
+    };
+  </script>
 </body>
 </html>"""
 )
@@ -132,8 +154,16 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     <button id="claim">Claim</button>
     <button id="extend">Extend</button>
     <button id="sensitive">Mark sensitive</button>
+    <input id="handover-note" type="text" placeholder="What should the agent do next?" />
+    <button id="handover">Hand over to agent</button>
     <button id="complete">Complete</button>
     <button id="cancel">Cancel</button>
+    <div id="handover-result" hidden>
+      <p>Give this one-time token to your agent so it can take over the session:</p>
+      <p><code id="handover-token"></code></p>
+      <p>The agent claims it with <code>POST <span id="handover-claim-url"></span></code> and <code>{"token": "&lt;token&gt;"}</code>.</p>
+    </div>
+    <p id="handover-pending" hidden>Handover pending — the one-time token was shown once and cannot be redisplayed. Click Cancel to abort and start over.</p>
     <div class="viewport" id="viewport">Remote viewport not connected</div>
   </main>
   <script>
@@ -146,17 +176,33 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       document.querySelector("#state").textContent = json.state;
       return json;
     }
+    async function connectViewport() {
+      const remote = await fetch(`/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
+      document.querySelector("#viewport").textContent = remote.ok ? "noVNC viewport authorized" : "Remote viewport unavailable";
+    }
     document.querySelector("#claim").onclick = async () => {
       const claim = await post(`/v1/sessions/${sid}/claim`, {token});
       token = claim.control_token;
       document.body.dataset.token = token;
-      const remote = await fetch(`/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
-      document.querySelector("#viewport").textContent = remote.ok ? "noVNC viewport authorized" : "Remote viewport unavailable";
+      await connectViewport();
     };
     document.querySelector("#extend").onclick = () => post(`/v1/sessions/${sid}/extend`, {token, minutes: 5});
     document.querySelector("#sensitive").onclick = () => post(`/v1/sessions/${sid}/mark-sensitive`, {token});
+    document.querySelector("#handover").onclick = async () => {
+      const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
+      document.querySelector("#handover-token").textContent = result.handover_token;
+      document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
+      document.querySelector("#handover-result").hidden = false;
+    };
     document.querySelector("#complete").onclick = () => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"});
     document.querySelector("#cancel").onclick = () => post(`/v1/sessions/${sid}/cancel`, {token, outcome: "cancelled"});
+    const initialState = document.querySelector("#state").textContent.trim();
+    if (token && initialState === "human_active") {
+      connectViewport();
+    }
+    if (initialState === "handover_requested") {
+      document.querySelector("#handover-pending").hidden = false;
+    }
   </script>
 </body>
 </html>"""
@@ -249,11 +295,16 @@ async def health():
 
 
 @app.post("/v1/sessions", dependencies=[Depends(require_service_auth)])
-async def create_session(req: CreateSessionRequest):
-    session = await registry.create_session(req)
+async def create_session(req: CreateSessionRequest, request: Request):
+    session, control_token = await registry.create_session(req)
     if session.state == SessionState.FAILED:
         raise HTTPException(status_code=503, detail="browser runtime unavailable")
-    return session
+    if control_token is None:
+        return session
+    response = session.model_dump(mode="json")
+    response["control_token"] = control_token
+    response["session_url"] = f"{str(request.base_url).rstrip('/')}/sessions/{session.session_id}?token={control_token}"
+    return response
 
 
 @app.get("/v1/sessions/{session_id}", dependencies=[Depends(require_service_auth)])
@@ -338,6 +389,30 @@ async def complete(session_id: str, req: HumanActionRequest):
 async def cancel(session_id: str, req: HumanActionRequest):
     try:
         return await registry.human_cancel(session_id, req.token, req.outcome)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/sessions/{session_id}/handover")
+async def handover(session_id: str, req: HandoverRequest, request: Request):
+    try:
+        session, handover_token = await registry.handover(session_id, req.token, req.handoff_note)
+        base_url = str(request.base_url).rstrip("/")
+        return {
+            "session_id": session.session_id,
+            "state": session.state,
+            "handover_token": handover_token,
+            "agent_claim_url": f"{base_url}/v1/sessions/{session.session_id}/agent-claim",
+            "expires_at": session.idle_expires_at,
+        }
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/sessions/{session_id}/agent-claim", dependencies=[Depends(require_service_auth)])
+async def agent_claim(session_id: str, req: ClaimRequest):
+    try:
+        return await registry.agent_claim(session_id, req.token)
     except Exception as exc:
         raise map_errors(exc) from exc
 

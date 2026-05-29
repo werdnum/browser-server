@@ -61,7 +61,7 @@ class SessionRegistry:
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
 
-    async def create_session(self, req: CreateSessionRequest) -> BrowserSession:
+    async def create_session(self, req: CreateSessionRequest) -> tuple[BrowserSession, str | None]:
         session = new_session(req)
         self.sessions[session.session_id] = session
         self.locks[session.session_id] = asyncio.Lock()
@@ -75,9 +75,19 @@ class SessionRegistry:
             session.lease_owner = LeaseOwner.NONE
             session.closed_at = now_utc()
             self._event(session, "worker_failed", "service", metadata={"reason": str(exc)[:500]})
-            return session
+            return session, None
+        if session.lease_owner == LeaseOwner.HUMAN:
+            control_token = mint_token()
+            self.tokens[hash_token(control_token)] = TokenRecord(
+                session_id=session.session_id,
+                token_hash=hash_token(control_token),
+                token_type="control",
+                expires_at=session.expires_at,
+            )
+            self._event(session, "session_created", "human")
+            return session, control_token
         self._event(session, "session_created", "agent")
-        return session
+        return session, None
 
     def get(self, session_id: str) -> BrowserSession:
         try:
@@ -168,6 +178,50 @@ class SessionRegistry:
             self._event(session, "handoff_cancelled", "human", metadata={"outcome": outcome or "cancelled"})
             return session
 
+    async def handover(self, session_id: str, token: str, handoff_note: str) -> tuple[BrowserSession, str]:
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            # Keep authorizing with the human control token, but do not consume it: it stays
+            # valid through the pending window so the human can still cancel if the agent never
+            # claims. State guards block every other human action while in HANDOVER_REQUESTED,
+            # and agent_claim revokes it once the agent takes over.
+            self._authorize_token_locked(session, token, token_type="control")
+            if session.state != SessionState.HUMAN_ACTIVE:
+                raise ConflictError("only an active human session can be handed over to an agent")
+            session.lease_owner = transition(session.state, session.lease_owner, SessionState.HANDOVER_REQUESTED)
+            session.state = SessionState.HANDOVER_REQUESTED
+            session.handoff_reason = None
+            session.allowed_resume = "never"
+            session.handoff_note = handoff_note
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=10), session.expires_at)
+            session.updated_at = now_utc()
+            handover_token = mint_token()
+            self.tokens[hash_token(handover_token)] = TokenRecord(
+                session_id=session_id,
+                token_hash=hash_token(handover_token),
+                token_type="handover",
+                expires_at=session.idle_expires_at,
+            )
+            self._event(session, "handover_requested", "human")
+            return session, handover_token
+
+    async def agent_claim(self, session_id: str, token: str) -> BrowserSession:
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if session.state != SessionState.HANDOVER_REQUESTED:
+                raise ConflictError("session is not awaiting an agent handover")
+            handover_record = self._authorize_token_locked(session, token, token_type="handover")
+            session.lease_owner = transition(session.state, session.lease_owner, SessionState.AGENT_ACTIVE)
+            session.state = SessionState.AGENT_ACTIVE
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
+            session.updated_at = now_utc()
+            handover_record.consumed_at = now_utc()
+            self._revoke_session_tokens_locked(session, token_type="control")
+            self._event(session, "handover_claimed", "agent")
+            return session
+
     async def extend(self, session_id: str, token: str, minutes: int) -> BrowserSession:
         session = self.get(session_id)
         async with self.locks[session_id]:
@@ -206,7 +260,9 @@ class SessionRegistry:
             if session.state == SessionState.HANDOFF_REQUESTED:
                 self._authorize_token_locked(session, token, token_type="handoff")
             else:
-                self._authorize_human_token_locked(session, token)
+                # allow_pending lets the page reload while a handover is pending: the human
+                # still holds their control token and can see state / cancel from the UI.
+                self._authorize_human_token_locked(session, token, allow_pending=True)
             return session
 
     async def agent_command(self, session_id: str, req: AgentCommandRequest) -> AgentCommandResponse:
@@ -300,11 +356,23 @@ class SessionRegistry:
     def _authorize_human_token_locked(self, session: BrowserSession, token: str, allow_pending: bool = False) -> None:
         allowed_states = {SessionState.HUMAN_ACTIVE, SessionState.HUMAN_SENSITIVE}
         if allow_pending:
+            # While a handoff is pending the human authorizes with the one-time handoff token;
+            # while a handover is pending they still hold their (unconsumed) control token.
             allowed_states.add(SessionState.HANDOFF_REQUESTED)
+            allowed_states.add(SessionState.HANDOVER_REQUESTED)
         if session.state not in allowed_states:
             raise AuthorizationError("session is not human-controlled")
         token_type = "handoff" if allow_pending and session.state == SessionState.HANDOFF_REQUESTED else "control"
         self._authorize_token_locked(session, token, token_type=token_type)
+
+    def _revoke_session_tokens_locked(self, session: BrowserSession, token_type: str) -> None:
+        for record in self.tokens.values():
+            if (
+                record.session_id == session.session_id
+                and record.token_type == token_type
+                and record.consumed_at is None
+            ):
+                record.consumed_at = now_utc()
 
     def _authorize_token_locked(
         self, session: BrowserSession, token: str, token_type: str | None = None

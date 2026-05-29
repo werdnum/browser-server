@@ -9,6 +9,7 @@ Implemented:
 - Service-authenticated agent API.
 - No human user identity model; handoff URL/control tokens are the human authorization primitive.
 - Human claim, complete, cancel, extend, and mark-sensitive flows.
+- Human-initiated sessions: a user can start a browser session (`initial_owner: "human"`) and later hand it over to an agent.
 - One-time handoff URL tokens; claim returns a separate human control token for remote/actions.
 - Optional `expected_origin` validation before minting a handoff URL.
 - Fail-closed command authorization after handoff starts.
@@ -20,6 +21,25 @@ Implemented:
 - SSE lifecycle event stream.
 - Agent-side smoke client in `scripts/agent_client_smoke.py`.
 - Python and Playwright e2e tests.
+
+## Session flows
+
+The service supports handing control of a single browser session in either direction:
+
+- **Agent-first (agent → human).** Create a session (the default `initial_owner: "agent"`),
+  drive it with agent commands, then `POST /v1/sessions/{id}/handoff` to mint a one-time
+  handoff URL. The human opens the URL, claims it, and finishes the task.
+- **Human-first (human → agent).** Create a session with `initial_owner: "human"` (the
+  "Start a browser session" button on the landing page does this from the
+  OAuth-authenticated UI). The response includes a `control_token` and a ready-to-open
+  `session_url`; the user drives the browser (e.g. signs in or navigates to the right page).
+  When ready, the user clicks "Hand over to agent" (`POST /v1/sessions/{id}/handover` with the
+  control token and an optional `handoff_note`). This is the mirror of `handoff`: the session
+  is parked in `handover_requested`, the human control token is revoked, and a one-time
+  `handover_token` plus `agent_claim_url` are returned for the user to give to their agent.
+  The agent — using its existing service credentials — takes over with
+  `POST /v1/sessions/{id}/agent-claim` and the `handover_token`, which transitions the session
+  to `agent_active` and lets the agent resume with agent commands. Unclaimed handovers expire.
 
 ## Setup
 

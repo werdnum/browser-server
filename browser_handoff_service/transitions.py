@@ -22,6 +22,9 @@ ALLOWED_TRANSITIONS = {
     (SessionState.AGENT_RESUMABLE, SessionState.HANDOFF_REQUESTED): LeaseOwner.SERVICE,
     (SessionState.HANDOFF_REQUESTED, SessionState.HUMAN_ACTIVE): LeaseOwner.HUMAN,
     (SessionState.HUMAN_ACTIVE, SessionState.HUMAN_SENSITIVE): LeaseOwner.HUMAN,
+    (SessionState.HUMAN_ACTIVE, SessionState.HANDOVER_REQUESTED): LeaseOwner.SERVICE,
+    (SessionState.HANDOVER_REQUESTED, SessionState.AGENT_ACTIVE): LeaseOwner.AGENT,
+    (SessionState.HANDOVER_REQUESTED, SessionState.CANCELLED): LeaseOwner.NONE,
     (SessionState.HUMAN_ACTIVE, SessionState.COMPLETED): LeaseOwner.NONE,
     (SessionState.HUMAN_SENSITIVE, SessionState.COMPLETED): LeaseOwner.NONE,
     (SessionState.HANDOFF_REQUESTED, SessionState.CANCELLED): LeaseOwner.NONE,
@@ -46,4 +49,6 @@ def transition(state: SessionState, owner: LeaseOwner, to_state: SessionState) -
         raise TransitionError("human-owned transition requires human lease")
     if state == SessionState.HANDOFF_REQUESTED and owner != LeaseOwner.SERVICE:
         raise TransitionError("handoff claim requires service lease")
+    if state == SessionState.HANDOVER_REQUESTED and owner != LeaseOwner.SERVICE:
+        raise TransitionError("handover claim requires service lease")
     return next_owner
