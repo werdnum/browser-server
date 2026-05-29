@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
@@ -10,6 +11,40 @@ from pydantic import BaseModel, Field, HttpUrl
 
 def now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+FormFactorName = Literal["mobile", "desktop"]
+
+# Default new sessions to a mobile-friendly portrait aspect ratio.
+DEFAULT_FORM_FACTOR: FormFactorName = "mobile"
+
+# Modern Chrome-on-Android user agent so sites serve their mobile layout.
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+
+
+@dataclass(frozen=True)
+class FormFactor:
+    """Display profile for a session: framebuffer size and optional emulation UA."""
+
+    width: int
+    height: int
+    user_agent: str | None = None
+
+
+FORM_FACTORS: dict[str, FormFactor] = {
+    # Portrait phone (Pixel 7 logical viewport).
+    "mobile": FormFactor(width=412, height=915, user_agent=MOBILE_USER_AGENT),
+    # Landscape desktop.
+    "desktop": FormFactor(width=1280, height=720, user_agent=None),
+}
+
+
+def form_factor_profile(name: str) -> FormFactor:
+    """Resolve a form factor name to its display profile, falling back to the default."""
+    return FORM_FACTORS.get(name, FORM_FACTORS[DEFAULT_FORM_FACTOR])
 
 
 class SessionState(StrEnum):
@@ -48,6 +83,7 @@ class CreateSessionRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     interface_type: str = "research"
     initial_owner: Literal["agent", "human"] = "agent"
+    form_factor: FormFactorName = DEFAULT_FORM_FACTOR
 
 
 class HandoffRequest(BaseModel):
@@ -96,6 +132,7 @@ class BrowserSession(BaseModel):
     session_id: str
     conversation_id: str
     interface_type: str
+    form_factor: str = DEFAULT_FORM_FACTOR
     state: SessionState
     lease_owner: LeaseOwner
     worker_id: str | None = None
@@ -144,6 +181,7 @@ def new_session(req: CreateSessionRequest) -> BrowserSession:
         session_id=f"bs_{uuid4().hex}",
         conversation_id=req.conversation_id,
         interface_type=req.interface_type,
+        form_factor=req.form_factor,
         state=SessionState.HUMAN_ACTIVE if human_first else SessionState.AGENT_ACTIVE,
         lease_owner=LeaseOwner.HUMAN if human_first else LeaseOwner.AGENT,
         worker_id=f"worker_{uuid4().hex}",

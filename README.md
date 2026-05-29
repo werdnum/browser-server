@@ -16,6 +16,7 @@ Implemented:
 - Sanitized resume for low-risk handoffs closes the human-controlled page before returning the lease.
 - Real Playwright Chromium runtime by default.
 - Headed Chromium plus Xvfb/x11vnc/noVNC launch path when host binaries are installed.
+- Mobile-friendly portrait sessions by default (`form_factor`); the noVNC viewport is sized to match.
 - noVNC access is exposed through the authenticated service proxy; raw worker noVNC ports stay loopback-only.
 - Minimal human UI at `/sessions/{session_id}`.
 - SSE lifecycle event stream.
@@ -23,6 +24,11 @@ Implemented:
 - Python and Playwright e2e tests.
 
 ## Session flows
+
+New sessions default to a mobile-friendly portrait `form_factor` (`"mobile"`, a 412×915
+framebuffer with a mobile user agent so sites serve their mobile layout). Pass
+`form_factor: "desktop"` when creating a session for a landscape 1280×720 display. The
+human UI sizes its noVNC viewport to match the session's aspect ratio.
 
 The service supports handing control of a single browser session in either direction:
 
