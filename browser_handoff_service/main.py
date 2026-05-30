@@ -273,8 +273,8 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     .notice p:last-child { margin-bottom: 0; }
     .error { border-color: var(--danger); color: var(--danger); background: var(--surface); }
     .viewport {
-      width: 100%; aspect-ratio: {{ viewport_width }} / {{ viewport_height }};
-      max-height: 85vh; margin: 0;
+      width: min(100%, calc(85vh * {{ viewport_width }} / {{ viewport_height }}));
+      aspect-ratio: {{ viewport_width }} / {{ viewport_height }}; margin: 0 auto;
       border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
       display: grid; place-items: center; background: var(--surface-2); color: var(--muted);
       overflow: hidden;
@@ -302,7 +302,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     .handover-details summary { cursor: pointer; font-size: .88rem; color: var(--muted); }
 """,
     )
-    + """<body data-session-id="{{ session.session_id }}" data-token="{{ token }}">
+    + """<body data-session-id="{{ session.session_id }}" data-token="{{ token }}" data-base-path="{{ base_path }}">
   <div class="wrap">
     """
     + _BRAND
@@ -369,6 +369,9 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
   <script>
     const sid = document.body.dataset.sessionId;
     let token = document.body.dataset.token;
+    // When the service is reached under a path prefix (a configured public URL or an
+    // X-Forwarded-Prefix proxy), API calls from this page must carry that prefix too.
+    const basePath = document.body.dataset.basePath || "";
     function showError(message) {
       const el = document.querySelector("#action-error");
       el.textContent = message || "Something went wrong.";
@@ -421,7 +424,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       if (target) copyText(target.textContent, btn);
     });
     async function post(path, body) {
-      const res = await fetch(path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
+      const res = await fetch(basePath + path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
       let json = {};
       try {
         json = await res.json();
@@ -436,7 +439,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       const viewport = document.querySelector("#viewport");
       viewport.classList.remove("connected");
       viewport.textContent = "Connecting remote viewport...";
-      const remote = await fetch(`/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
+      const remote = await fetch(`${basePath}/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
       let json = {};
       try {
         json = await remote.json();
@@ -913,18 +916,22 @@ async def session_list():
 
 
 @app.get("/sessions/{session_id}", response_class=HTMLResponse)
-async def session_detail(session_id: str, token: str | None = None):
+async def session_detail(session_id: str, request: Request, token: str | None = None):
     try:
         session = await registry.authorize_handoff_page(session_id, token or "")
     except Exception as exc:
         raise map_errors(exc) from exc
     profile = form_factor_profile(session.form_factor)
     box_width, box_height = _viewport_box(profile.width, profile.height)
+    # The page's own API calls must include the public path prefix (if any) so they keep
+    # working behind a proxy that only exposes the service under that prefix.
+    base_path = urlsplit(public_base_url(request)).path.rstrip("/")
     return SESSION_DETAIL_TEMPLATE.render(
         session=session,
         token=token or "",
         viewport_width=box_width,
         viewport_height=box_height,
+        base_path=base_path,
     )
 
 

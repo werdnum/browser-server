@@ -428,6 +428,11 @@ async def test_public_url_override_replaces_internal_request_host(monkeypatch):
             f"https://browser.example.com/app/v1/sessions/{session_id}/agent-claim"
         )
 
+        # The session page must carry the path prefix so its own API calls stay under /app.
+        page = await client.get(f"/sessions/{session_id}", params={"token": control_token})
+        assert page.status_code == 200
+        assert 'data-base-path="/app"' in page.text
+
 
 @pytest.mark.asyncio
 async def test_public_url_override_rejects_relative_value(monkeypatch):
