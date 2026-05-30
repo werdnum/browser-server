@@ -682,6 +682,9 @@ async def health():
 
 @app.post("/v1/sessions", dependencies=[Depends(require_service_auth)])
 async def create_session(req: CreateSessionRequest, request: Request):
+    # Resolve (and validate) the public base URL before launching a browser, so a
+    # misconfigured BROWSER_HANDOFF_PUBLIC_URL fails fast instead of leaking a started session.
+    base_url = public_base_url(request).rstrip("/")
     session, control_token = await registry.create_session(req)
     if session.state == SessionState.FAILED:
         raise HTTPException(status_code=503, detail="browser runtime unavailable")
@@ -689,9 +692,7 @@ async def create_session(req: CreateSessionRequest, request: Request):
         return session
     response = session.model_dump(mode="json")
     response["control_token"] = control_token
-    response["session_url"] = (
-        f"{public_base_url(request).rstrip('/')}/sessions/{session.session_id}?token={control_token}"
-    )
+    response["session_url"] = f"{base_url}/sessions/{session.session_id}?token={control_token}"
     return response
 
 
@@ -715,8 +716,11 @@ async def agent_command(session_id: str, req: AgentCommandRequest):
     "/v1/sessions/{session_id}/handoff", response_model=HandoffResponse, dependencies=[Depends(require_service_auth)]
 )
 async def handoff(session_id: str, req: HandoffRequest, request: Request):
+    # Resolve the public base URL before mutating session state so a misconfigured
+    # BROWSER_HANDOFF_PUBLIC_URL never strands the session mid-handoff.
+    base_url = public_base_url(request)
     try:
-        session, url = await registry.handoff(session_id, req, public_base_url(request))
+        session, url = await registry.handoff(session_id, req, base_url)
         return {
             "session_id": session.session_id,
             "state": session.state,
@@ -783,9 +787,11 @@ async def cancel(session_id: str, req: HumanActionRequest):
 
 @app.post("/v1/sessions/{session_id}/handover")
 async def handover(session_id: str, req: HandoverRequest, request: Request):
+    # Resolve the public base URL before mutating session state: a misconfigured
+    # BROWSER_HANDOFF_PUBLIC_URL must not park the session and burn the one-time token.
+    base_url = public_base_url(request).rstrip("/")
     try:
         session, handover_token = await registry.handover(session_id, req.token, req.handoff_note)
-        base_url = public_base_url(request).rstrip("/")
         return {
             "session_id": session.session_id,
             "state": session.state,

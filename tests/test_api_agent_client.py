@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from browser_handoff_service import main
 from browser_handoff_service.main import app, novnc_proxy_url, registry
+from browser_handoff_service.models import SessionState
 from browser_handoff_service.runtime import RemoteDisplayStatus
 from httpx import ASGITransport, AsyncClient
 
@@ -451,3 +452,38 @@ async def test_public_url_override_rejects_relative_value(monkeypatch):
         )
         assert created.status_code == 500, created.text
         assert main.PUBLIC_URL_ENV in created.json()["detail"]
+        # The misconfigured URL is caught before launching a browser, so nothing is stranded.
+        assert registry.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_bad_public_url_does_not_strand_handover(monkeypatch):
+    """A malformed public URL must be caught before handover mutates state, so the user
+    keeps a usable session instead of one parked in handover_requested with a burned token."""
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_handover_strand", "initial_owner": "human"},
+        )
+        assert created.status_code == 200, created.text
+        session_id = created.json()["session_id"]
+        control_token = created.json()["control_token"]
+
+        monkeypatch.setenv(main.PUBLIC_URL_ENV, "not-a-url")
+        failed = await client.post(
+            f"/v1/sessions/{session_id}/handover",
+            json={"token": control_token, "handoff_note": "take over"},
+        )
+        assert failed.status_code == 500, failed.text
+
+        # The session is untouched: still human_active and the control token still works.
+        monkeypatch.delenv(main.PUBLIC_URL_ENV, raising=False)
+        assert registry.sessions[session_id].state == SessionState.HUMAN_ACTIVE
+        extended = await client.post(
+            f"/v1/sessions/{session_id}/extend",
+            json={"token": control_token, "minutes": 5},
+        )
+        assert extended.status_code == 200, extended.text
