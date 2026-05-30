@@ -136,6 +136,15 @@ class AgentCommandRequest(BaseModel):
         "extract",
         "exec",
         "wait",
+        "mouse_click",
+        "mouse_move",
+        "mouse_down",
+        "mouse_up",
+        "mouse_wheel",
+        "keyboard_type",
+        "keyboard_press",
+        "navigate_back",
+        "navigate_forward",
     ]
     args: dict[str, Any] = Field(default_factory=dict)
 
