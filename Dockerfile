@@ -49,7 +49,7 @@ COPY browser_handoff_service ./browser_handoff_service
 
 RUN python -m pip install --no-cache-dir --upgrade pip \
   && python -m pip install --no-cache-dir . \
-  && python -m playwright install chromium \
+  && python -m rebrowser_playwright install chromium \
   && useradd --create-home --shell /usr/sbin/nologin appuser \
   && chown -R appuser:appuser /app /ms-playwright
 

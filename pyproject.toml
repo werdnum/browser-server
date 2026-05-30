@@ -22,6 +22,7 @@ dependencies = [
 test = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.24.0",
+  "playwright==1.52.0",
 ]
 dev = [
   "pytest>=8.3.0",
@@ -29,6 +30,7 @@ dev = [
   "pre-commit>=4.0.0",
   "ruff>=0.14.0",
   "ty>=0.0.1a22",
+  "playwright==1.52.0",
 ]
 
 [tool.pytest.ini_options]
