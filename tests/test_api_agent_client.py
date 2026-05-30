@@ -398,3 +398,47 @@ def test_remote_url_uses_authenticated_service_proxy_without_prefix():
         "https://handoff.example/v1/sessions/bs_example/novnc/vnc.html?"
         "autoconnect=1&resize=remote&path=%2Fv1%2Fsessions%2Fbs_example%2Fnovnc%2Fwebsockify"
     )
+
+
+@pytest.mark.asyncio
+async def test_public_url_override_replaces_internal_request_host(monkeypatch):
+    """A configured external URL must win over the (possibly internal) request host so we
+    never hand a cluster-internal address to a user or agent."""
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, "https://browser.example.com/app/")
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://browser.default.svc.cluster.local") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_public_url", "initial_owner": "human"},
+        )
+        assert created.status_code == 200, created.text
+        body = created.json()
+        session_id = body["session_id"]
+        control_token = body["control_token"]
+        assert body["session_url"] == (f"https://browser.example.com/app/sessions/{session_id}?token={control_token}")
+
+        handover = await client.post(
+            f"/v1/sessions/{session_id}/handover",
+            json={"token": control_token, "handoff_note": "take over"},
+        )
+        assert handover.status_code == 200, handover.text
+        assert handover.json()["agent_claim_url"] == (
+            f"https://browser.example.com/app/v1/sessions/{session_id}/agent-claim"
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_url_override_rejects_relative_value(monkeypatch):
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, "browser.example.com")
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_bad_public_url", "initial_owner": "human"},
+        )
+        assert created.status_code == 500, created.text
+        assert main.PUBLIC_URL_ENV in created.json()["detail"]

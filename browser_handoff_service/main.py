@@ -130,6 +130,22 @@ BASE_CSS = """
 
 _BRAND = '<div class="brand"><span class="logo">\U0001f5a5️</span><span class="name">Browser Handoff</span></div>'
 
+# Small inline "copy" glyph reused by every click-to-copy control.
+_COPY_ICON = (
+    '<svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<rect x="9" y="9" width="13" height="13" rx="2"/>'
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+)
+
+
+def _copy_button(target_id: str, label: str = "Copy") -> str:
+    """Render a click-to-copy button that copies the text content of ``target_id``."""
+    return (
+        f'<button type="button" class="copy-btn" data-copy="{target_id}" '
+        f'aria-label="Copy {label.lower()}">{_COPY_ICON}<span class="copy-text">{label}</span></button>'
+    )
+
 
 def _html_head(title: str, extra_css: str = "") -> str:
     return (
@@ -257,13 +273,33 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     .notice p:last-child { margin-bottom: 0; }
     .error { border-color: var(--danger); color: var(--danger); background: var(--surface); }
     .viewport {
-      width: {{ viewport_width }}px; height: {{ viewport_height }}px; max-width: 100%;
-      margin: 0 auto; border: 1px solid var(--border); border-radius: var(--radius);
+      width: 100%; aspect-ratio: {{ viewport_width }} / {{ viewport_height }};
+      max-height: 85vh; margin: 0;
+      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
       display: grid; place-items: center; background: var(--surface-2); color: var(--muted);
-      overflow: hidden; box-shadow: var(--shadow);
+      overflow: hidden;
     }
     .viewport.connected { display: block; }
     .viewport iframe { width: 100%; height: 100%; border: 0; display: block; }
+    .copy-label { font-weight: 600; font-size: .85rem; margin: .9rem 0 .3rem; }
+    .copy-row { display: flex; align-items: stretch; gap: .4rem; margin: .35rem 0; }
+    .copy-row code, .copy-row pre {
+      flex: 1 1 auto; min-width: 0; margin: 0; padding: .6rem .7rem; background: var(--surface-2);
+      border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem;
+      white-space: pre-wrap; word-break: break-word; max-height: 11rem; overflow: auto;
+    }
+    .copy-btn {
+      flex: 0 0 auto; display: inline-flex; align-items: center; gap: .35rem; align-self: flex-start;
+      padding: 0 .8rem; min-height: 40px; font: inherit; font-size: .85rem; font-weight: 560;
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      background: var(--surface); color: var(--text); cursor: pointer;
+    }
+    .copy-btn:hover { background: var(--surface-2); }
+    .copy-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+    .copy-icon { width: 15px; height: 15px; flex: none; }
+    .handover-details { margin-top: .75rem; }
+    .handover-details summary { cursor: pointer; font-size: .88rem; color: var(--muted); }
 """,
     )
     + """<body data-session-id="{{ session.session_id }}" data-token="{{ token }}">
@@ -298,16 +334,38 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           <button id="cancel" class="btn btn-danger">Cancel</button>
         </div>
         <div id="handover-result" class="notice" hidden>
-          <p>Give this one-time token to your agent so it can take over the session:</p>
-          <p><code id="handover-token"></code></p>
-          <p class="muted">The agent claims it with <code>POST <span id="handover-claim-url"></span></code> and <code>{"token": "&lt;token&gt;"}</code>.</p>
+          <p><strong>Ready to hand back to your agent.</strong></p>
+          <p class="muted">Copy the message below and send it to your agent — it has everything needed to take over.</p>
+          <div class="copy-row">
+            <pre id="agent-instruction"></pre>
+            """
+    + _copy_button("agent-instruction", "Copy message")
+    + """
+          </div>
+          <details class="handover-details">
+            <summary>Show the raw token and endpoint</summary>
+            <p class="copy-label">One-time token</p>
+            <div class="copy-row">
+              <code id="handover-token"></code>
+              """
+    + _copy_button("handover-token")
+    + """
+            </div>
+            <p class="copy-label">Claim endpoint</p>
+            <div class="copy-row">
+              <code id="handover-claim-url"></code>
+              """
+    + _copy_button("handover-claim-url")
+    + """
+            </div>
+          </details>
         </div>
-        <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and cannot be redisplayed. Click Cancel to abort and start over.</p>
+        <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and can't be shown again. Click Cancel to stop and start over.</p>
         <p id="action-error" class="notice error" role="alert" hidden></p>
       </div>
-      <div class="viewport" id="viewport">Remote viewport not connected</div>
     </main>
   </div>
+  <div class="viewport" id="viewport">Remote viewport not connected</div>
   <script>
     const sid = document.body.dataset.sessionId;
     let token = document.body.dataset.token;
@@ -331,6 +389,37 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
         }
       };
     }
+    async function copyText(text, btn) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const area = document.createElement("textarea");
+          area.value = text;
+          area.style.position = "fixed";
+          area.style.opacity = "0";
+          document.body.appendChild(area);
+          area.select();
+          document.execCommand("copy");
+          area.remove();
+        }
+        const label = btn.querySelector(".copy-text");
+        if (label) {
+          const original = label.dataset.label || label.textContent;
+          label.dataset.label = original;
+          label.textContent = "Copied";
+          setTimeout(() => { label.textContent = original; }, 1500);
+        }
+      } catch (err) {
+        showError("Couldn't copy to clipboard — select the text and copy manually.");
+      }
+    }
+    document.addEventListener("click", (event) => {
+      const btn = event.target.closest(".copy-btn");
+      if (!btn) return;
+      const target = document.getElementById(btn.dataset.copy);
+      if (target) copyText(target.textContent, btn);
+    });
     async function post(path, body) {
       const res = await fetch(path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
       let json = {};
@@ -377,6 +466,11 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
       document.querySelector("#handover-token").textContent = result.handover_token;
       document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
+      document.querySelector("#agent-instruction").textContent =
+        "Take over the browser session I set up. Claim it using your own service credentials by sending:\\n\\n"
+        + "POST " + result.agent_claim_url + "\\n"
+        + "Content-Type: application/json\\n\\n"
+        + JSON.stringify({token: result.handover_token});
       document.querySelector("#handover-result").hidden = false;
     });
     document.querySelector("#complete").onclick = action(() => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"}));
@@ -528,13 +622,41 @@ def map_errors(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=str(exc))
 
 
+PUBLIC_URL_ENV = "BROWSER_HANDOFF_PUBLIC_URL"
+
+
 def public_base_url(request: Request) -> str:
+    """Resolve the externally reachable base URL used in links we hand to users and agents.
+
+    When BROWSER_HANDOFF_PUBLIC_URL is set it always wins, so the service never tells a
+    user or agent to visit an internal address (e.g. a cluster.local Service URL) it picked
+    up from the request host. Otherwise we fall back to standard reverse-proxy forwarding
+    headers, then to the request's own scheme/host.
+    """
+    configured = _configured_public_base_url()
+    if configured is not None:
+        return configured
     scheme = _first_forwarded_value(request.headers.get("x-forwarded-proto")) or request.url.scheme
     host = _first_forwarded_value(request.headers.get("x-forwarded-host")) or request.url.netloc
     prefix = _first_forwarded_value(request.headers.get("x-forwarded-prefix")) or request.scope.get("root_path", "")
     normalized_prefix = prefix.strip("/") if prefix else ""
     path = f"/{normalized_prefix}/" if normalized_prefix else "/"
     return urlunsplit((scheme, host, path, "", ""))
+
+
+def _configured_public_base_url() -> str | None:
+    raw = os.environ.get(PUBLIC_URL_ENV, "").strip()
+    if not raw:
+        return None
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{PUBLIC_URL_ENV} must be an absolute URL with a scheme and host, e.g. https://browser.example.com",
+        )
+    normalized_prefix = parts.path.strip("/")
+    path = f"/{normalized_prefix}/" if normalized_prefix else "/"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
 def _first_forwarded_value(value: str | None) -> str | None:

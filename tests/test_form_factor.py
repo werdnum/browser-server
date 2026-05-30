@@ -185,5 +185,6 @@ async def test_session_detail_viewport_matches_form_factor():
 
     mobile = form_factor_profile("mobile")
     box_w, box_h = _viewport_box(mobile.width, mobile.height)
-    assert f"width: {box_w}px" in page.text
-    assert f"height: {box_h}px" in page.text
+    # The viewport now spans the full screen width and keeps the session aspect ratio.
+    assert "width: 100%" in page.text
+    assert f"aspect-ratio: {box_w} / {box_h}" in page.text

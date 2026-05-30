@@ -78,6 +78,24 @@ export BROWSER_HANDOFF_SERVICE_TOKEN="$(openssl rand -hex 32)"
 .venv/bin/python -m uvicorn browser_handoff_service.main:app --host 127.0.0.1 --port 8000
 ```
 
+### Public URL
+
+Links the service hands to users and agents (the session URL, handoff URL, agent
+claim endpoint, and the noVNC viewport) are built from the request host by default,
+falling back to `X-Forwarded-Proto`/`-Host`/`-Prefix` when behind a reverse proxy.
+In environments where the request host is internal (e.g. a `*.svc.cluster.local`
+Service address), set `BROWSER_HANDOFF_PUBLIC_URL` to the externally reachable base
+URL so the service never tells a user or agent to visit an unreachable internal
+address:
+
+```bash
+export BROWSER_HANDOFF_PUBLIC_URL="https://browser.example.com"
+# or, when served under a path prefix:
+export BROWSER_HANDOFF_PUBLIC_URL="https://example.com/browser"
+```
+
+When set, this value always wins over the request host and forwarding headers.
+
 Headed Chromium with noVNC, when Xvfb/x11vnc/noVNC are installed:
 
 ```bash
