@@ -161,7 +161,7 @@ def _html_head(title: str, extra_css: str = "") -> str:
 
 LANDING_PAGE_TEMPLATE = templates.from_string(
     _html_head("Browser Handoff Service")
-    + """<body>
+    + """<body data-base-path="{{ base_path }}">
   <div class="wrap">
     """
     + _BRAND
@@ -176,17 +176,19 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
         <p id="start-status" class="muted" role="status" aria-live="polite"></p>
       </div>
       <nav class="actions">
-        <a class="btn" href="/sessions">View Sessions</a>
-        <a class="btn" href="/docs">API Docs</a>
-        <a class="btn" href="/health">Health Status</a>
+        <a class="btn" href="{{ base_path }}/sessions">View Sessions</a>
+        <a class="btn" href="{{ base_path }}/docs">API Docs</a>
+        <a class="btn" href="{{ base_path }}/health">Health Status</a>
       </nav>
     </main>
   </div>
   <script>
+    // Keep API calls under the public path prefix (configured public URL or proxy prefix).
+    const basePath = document.body.dataset.basePath || "";
     document.querySelector("#start").onclick = async () => {
       const status = document.querySelector("#start-status");
       status.textContent = "Starting…";
-      const res = await fetch("/v1/sessions", {
+      const res = await fetch(basePath + "/v1/sessions", {
         method: "POST",
         headers: {"content-type": "application/json"},
         body: JSON.stringify({
@@ -662,6 +664,12 @@ def _configured_public_base_url() -> str | None:
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def _public_base_path(request: Request) -> str:
+    """The public path prefix (e.g. "/browser" or "") that browser-facing pages must prepend
+    to their own API calls so they keep working when the service is exposed under a prefix."""
+    return urlsplit(public_base_url(request)).path.rstrip("/")
+
+
 def _first_forwarded_value(value: str | None) -> str | None:
     if not value:
         return None
@@ -670,8 +678,8 @@ def _first_forwarded_value(value: str | None) -> str | None:
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
-async def landing_page():
-    return LANDING_PAGE_TEMPLATE.render()
+async def landing_page(request: Request):
+    return LANDING_PAGE_TEMPLATE.render(base_path=_public_base_path(request))
 
 
 @app.get("/health")
@@ -930,15 +938,12 @@ async def session_detail(session_id: str, request: Request, token: str | None = 
         raise map_errors(exc) from exc
     profile = form_factor_profile(session.form_factor)
     box_width, box_height = _viewport_box(profile.width, profile.height)
-    # The page's own API calls must include the public path prefix (if any) so they keep
-    # working behind a proxy that only exposes the service under that prefix.
-    base_path = urlsplit(public_base_url(request)).path.rstrip("/")
     return SESSION_DETAIL_TEMPLATE.render(
         session=session,
         token=token or "",
         viewport_width=box_width,
         viewport_height=box_height,
-        base_path=base_path,
+        base_path=_public_base_path(request),
     )
 
 

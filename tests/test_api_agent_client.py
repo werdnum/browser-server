@@ -32,6 +32,12 @@ async def test_landing_page():
         assert "Browser Handoff Service" in response.text
         assert "View Sessions" in response.text
 
+        # Under a path prefix the landing page must point its Start call and nav links there.
+        prefixed = await client.get("/", headers={**headers, "x-forwarded-prefix": "/browser"})
+        assert prefixed.status_code == 200
+        assert 'data-base-path="/browser"' in prefixed.text
+        assert 'href="/browser/sessions"' in prefixed.text
+
 
 @pytest.mark.asyncio
 async def test_agent_side_service_flow_through_http_api(monkeypatch):
