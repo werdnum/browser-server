@@ -17,6 +17,7 @@ import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, StrictUndefined, select_autoescape
+from pydantic import HttpUrl, TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .models import (
@@ -649,19 +650,34 @@ def public_base_url(request: Request) -> str:
     return urlunsplit((scheme, host, path, "", ""))
 
 
+_PUBLIC_URL_ADAPTER = TypeAdapter(HttpUrl)
+
+
 def _configured_public_base_url() -> str | None:
     raw = os.environ.get(PUBLIC_URL_ENV, "").strip()
     if not raw:
         return None
     parts = urlsplit(raw)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise HTTPException(
-            status_code=500,
-            detail=(f"{PUBLIC_URL_ENV} must be an absolute http(s) URL with a host, e.g. https://browser.example.com"),
-        )
     normalized_prefix = parts.path.strip("/")
     path = f"/{normalized_prefix}/" if normalized_prefix else "/"
-    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    normalized = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    # Validate scheme + authority (host/port) with a real URL validator so a malformed value
+    # like "https://bad host" or "https://host:bad" is rejected here rather than later, after a
+    # browser is launched or the session has already been mutated.
+    if parts.scheme not in ("http", "https") or not _is_valid_http_url(normalized):
+        raise HTTPException(
+            status_code=500,
+            detail=f"{PUBLIC_URL_ENV} must be an absolute http(s) URL with a valid host, e.g. https://browser.example.com",
+        )
+    return normalized
+
+
+def _is_valid_http_url(value: str) -> bool:
+    try:
+        _PUBLIC_URL_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
 
 
 def _public_base_path(request: Request) -> str:

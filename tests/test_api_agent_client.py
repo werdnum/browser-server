@@ -481,6 +481,25 @@ async def test_public_url_override_rejects_non_http_scheme(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_url", ["https://bad host", "https://browser.example.com:bad"])
+async def test_public_url_override_rejects_invalid_authority(monkeypatch, bad_url):
+    """An http(s) URL whose host/port is malformed must be rejected up front, not after a
+    browser is launched or the response fails HttpUrl validation."""
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, bad_url)
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_bad_authority", "initial_owner": "human"},
+        )
+        assert created.status_code == 500, created.text
+        assert main.PUBLIC_URL_ENV in created.json()["detail"]
+        assert registry.sessions == {}
+
+
+@pytest.mark.asyncio
 async def test_bad_public_url_does_not_strand_handover(monkeypatch):
     """A malformed public URL must be caught before handover mutates state, so the user
     keeps a usable session instead of one parked in handover_requested with a burned token."""
