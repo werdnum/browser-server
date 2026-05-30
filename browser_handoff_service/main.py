@@ -848,7 +848,7 @@ async def remote(session_id: str, token: str, request: Request):
         httponly=True,
         samesite="lax",
         secure=secure_cookie,
-        path=f"/v1/sessions/{session_id}/novnc",
+        path=_novnc_cookie_path(base_url, session_id),
     )
     return response
 
@@ -866,14 +866,15 @@ async def novnc_http_proxy(session_id: str, asset_path: str, request: Request, t
     query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "token"]
     response = await _proxy_novnc_http(remote_url, asset_path, query_items)
     if token:
-        secure_cookie = urlsplit(public_base_url(request)).scheme == "https"
+        base_url = public_base_url(request)
+        secure_cookie = urlsplit(base_url).scheme == "https"
         response.set_cookie(
             _novnc_cookie_name(session_id),
             token,
             httponly=True,
             samesite="lax",
             secure=secure_cookie,
-            path=f"/v1/sessions/{session_id}/novnc",
+            path=_novnc_cookie_path(base_url, session_id),
         )
     return response
 
@@ -967,6 +968,13 @@ def novnc_proxy_url(session_id: str, public_base_url: str, remote_url: str) -> s
 
 def _novnc_cookie_name(session_id: str) -> str:
     return f"novnc_{session_id}"
+
+
+def _novnc_cookie_path(base_url: str, session_id: str) -> str:
+    """Scope the noVNC auth cookie to the same public-prefixed path the assets are served
+    under, so the browser actually sends it (see novnc_proxy_url for the matching prefix)."""
+    prefix = urlsplit(base_url).path.rstrip("/")
+    return f"{prefix}/v1/sessions/{session_id}/novnc"
 
 
 async def _authorize_novnc_request(session_id: str, token: str | None, cookie_token: str | None):

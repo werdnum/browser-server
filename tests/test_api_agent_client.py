@@ -87,6 +87,7 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
         assert remote.json()["novnc_url"].startswith(f"http://testserver/v1/sessions/{session_id}/novnc/vnc.html?")
         assert "34147" not in remote.json()["novnc_url"]
         assert f"novnc_{session_id}=" in remote.headers["set-cookie"]
+        assert f"Path=/v1/sessions/{session_id}/novnc" in remote.headers["set-cookie"]
 
         forwarded_remote = await client.get(
             f"/v1/sessions/{session_id}/remote",
@@ -116,6 +117,9 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
             f"path=%2Fbrowser%2Fv1%2Fsessions%2F{session_id}%2Fnovnc%2Fwebsockify"
             in forwarded_prefixed_remote.json()["novnc_url"]
         )
+        # The auth cookie must be scoped to the same prefixed path so the browser sends it
+        # back when noVNC fetches assets / opens the websockify socket under /browser.
+        assert f"Path=/browser/v1/sessions/{session_id}/novnc" in forwarded_prefixed_remote.headers["set-cookie"]
 
         completed = await client.post(
             f"/v1/sessions/{session_id}/complete",
