@@ -17,6 +17,7 @@ import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, StrictUndefined, select_autoescape
+from pydantic import HttpUrl, TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .models import (
@@ -130,6 +131,22 @@ BASE_CSS = """
 
 _BRAND = '<div class="brand"><span class="logo">\U0001f5a5️</span><span class="name">Browser Handoff</span></div>'
 
+# Small inline "copy" glyph reused by every click-to-copy control.
+_COPY_ICON = (
+    '<svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<rect x="9" y="9" width="13" height="13" rx="2"/>'
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+)
+
+
+def _copy_button(target_id: str, label: str = "Copy") -> str:
+    """Render a click-to-copy button that copies the text content of ``target_id``."""
+    return (
+        f'<button type="button" class="copy-btn" data-copy="{target_id}" '
+        f'aria-label="Copy {label.lower()}">{_COPY_ICON}<span class="copy-text">{label}</span></button>'
+    )
+
 
 def _html_head(title: str, extra_css: str = "") -> str:
     return (
@@ -145,7 +162,7 @@ def _html_head(title: str, extra_css: str = "") -> str:
 
 LANDING_PAGE_TEMPLATE = templates.from_string(
     _html_head("Browser Handoff Service")
-    + """<body>
+    + """<body data-base-path="{{ base_path }}">
   <div class="wrap">
     """
     + _BRAND
@@ -160,17 +177,19 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
         <p id="start-status" class="muted" role="status" aria-live="polite"></p>
       </div>
       <nav class="actions">
-        <a class="btn" href="/sessions">View Sessions</a>
-        <a class="btn" href="/docs">API Docs</a>
-        <a class="btn" href="/health">Health Status</a>
+        <a class="btn" href="{{ base_path }}/sessions">View Sessions</a>
+        <a class="btn" href="{{ base_path }}/docs">API Docs</a>
+        <a class="btn" href="{{ base_path }}/health">Health Status</a>
       </nav>
     </main>
   </div>
   <script>
+    // Keep API calls under the public path prefix (configured public URL or proxy prefix).
+    const basePath = document.body.dataset.basePath || "";
     document.querySelector("#start").onclick = async () => {
       const status = document.querySelector("#start-status");
       status.textContent = "Starting…";
-      const res = await fetch("/v1/sessions", {
+      const res = await fetch(basePath + "/v1/sessions", {
         method: "POST",
         headers: {"content-type": "application/json"},
         body: JSON.stringify({
@@ -257,16 +276,36 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     .notice p:last-child { margin-bottom: 0; }
     .error { border-color: var(--danger); color: var(--danger); background: var(--surface); }
     .viewport {
-      width: {{ viewport_width }}px; height: {{ viewport_height }}px; max-width: 100%;
-      margin: 0 auto; border: 1px solid var(--border); border-radius: var(--radius);
+      width: min(100%, calc(85vh * {{ viewport_width }} / {{ viewport_height }}));
+      aspect-ratio: {{ viewport_width }} / {{ viewport_height }}; margin: 0 auto;
+      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
       display: grid; place-items: center; background: var(--surface-2); color: var(--muted);
-      overflow: hidden; box-shadow: var(--shadow);
+      overflow: hidden;
     }
     .viewport.connected { display: block; }
     .viewport iframe { width: 100%; height: 100%; border: 0; display: block; }
+    .copy-label { font-weight: 600; font-size: .85rem; margin: .9rem 0 .3rem; }
+    .copy-row { display: flex; align-items: stretch; gap: .4rem; margin: .35rem 0; }
+    .copy-row code, .copy-row pre {
+      flex: 1 1 auto; min-width: 0; margin: 0; padding: .6rem .7rem; background: var(--surface-2);
+      border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem;
+      white-space: pre-wrap; word-break: break-word; max-height: 11rem; overflow: auto;
+    }
+    .copy-btn {
+      flex: 0 0 auto; display: inline-flex; align-items: center; gap: .35rem; align-self: flex-start;
+      padding: 0 .8rem; min-height: 40px; font: inherit; font-size: .85rem; font-weight: 560;
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      background: var(--surface); color: var(--text); cursor: pointer;
+    }
+    .copy-btn:hover { background: var(--surface-2); }
+    .copy-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+    .copy-icon { width: 15px; height: 15px; flex: none; }
+    .handover-details { margin-top: .75rem; }
+    .handover-details summary { cursor: pointer; font-size: .88rem; color: var(--muted); }
 """,
     )
-    + """<body data-session-id="{{ session.session_id }}" data-token="{{ token }}">
+    + """<body data-session-id="{{ session.session_id }}" data-token="{{ token }}" data-base-path="{{ base_path }}">
   <div class="wrap">
     """
     + _BRAND
@@ -298,19 +337,44 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           <button id="cancel" class="btn btn-danger">Cancel</button>
         </div>
         <div id="handover-result" class="notice" hidden>
-          <p>Give this one-time token to your agent so it can take over the session:</p>
-          <p><code id="handover-token"></code></p>
-          <p class="muted">The agent claims it with <code>POST <span id="handover-claim-url"></span></code> and <code>{"token": "&lt;token&gt;"}</code>.</p>
+          <p><strong>Ready to hand back to your agent.</strong></p>
+          <p class="muted">Copy the message below and send it to your agent — it has everything needed to take over.</p>
+          <div class="copy-row">
+            <pre id="agent-instruction"></pre>
+            """
+    + _copy_button("agent-instruction", "Copy message")
+    + """
+          </div>
+          <details class="handover-details">
+            <summary>Show the raw token and endpoint</summary>
+            <p class="copy-label">One-time token</p>
+            <div class="copy-row">
+              <code id="handover-token"></code>
+              """
+    + _copy_button("handover-token")
+    + """
+            </div>
+            <p class="copy-label">Claim endpoint</p>
+            <div class="copy-row">
+              <code id="handover-claim-url"></code>
+              """
+    + _copy_button("handover-claim-url")
+    + """
+            </div>
+          </details>
         </div>
-        <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and cannot be redisplayed. Click Cancel to abort and start over.</p>
+        <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and can't be shown again. Click Cancel to stop and start over.</p>
         <p id="action-error" class="notice error" role="alert" hidden></p>
       </div>
-      <div class="viewport" id="viewport">Remote viewport not connected</div>
     </main>
   </div>
+  <div class="viewport" id="viewport">Remote viewport not connected</div>
   <script>
     const sid = document.body.dataset.sessionId;
     let token = document.body.dataset.token;
+    // When the service is reached under a path prefix (a configured public URL or an
+    // X-Forwarded-Prefix proxy), API calls from this page must carry that prefix too.
+    const basePath = document.body.dataset.basePath || "";
     function showError(message) {
       const el = document.querySelector("#action-error");
       el.textContent = message || "Something went wrong.";
@@ -331,8 +395,39 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
         }
       };
     }
+    async function copyText(text, btn) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const area = document.createElement("textarea");
+          area.value = text;
+          area.style.position = "fixed";
+          area.style.opacity = "0";
+          document.body.appendChild(area);
+          area.select();
+          document.execCommand("copy");
+          area.remove();
+        }
+        const label = btn.querySelector(".copy-text");
+        if (label) {
+          const original = label.dataset.label || label.textContent;
+          label.dataset.label = original;
+          label.textContent = "Copied";
+          setTimeout(() => { label.textContent = original; }, 1500);
+        }
+      } catch (err) {
+        showError("Couldn't copy to clipboard — select the text and copy manually.");
+      }
+    }
+    document.addEventListener("click", (event) => {
+      const btn = event.target.closest(".copy-btn");
+      if (!btn) return;
+      const target = document.getElementById(btn.dataset.copy);
+      if (target) copyText(target.textContent, btn);
+    });
     async function post(path, body) {
-      const res = await fetch(path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
+      const res = await fetch(basePath + path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
       let json = {};
       try {
         json = await res.json();
@@ -347,7 +442,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       const viewport = document.querySelector("#viewport");
       viewport.classList.remove("connected");
       viewport.textContent = "Connecting remote viewport...";
-      const remote = await fetch(`/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
+      const remote = await fetch(`${basePath}/v1/sessions/${sid}/remote?token=${encodeURIComponent(token)}`);
       let json = {};
       try {
         json = await remote.json();
@@ -377,6 +472,11 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
       document.querySelector("#handover-token").textContent = result.handover_token;
       document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
+      document.querySelector("#agent-instruction").textContent =
+        "Take over the browser session I set up. Claim it using your own service credentials by sending:\\n\\n"
+        + "POST " + result.agent_claim_url + "\\n"
+        + "Content-Type: application/json\\n\\n"
+        + JSON.stringify({token: result.handover_token});
       document.querySelector("#handover-result").hidden = false;
     });
     document.querySelector("#complete").onclick = action(() => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"}));
@@ -528,13 +628,62 @@ def map_errors(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=str(exc))
 
 
+PUBLIC_URL_ENV = "BROWSER_HANDOFF_PUBLIC_URL"
+
+
 def public_base_url(request: Request) -> str:
+    """Resolve the externally reachable base URL used in links we hand to users and agents.
+
+    When BROWSER_HANDOFF_PUBLIC_URL is set it always wins, so the service never tells a
+    user or agent to visit an internal address (e.g. a cluster.local Service URL) it picked
+    up from the request host. Otherwise we fall back to standard reverse-proxy forwarding
+    headers, then to the request's own scheme/host.
+    """
+    configured = _configured_public_base_url()
+    if configured is not None:
+        return configured
     scheme = _first_forwarded_value(request.headers.get("x-forwarded-proto")) or request.url.scheme
     host = _first_forwarded_value(request.headers.get("x-forwarded-host")) or request.url.netloc
     prefix = _first_forwarded_value(request.headers.get("x-forwarded-prefix")) or request.scope.get("root_path", "")
     normalized_prefix = prefix.strip("/") if prefix else ""
     path = f"/{normalized_prefix}/" if normalized_prefix else "/"
     return urlunsplit((scheme, host, path, "", ""))
+
+
+_PUBLIC_URL_ADAPTER = TypeAdapter(HttpUrl)
+
+
+def _configured_public_base_url() -> str | None:
+    raw = os.environ.get(PUBLIC_URL_ENV, "").strip()
+    if not raw:
+        return None
+    parts = urlsplit(raw)
+    normalized_prefix = parts.path.strip("/")
+    path = f"/{normalized_prefix}/" if normalized_prefix else "/"
+    normalized = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    # Validate scheme + authority (host/port) with a real URL validator so a malformed value
+    # like "https://bad host" or "https://host:bad" is rejected here rather than later, after a
+    # browser is launched or the session has already been mutated.
+    if parts.scheme not in ("http", "https") or not _is_valid_http_url(normalized):
+        raise HTTPException(
+            status_code=500,
+            detail=f"{PUBLIC_URL_ENV} must be an absolute http(s) URL with a valid host, e.g. https://browser.example.com",
+        )
+    return normalized
+
+
+def _is_valid_http_url(value: str) -> bool:
+    try:
+        _PUBLIC_URL_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
+
+
+def _public_base_path(request: Request) -> str:
+    """The public path prefix (e.g. "/browser" or "") that browser-facing pages must prepend
+    to their own API calls so they keep working when the service is exposed under a prefix."""
+    return urlsplit(public_base_url(request)).path.rstrip("/")
 
 
 def _first_forwarded_value(value: str | None) -> str | None:
@@ -545,8 +694,8 @@ def _first_forwarded_value(value: str | None) -> str | None:
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
-async def landing_page():
-    return LANDING_PAGE_TEMPLATE.render()
+async def landing_page(request: Request):
+    return LANDING_PAGE_TEMPLATE.render(base_path=_public_base_path(request))
 
 
 @app.get("/health")
@@ -557,6 +706,9 @@ async def health():
 
 @app.post("/v1/sessions", dependencies=[Depends(require_service_auth)])
 async def create_session(req: CreateSessionRequest, request: Request):
+    # Resolve (and validate) the public base URL before launching a browser, so a
+    # misconfigured BROWSER_HANDOFF_PUBLIC_URL fails fast instead of leaking a started session.
+    base_url = public_base_url(request).rstrip("/")
     session, control_token = await registry.create_session(req)
     if session.state == SessionState.FAILED:
         raise HTTPException(status_code=503, detail="browser runtime unavailable")
@@ -564,9 +716,7 @@ async def create_session(req: CreateSessionRequest, request: Request):
         return session
     response = session.model_dump(mode="json")
     response["control_token"] = control_token
-    response["session_url"] = (
-        f"{public_base_url(request).rstrip('/')}/sessions/{session.session_id}?token={control_token}"
-    )
+    response["session_url"] = f"{base_url}/sessions/{session.session_id}?token={control_token}"
     return response
 
 
@@ -590,8 +740,11 @@ async def agent_command(session_id: str, req: AgentCommandRequest):
     "/v1/sessions/{session_id}/handoff", response_model=HandoffResponse, dependencies=[Depends(require_service_auth)]
 )
 async def handoff(session_id: str, req: HandoffRequest, request: Request):
+    # Resolve the public base URL before mutating session state so a misconfigured
+    # BROWSER_HANDOFF_PUBLIC_URL never strands the session mid-handoff.
+    base_url = public_base_url(request)
     try:
-        session, url = await registry.handoff(session_id, req, public_base_url(request))
+        session, url = await registry.handoff(session_id, req, base_url)
         return {
             "session_id": session.session_id,
             "state": session.state,
@@ -658,9 +811,11 @@ async def cancel(session_id: str, req: HumanActionRequest):
 
 @app.post("/v1/sessions/{session_id}/handover")
 async def handover(session_id: str, req: HandoverRequest, request: Request):
+    # Resolve the public base URL before mutating session state: a misconfigured
+    # BROWSER_HANDOFF_PUBLIC_URL must not park the session and burn the one-time token.
+    base_url = public_base_url(request).rstrip("/")
     try:
         session, handover_token = await registry.handover(session_id, req.token, req.handoff_note)
-        base_url = public_base_url(request).rstrip("/")
         return {
             "session_id": session.session_id,
             "state": session.state,
@@ -723,7 +878,7 @@ async def remote(session_id: str, token: str, request: Request):
         httponly=True,
         samesite="lax",
         secure=secure_cookie,
-        path=f"/v1/sessions/{session_id}/novnc",
+        path=_novnc_cookie_path(base_url, session_id),
     )
     return response
 
@@ -741,14 +896,15 @@ async def novnc_http_proxy(session_id: str, asset_path: str, request: Request, t
     query_items = [(key, value) for key, value in request.query_params.multi_items() if key != "token"]
     response = await _proxy_novnc_http(remote_url, asset_path, query_items)
     if token:
-        secure_cookie = urlsplit(public_base_url(request)).scheme == "https"
+        base_url = public_base_url(request)
+        secure_cookie = urlsplit(base_url).scheme == "https"
         response.set_cookie(
             _novnc_cookie_name(session_id),
             token,
             httponly=True,
             samesite="lax",
             secure=secure_cookie,
-            path=f"/v1/sessions/{session_id}/novnc",
+            path=_novnc_cookie_path(base_url, session_id),
         )
     return response
 
@@ -791,7 +947,7 @@ async def session_list():
 
 
 @app.get("/sessions/{session_id}", response_class=HTMLResponse)
-async def session_detail(session_id: str, token: str | None = None):
+async def session_detail(session_id: str, request: Request, token: str | None = None):
     try:
         session = await registry.authorize_handoff_page(session_id, token or "")
     except Exception as exc:
@@ -803,6 +959,7 @@ async def session_detail(session_id: str, token: str | None = None):
         token=token or "",
         viewport_width=box_width,
         viewport_height=box_height,
+        base_path=_public_base_path(request),
     )
 
 
@@ -838,6 +995,13 @@ def novnc_proxy_url(session_id: str, public_base_url: str, remote_url: str) -> s
 
 def _novnc_cookie_name(session_id: str) -> str:
     return f"novnc_{session_id}"
+
+
+def _novnc_cookie_path(base_url: str, session_id: str) -> str:
+    """Scope the noVNC auth cookie to the same public-prefixed path the assets are served
+    under, so the browser actually sends it (see novnc_proxy_url for the matching prefix)."""
+    prefix = urlsplit(base_url).path.rstrip("/")
+    return f"{prefix}/v1/sessions/{session_id}/novnc"
 
 
 async def _authorize_novnc_request(session_id: str, token: str | None, cookie_token: str | None):

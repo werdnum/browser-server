@@ -40,6 +40,13 @@ test("user can start a browser session and hand it over to an agent", async ({ p
   const handoverToken = await page.locator("#handover-token").textContent();
   expect(handoverToken).toBeTruthy();
 
+  // The ready-to-send agent message embeds the real token (no "<token>" placeholder)
+  // and there is a click-to-copy control for it.
+  const instruction = await page.locator("#agent-instruction").textContent();
+  expect(instruction).toContain(handoverToken);
+  expect(instruction).not.toContain("<token>");
+  await expect(page.locator('.copy-btn[data-copy="agent-instruction"]')).toBeVisible();
+
   // The agent claims the session with that token plus its service credentials.
   const claim = await api(`/v1/sessions/${session.session_id}/agent-claim`, { token: handoverToken });
   expect(claim.status).toBe(200);

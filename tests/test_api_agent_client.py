@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from browser_handoff_service import main
 from browser_handoff_service.main import app, novnc_proxy_url, registry
+from browser_handoff_service.models import SessionState
 from browser_handoff_service.runtime import RemoteDisplayStatus
 from httpx import ASGITransport, AsyncClient
 
@@ -30,6 +31,12 @@ async def test_landing_page():
         assert response.status_code == 200
         assert "Browser Handoff Service" in response.text
         assert "View Sessions" in response.text
+
+        # Under a path prefix the landing page must point its Start call and nav links there.
+        prefixed = await client.get("/", headers={**headers, "x-forwarded-prefix": "/browser"})
+        assert prefixed.status_code == 200
+        assert 'data-base-path="/browser"' in prefixed.text
+        assert 'href="/browser/sessions"' in prefixed.text
 
 
 @pytest.mark.asyncio
@@ -87,6 +94,7 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
         assert remote.json()["novnc_url"].startswith(f"http://testserver/v1/sessions/{session_id}/novnc/vnc.html?")
         assert "34147" not in remote.json()["novnc_url"]
         assert f"novnc_{session_id}=" in remote.headers["set-cookie"]
+        assert f"Path=/v1/sessions/{session_id}/novnc" in remote.headers["set-cookie"]
 
         forwarded_remote = await client.get(
             f"/v1/sessions/{session_id}/remote",
@@ -116,6 +124,9 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
             f"path=%2Fbrowser%2Fv1%2Fsessions%2F{session_id}%2Fnovnc%2Fwebsockify"
             in forwarded_prefixed_remote.json()["novnc_url"]
         )
+        # The auth cookie must be scoped to the same prefixed path so the browser sends it
+        # back when noVNC fetches assets / opens the websockify socket under /browser.
+        assert f"Path=/browser/v1/sessions/{session_id}/novnc" in forwarded_prefixed_remote.headers["set-cookie"]
 
         completed = await client.post(
             f"/v1/sessions/{session_id}/complete",
@@ -398,3 +409,124 @@ def test_remote_url_uses_authenticated_service_proxy_without_prefix():
         "https://handoff.example/v1/sessions/bs_example/novnc/vnc.html?"
         "autoconnect=1&resize=remote&path=%2Fv1%2Fsessions%2Fbs_example%2Fnovnc%2Fwebsockify"
     )
+
+
+@pytest.mark.asyncio
+async def test_public_url_override_replaces_internal_request_host(monkeypatch):
+    """A configured external URL must win over the (possibly internal) request host so we
+    never hand a cluster-internal address to a user or agent."""
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, "https://browser.example.com/app/")
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://browser.default.svc.cluster.local") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_public_url", "initial_owner": "human"},
+        )
+        assert created.status_code == 200, created.text
+        body = created.json()
+        session_id = body["session_id"]
+        control_token = body["control_token"]
+        assert body["session_url"] == (f"https://browser.example.com/app/sessions/{session_id}?token={control_token}")
+
+        handover = await client.post(
+            f"/v1/sessions/{session_id}/handover",
+            json={"token": control_token, "handoff_note": "take over"},
+        )
+        assert handover.status_code == 200, handover.text
+        assert handover.json()["agent_claim_url"] == (
+            f"https://browser.example.com/app/v1/sessions/{session_id}/agent-claim"
+        )
+
+        # The session page must carry the path prefix so its own API calls stay under /app.
+        page = await client.get(f"/sessions/{session_id}", params={"token": control_token})
+        assert page.status_code == 200
+        assert 'data-base-path="/app"' in page.text
+
+
+@pytest.mark.asyncio
+async def test_public_url_override_rejects_relative_value(monkeypatch):
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, "browser.example.com")
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_bad_public_url", "initial_owner": "human"},
+        )
+        assert created.status_code == 500, created.text
+        assert main.PUBLIC_URL_ENV in created.json()["detail"]
+        # The misconfigured URL is caught before launching a browser, so nothing is stranded.
+        assert registry.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_public_url_override_rejects_non_http_scheme(monkeypatch):
+    """An absolute but non-HTTP scheme (e.g. ftp://) must be rejected, since every
+    generated link is a browser/API HTTP endpoint."""
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, "ftp://browser.example.com")
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_ftp_public_url", "initial_owner": "human"},
+        )
+        assert created.status_code == 500, created.text
+        assert main.PUBLIC_URL_ENV in created.json()["detail"]
+        assert registry.sessions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_url", ["https://bad host", "https://browser.example.com:bad"])
+async def test_public_url_override_rejects_invalid_authority(monkeypatch, bad_url):
+    """An http(s) URL whose host/port is malformed must be rejected up front, not after a
+    browser is launched or the response fails HttpUrl validation."""
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, bad_url)
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_bad_authority", "initial_owner": "human"},
+        )
+        assert created.status_code == 500, created.text
+        assert main.PUBLIC_URL_ENV in created.json()["detail"]
+        assert registry.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_bad_public_url_does_not_strand_handover(monkeypatch):
+    """A malformed public URL must be caught before handover mutates state, so the user
+    keeps a usable session instead of one parked in handover_requested with a burned token."""
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_handover_strand", "initial_owner": "human"},
+        )
+        assert created.status_code == 200, created.text
+        session_id = created.json()["session_id"]
+        control_token = created.json()["control_token"]
+
+        monkeypatch.setenv(main.PUBLIC_URL_ENV, "not-a-url")
+        failed = await client.post(
+            f"/v1/sessions/{session_id}/handover",
+            json={"token": control_token, "handoff_note": "take over"},
+        )
+        assert failed.status_code == 500, failed.text
+
+        # The session is untouched: still human_active and the control token still works.
+        monkeypatch.delenv(main.PUBLIC_URL_ENV, raising=False)
+        assert registry.sessions[session_id].state == SessionState.HUMAN_ACTIVE
+        extended = await client.post(
+            f"/v1/sessions/{session_id}/extend",
+            json={"token": control_token, "minutes": 5},
+        )
+        assert extended.status_code == 200, extended.text
