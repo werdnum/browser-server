@@ -217,6 +217,47 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
 
 
 @pytest.mark.asyncio
+async def test_visual_control_commands_accepted_by_http_model():
+    """Regression: visual-control commands must not 422 at the Pydantic model layer.
+
+    This test exercises the HTTP request path (ASGITransport → FastAPI → Pydantic) so
+    that any future omission from AgentCommandRequest.type is caught at test time rather
+    than discovered via live 422 errors.
+    """
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post("/v1/sessions", headers=headers, json={"conversation_id": "conv_visual_http"})
+        assert created.status_code == 200, created.text
+        session_id = created.json()["session_id"]
+
+        await client.post(
+            f"/v1/sessions/{session_id}/agent-command",
+            headers=headers,
+            json={"type": "navigate", "args": {"url": "https://example.test/"}},
+        )
+
+        commands = [
+            {"type": "mouse_click", "args": {"x": 100, "y": 200}},
+            {"type": "mouse_move", "args": {"x": 50, "y": 50}},
+            {"type": "mouse_down"},
+            {"type": "mouse_up"},
+            {"type": "mouse_wheel", "args": {"delta_x": 0, "delta_y": 100}},
+            {"type": "keyboard_type", "args": {"text": "hello"}},
+            {"type": "keyboard_press", "args": {"key": "Enter"}},
+            {"type": "navigate_back"},
+            {"type": "navigate_forward"},
+        ]
+        for cmd in commands:
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/agent-command",
+                headers=headers,
+                json=cmd,
+            )
+            assert resp.status_code == 200, f"command {cmd['type']!r} got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
 async def test_service_auth_fails_closed_when_token_unset(monkeypatch):
     monkeypatch.delenv("BROWSER_HANDOFF_SERVICE_TOKEN", raising=False)
     transport = ASGITransport(app=app)
