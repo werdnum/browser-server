@@ -92,7 +92,9 @@ TERMINAL_STATES = {
 }
 
 AGENT_COMMAND_STATES = {SessionState.AGENT_ACTIVE, SessionState.AGENT_RESUMABLE}
-OBSERVATION_COMMANDS = {"snapshot", "screenshot", "current_page"}
+# Commands that read page content/state. Denied outside agent-owned states so a
+# human-controlled session can never be observed by the agent.
+OBSERVATION_COMMANDS = {"snapshot", "screenshot", "current_page", "extract", "exec"}
 
 
 class CreateSessionRequest(BaseModel):
@@ -131,6 +133,9 @@ class AgentCommandRequest(BaseModel):
         "screenshot",
         "current_page",
         "close_page",
+        "extract",
+        "exec",
+        "wait",
     ]
     args: dict[str, Any] = Field(default_factory=dict)
 

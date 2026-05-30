@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import socket
@@ -14,6 +15,150 @@ from .security import redact_url
 
 class RuntimeUnavailable(RuntimeError):
     pass
+
+
+# In-page DOM walker. Tags interactive/labeled elements with a stable
+# ``data-fa-ref`` attribute and returns a nested accessibility tree. The shape
+# matches the ``Snapshot`` contract consumed by the Family Assistant browser
+# tools, so the same rich tools work against this remote worker as against a
+# local Playwright page. The ref ``e12`` always resolves to the selector
+# ``[data-fa-ref="e12"]``, which agents pass straight to click/type_text/select.
+_SNAPSHOT_JS = r"""
+() => {
+  document.querySelectorAll('[data-fa-ref]').forEach(el => el.removeAttribute('data-fa-ref'));
+
+  let refCounter = 0;
+  const allocRef = () => 'e' + (++refCounter);
+
+  const ROLE_MAP = {
+    A: 'link', BUTTON: 'button', SELECT: 'combobox',
+    TEXTAREA: 'textbox', FORM: 'form', NAV: 'navigation',
+    MAIN: 'main', ASIDE: 'complementary', HEADER: 'banner',
+    FOOTER: 'contentinfo', IMG: 'img',
+  };
+  const INPUT_ROLES = {
+    submit: 'button', button: 'button', reset: 'button',
+    checkbox: 'checkbox', radio: 'radio',
+    range: 'slider', file: 'textbox',
+  };
+  const HEADING_TAGS = new Set(['H1','H2','H3','H4','H5','H6']);
+  const NAME_FROM_CONTENT = new Set([
+    'A', 'BUTTON', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'P', 'LI', 'SPAN', 'LABEL', 'OPTION', 'TD', 'TH', 'CAPTION',
+  ]);
+
+  function roleFor(el) {
+    const aria = el.getAttribute('role');
+    if (aria) return aria;
+    if (HEADING_TAGS.has(el.tagName)) return 'heading';
+    if (el.tagName === 'INPUT') {
+      const t = (el.getAttribute('type') || 'text').toLowerCase();
+      return INPUT_ROLES[t] || 'textbox';
+    }
+    return ROLE_MAP[el.tagName] || null;
+  }
+
+  function accName(el) {
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const parts = [];
+      for (const id of labelledBy.trim().split(/\s+/)) {
+        const target = id && document.getElementById(id);
+        if (target) parts.push(target.textContent.trim());
+      }
+      if (parts.length) return parts.join(' ');
+    }
+    const aria = el.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    if (el.id) {
+      const lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (lbl) return lbl.textContent.trim();
+    }
+    const parentLabel = el.closest && el.closest('label');
+    if (parentLabel && parentLabel !== el) return parentLabel.textContent.trim();
+    if (el.getAttribute('alt')) return el.getAttribute('alt').trim();
+    if (el.getAttribute('title')) return el.getAttribute('title').trim();
+    if (el.getAttribute('placeholder')) return el.getAttribute('placeholder').trim();
+    if (!NAME_FROM_CONTENT.has(el.tagName)) return '';
+    const txt = (el.innerText || el.textContent || '').trim();
+    return txt.length > 120 ? txt.slice(0, 120) + '…' : txt;
+  }
+
+  function isVisible(el) {
+    if (!el.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return false;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') return false;
+    return true;
+  }
+
+  function interesting(el) {
+    const role = roleFor(el);
+    if (role) return role;
+    if (el.tagName === 'P' || el.tagName === 'LI') return 'text';
+    return null;
+  }
+
+  function walk(el, out) {
+    if (el.nodeType !== 1) return;
+    if (!isVisible(el)) return;
+    const role = interesting(el);
+    if (role) {
+      const ref = allocRef();
+      el.setAttribute('data-fa-ref', ref);
+      const node = { ref, role, name: accName(el) };
+      const href = el.getAttribute('href');
+      if (href) node.href = href;
+      const value = el.value;
+      if (typeof value === 'string' && value) node.value = value;
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+        node.tag = el.tagName.toLowerCase();
+        const t = el.getAttribute('type');
+        if (t) node.input_type = t.toLowerCase();
+      }
+      out.push(node);
+      node.children = [];
+      for (const child of el.children) walk(child, node.children);
+      if (node.children.length === 0) delete node.children;
+    } else {
+      for (const child of el.children) walk(child, out);
+    }
+  }
+
+  const roots = [];
+  walk(document.body, roots);
+
+  const formCount = document.forms ? document.forms.length : 0;
+  return {
+    url: location.href,
+    title: document.title,
+    forms: formCount,
+    elements: refCounter,
+    roots,
+  };
+}
+"""
+
+
+def _wrap_exec_code(code: str) -> str:
+    """Wrap caller-provided JS so ``page.evaluate`` runs it uniformly.
+
+    Playwright treats a function-shaped string as callable and a bare
+    expression as a value. Accept both ``document.title`` (expression) and
+    ``return document.title`` (statement body).
+    """
+    stripped = code.strip()
+    if not stripped:
+        return "async () => null"
+    if stripped.startswith(("(", "async ", "function ")):
+        return stripped
+    if stripped.startswith("{"):
+        return f"async () => {stripped}"
+    looks_like_statements = "return " in stripped or ";" in stripped or "\n" in stripped
+    if looks_like_statements:
+        return f"async () => {{ {stripped} }}"
+    return f"async () => ({stripped})"
 
 
 class BrowserRuntime(Protocol):
@@ -50,11 +195,45 @@ class FakeBrowserWorker:
             self.actions.append({"type": request.type, "args": request.args})
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "snapshot":
-            return {"nodes": [{"role": "document", "name": self.title}]}
+            return {
+                "url": redact_url(self.url)[0] if self.url else "about:blank",
+                "title": self.title,
+                "forms": 0,
+                "elements": 1,
+                "roots": [{"ref": "e1", "role": "document", "name": self.title}],
+            }
         if request.type == "screenshot":
-            return {"mime_type": "image/png", "redacted": True}
+            # 1x1 transparent PNG so callers exercising the bytes path get valid image data.
+            png = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            )
+            return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}
         if request.type == "current_page":
             return {"url": redact_url(self.url)[0] if self.url else None, "title": self.title}
+        if request.type == "extract":
+            return {
+                "url": redact_url(self.url)[0] if self.url else None,
+                "html": f"<html><body><h1>{self.title}</h1></body></html>",
+            }
+        if request.type == "exec":
+            return {"result": self.title, "url": redact_url(self.url)[0] if self.url else None}
+        if request.type == "wait":
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
+        if request.type in {
+            "mouse_click",
+            "mouse_move",
+            "mouse_down",
+            "mouse_up",
+            "mouse_wheel",
+            "keyboard_type",
+            "keyboard_press",
+        }:
+            self.actions.append({"type": request.type, "args": request.args})
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None}
+        if request.type == "navigate_back":
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None}
+        if request.type == "navigate_forward":
+            return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None}
         if request.type == "close_page":
             self.url = None
             self.title = "Blank"
@@ -143,14 +322,77 @@ class PlaywrightBrowserWorker:
             await page.keyboard.press(str(request.args["key"]))
             return await self._current_page_result({"accepted": True})
         if request.type == "snapshot":
-            title = await page.title()
-            body = await page.locator("body").text_content(timeout=1000) or ""
-            return {"nodes": [{"role": "document", "name": title, "text": body[:500]}]}
+            result = await page.evaluate(_SNAPSHOT_JS)
+            result["url"] = redact_url(result.get("url", ""))[0]
+            return result
         if request.type == "screenshot":
-            await page.screenshot(full_page=False)
-            return {"mime_type": "image/png", "redacted": True}
+            png = await page.screenshot(type="png", full_page=False)
+            return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}
+        if request.type == "extract":
+            selector = request.args.get("selector")
+            if selector:
+                html = await page.locator(str(selector)).inner_html()
+            else:
+                html = await page.content()
+            return {"url": redact_url(page.url)[0], "html": html, "selector": selector}
+        if request.type == "exec":
+            from playwright.async_api import Error as PlaywrightError
+
+            try:
+                result = await page.evaluate(_wrap_exec_code(str(request.args.get("code", ""))))
+            except PlaywrightError as exc:
+                return {"error": str(exc), "url": redact_url(page.url)[0]}
+            return {"result": result, "url": redact_url(page.url)[0]}
+        if request.type == "wait":
+            from typing import Literal, cast
+
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+            selector = request.args.get("selector")
+            timeout_ms = float(request.args.get("timeout_ms", 5000))
+            raw_state = str(request.args.get("state", "domcontentloaded"))
+            valid_states = ("domcontentloaded", "load", "networkidle")
+            state = cast(
+                'Literal["domcontentloaded", "load", "networkidle"]',
+                raw_state if raw_state in valid_states else "domcontentloaded",
+            )
+            try:
+                if selector:
+                    await page.wait_for_selector(str(selector), timeout=timeout_ms)
+                else:
+                    await page.wait_for_load_state(state, timeout=timeout_ms)
+            except PlaywrightTimeoutError as exc:
+                return {"error": str(exc), "url": redact_url(page.url)[0], "title": await page.title()}
+            return {"accepted": True, "url": redact_url(page.url)[0], "title": await page.title()}
         if request.type == "current_page":
             return {"url": redact_url(page.url)[0], "title": await page.title()}
+        if request.type == "mouse_click":
+            await page.mouse.click(float(request.args["x"]), float(request.args["y"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "mouse_move":
+            await page.mouse.move(float(request.args["x"]), float(request.args["y"]))
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "mouse_down":
+            await page.mouse.down()
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "mouse_up":
+            await page.mouse.up()
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "mouse_wheel":
+            await page.mouse.wheel(float(request.args["delta_x"]), float(request.args["delta_y"]))
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "keyboard_type":
+            await page.keyboard.type(str(request.args["text"]))
+            return {"accepted": True, "url": redact_url(page.url)[0]}
+        if request.type == "keyboard_press":
+            await page.keyboard.press(str(request.args["keys"]))
+            return await self._current_page_result({"accepted": True})
+        if request.type == "navigate_back":
+            await page.go_back()
+            return await self._current_page_result({"accepted": True})
+        if request.type == "navigate_forward":
+            await page.go_forward()
+            return await self._current_page_result({"accepted": True})
         if request.type == "close_page":
             await page.goto("about:blank")
             return {"closed": True, "url": None, "title": "Blank"}

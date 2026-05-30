@@ -39,7 +39,18 @@ class ConflictError(RuntimeError):
     pass
 
 
-PAGE_STATE_COMMANDS = {"navigate", "click", "type_text", "select", "press_key", "current_page", "close_page"}
+PAGE_STATE_COMMANDS = {
+    "navigate",
+    "click",
+    "type_text",
+    "select",
+    "press_key",
+    "current_page",
+    "close_page",
+    "wait",
+    "exec",
+    "extract",
+}
 
 
 @dataclass
@@ -351,8 +362,9 @@ class SessionRegistry:
         url = result.get("url")
         session.current_url_redacted = url if isinstance(url, str) else None
         session.current_origin = redact_url(url)[1] if isinstance(url, str) else None
-        title = result.get("title")
-        session.current_title_redacted = title if isinstance(title, str) else None
+        if "title" in result:
+            title = result.get("title")
+            session.current_title_redacted = title if isinstance(title, str) else None
 
     def _raise_if_expired(self, session: BrowserSession) -> None:
         if session.state not in TERMINAL_STATES and (
