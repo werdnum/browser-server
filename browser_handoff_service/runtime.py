@@ -272,10 +272,16 @@ class PlaywrightBrowserWorker:
 
     async def start(self) -> None:
         try:
-            from playwright.async_api import async_playwright
+            from rebrowser_playwright.async_api import async_playwright
 
             env: dict[str, str | float | bool] = dict(os.environ)
-            args = ["--no-sandbox", "--disable-dev-shm-usage"]
+            args = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--enable-features=NetworkService,NetworkServiceInProcess",
+            ]
             if self.headed:
                 self._display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
                 self.remote_url = self._display.start()
@@ -295,6 +301,12 @@ class PlaywrightBrowserWorker:
                 page_kwargs["user_agent"] = self.user_agent
                 page_kwargs["is_mobile"] = True
                 page_kwargs["has_touch"] = True
+            else:
+                # Use a realistic desktop Chrome UA to avoid bot detection.
+                page_kwargs["user_agent"] = (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                )
             self._page = await self._browser.new_page(**page_kwargs)
         except Exception as exc:
             await self.close()
@@ -336,7 +348,7 @@ class PlaywrightBrowserWorker:
                 html = await page.content()
             return {"url": redact_url(page.url)[0], "html": html, "selector": selector}
         if request.type == "exec":
-            from playwright.async_api import Error as PlaywrightError
+            from rebrowser_playwright.async_api import Error as PlaywrightError
 
             try:
                 result = await page.evaluate(_wrap_exec_code(str(request.args.get("code", ""))))
@@ -346,7 +358,7 @@ class PlaywrightBrowserWorker:
         if request.type == "wait":
             from typing import Literal, cast
 
-            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from rebrowser_playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
             selector = request.args.get("selector")
             timeout_ms = float(request.args.get("timeout_ms", 5000))
@@ -402,7 +414,7 @@ class PlaywrightBrowserWorker:
     async def _current_page_result(self, result: dict[str, Any]) -> dict[str, Any]:
         if self._page is None:
             raise RuntimeError("worker is closed")
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from rebrowser_playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
         try:
             await self._page.wait_for_load_state("domcontentloaded", timeout=1000)
