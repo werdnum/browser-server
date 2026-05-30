@@ -50,6 +50,15 @@ PAGE_STATE_COMMANDS = {
     "wait",
     "exec",
     "extract",
+    "mouse_click",
+    "mouse_move",
+    "mouse_down",
+    "mouse_up",
+    "mouse_wheel",
+    "keyboard_type",
+    "keyboard_press",
+    "navigate_back",
+    "navigate_forward",
 }
 
 

@@ -385,7 +385,8 @@ class PlaywrightBrowserWorker:
             await page.keyboard.type(str(request.args["text"]))
             return {"accepted": True, "url": redact_url(page.url)[0]}
         if request.type == "keyboard_press":
-            await page.keyboard.press(str(request.args["keys"]))
+            keys = request.args.get("keys", request.args.get("key"))
+            await page.keyboard.press(str(keys))
             return await self._current_page_result({"accepted": True})
         if request.type == "navigate_back":
             await page.go_back()

@@ -1,4 +1,4 @@
-"""Extended agent-command protocol: rich snapshot, screenshot bytes, extract, exec, wait.
+"""Extended agent-command protocol: rich snapshot, screenshot bytes, extract, exec, wait, visual controls.
 
 These commands let a remote client (the Family Assistant browser-tool adapter) drive
 the session with the same rich semantics as a local Playwright page, while keeping the
@@ -6,6 +6,7 @@ no-observation-during-human-control invariant intact.
 """
 
 import base64
+from typing import Literal
 
 import pytest
 from browser_handoff_service.models import (
@@ -15,6 +16,18 @@ from browser_handoff_service.models import (
     SessionState,
 )
 from browser_handoff_service.registry import AuthorizationError, SessionRegistry
+
+VisualCommand = Literal[
+    "mouse_move",
+    "mouse_click",
+    "mouse_down",
+    "mouse_up",
+    "mouse_wheel",
+    "keyboard_type",
+    "keyboard_press",
+    "navigate_back",
+    "navigate_forward",
+]
 
 
 @pytest.mark.asyncio
@@ -73,3 +86,24 @@ async def test_extended_observation_commands_denied_during_human_control():
     for command in ("snapshot", "screenshot", "extract", "exec"):
         with pytest.raises(AuthorizationError):
             await registry.agent_command(session.session_id, AgentCommandRequest(type=command))
+
+
+@pytest.mark.asyncio
+async def test_visual_commands_are_accepted_by_api_model_and_registry():
+    registry = SessionRegistry()
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_visual"))
+
+    command_args: list[tuple[VisualCommand, dict[str, object]]] = [
+        ("mouse_move", {"x": 10, "y": 20}),
+        ("mouse_click", {"x": 10, "y": 20}),
+        ("mouse_down", {}),
+        ("mouse_up", {}),
+        ("mouse_wheel", {"delta_x": 0, "delta_y": 120}),
+        ("keyboard_type", {"text": "hello"}),
+        ("keyboard_press", {"key": "Enter"}),
+        ("navigate_back", {}),
+        ("navigate_forward", {}),
+    ]
+    for command, args in command_args:
+        resp = await registry.agent_command(session.session_id, AgentCommandRequest(type=command, args=args))
+        assert resp.ok
