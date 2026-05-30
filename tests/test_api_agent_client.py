@@ -457,6 +457,24 @@ async def test_public_url_override_rejects_relative_value(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_public_url_override_rejects_non_http_scheme(monkeypatch):
+    """An absolute but non-HTTP scheme (e.g. ftp://) must be rejected, since every
+    generated link is a browser/API HTTP endpoint."""
+    monkeypatch.setenv(main.PUBLIC_URL_ENV, "ftp://browser.example.com")
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_ftp_public_url", "initial_owner": "human"},
+        )
+        assert created.status_code == 500, created.text
+        assert main.PUBLIC_URL_ENV in created.json()["detail"]
+        assert registry.sessions == {}
+
+
+@pytest.mark.asyncio
 async def test_bad_public_url_does_not_strand_handover(monkeypatch):
     """A malformed public URL must be caught before handover mutates state, so the user
     keeps a usable session instead of one parked in handover_requested with a burned token."""

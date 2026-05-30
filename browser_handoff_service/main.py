@@ -652,10 +652,10 @@ def _configured_public_base_url() -> str | None:
     if not raw:
         return None
     parts = urlsplit(raw)
-    if not parts.scheme or not parts.netloc:
+    if parts.scheme not in ("http", "https") or not parts.netloc:
         raise HTTPException(
             status_code=500,
-            detail=f"{PUBLIC_URL_ENV} must be an absolute URL with a scheme and host, e.g. https://browser.example.com",
+            detail=(f"{PUBLIC_URL_ENV} must be an absolute http(s) URL with a host, e.g. https://browser.example.com"),
         )
     normalized_prefix = parts.path.strip("/")
     path = f"/{normalized_prefix}/" if normalized_prefix else "/"
