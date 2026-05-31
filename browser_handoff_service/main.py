@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Annotated, Literal
 
 if TYPE_CHECKING:
     from jwt.types import Options
@@ -38,6 +39,13 @@ from .transitions import TransitionError
 
 SERVICE_TOKEN_ENV = "BROWSER_HANDOFF_SERVICE_TOKEN"
 registry = SessionRegistry()
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    actor_type: Literal["agent", "human"]
+    subject: str | None = None
+
 
 templates = Environment(
     autoescape=select_autoescape(enabled_extensions=("html", "xml"), default_for_string=True),
@@ -191,6 +199,9 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
       status.textContent = "Starting…";
       const res = await fetch(basePath + "/v1/sessions", {
         method: "POST",
+        // The browser authenticates to Envoy with its OIDC session cookie; Envoy
+        // validates it and forwards the OIDC access token upstream as Authorization.
+        credentials: "same-origin",
         headers: {"content-type": "application/json"},
         body: JSON.stringify({
           conversation_id: `conv_${Date.now()}`,
@@ -583,7 +594,7 @@ def _get_jwks_client() -> jwt.PyJWKClient | None:
     return _jwks_client
 
 
-def require_service_auth(authorization: str | None = Header(default=None)) -> None:
+def require_service_auth(authorization: str | None = Header(default=None)) -> AuthContext:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing or invalid authorization header format")
 
@@ -600,8 +611,11 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
             audience = os.environ.get(OIDC_AUDIENCE_ENV)
             options: Options | None = {"verify_aud": False} if not audience else None
 
-            jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options)
-            return  # OIDC valid
+            claims = jwt.decode(
+                token, signing_key.key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options
+            )
+            subject = claims.get("sub") if isinstance(claims, dict) and isinstance(claims.get("sub"), str) else None
+            return AuthContext(actor_type="human", subject=subject)
         except jwt.PyJWTError as e:
             logging.debug(f"OIDC token invalid: {e}")
             pass  # Try fallback
@@ -616,6 +630,14 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> No
         raise HTTPException(status_code=503, detail="service token is not configured")
     if token != service_token:
         raise HTTPException(status_code=401, detail="invalid service token")
+    return AuthContext(actor_type="agent")
+
+
+def require_agent_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+    auth = require_service_auth(authorization)
+    if auth.actor_type != "agent":
+        raise HTTPException(status_code=403, detail="agent service token required")
+    return auth
 
 
 def map_errors(exc: Exception) -> HTTPException:
@@ -695,7 +717,7 @@ def _first_forwarded_value(value: str | None) -> str | None:
     return first or None
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
+@app.get("/", response_class=HTMLResponse)
 async def landing_page(request: Request):
     return LANDING_PAGE_TEMPLATE.render(base_path=_public_base_path(request))
 
@@ -706,8 +728,14 @@ async def health():
     return {"ok": True, "remote_display": remote_display_status().__dict__}
 
 
-@app.post("/v1/sessions", dependencies=[Depends(require_service_auth)])
-async def create_session(req: CreateSessionRequest, request: Request):
+@app.post("/v1/sessions")
+async def create_session(
+    req: CreateSessionRequest, request: Request, auth: Annotated[AuthContext, Depends(require_service_auth)]
+):
+    if auth.actor_type == "human":
+        if "initial_owner" in req.model_fields_set and req.initial_owner != "human":
+            raise HTTPException(status_code=403, detail="OIDC users can only start human-owned sessions")
+        req = req.model_copy(update={"initial_owner": "human"})
     # Resolve (and validate) the public base URL before launching a browser, so a
     # misconfigured BROWSER_HANDOFF_PUBLIC_URL fails fast instead of leaking a started session.
     base_url = public_base_url(request).rstrip("/")
@@ -730,7 +758,7 @@ async def get_session(session_id: str):
         raise map_errors(exc) from exc
 
 
-@app.post("/v1/sessions/{session_id}/agent-command", dependencies=[Depends(require_service_auth)])
+@app.post("/v1/sessions/{session_id}/agent-command", dependencies=[Depends(require_agent_auth)])
 async def agent_command(session_id: str, req: AgentCommandRequest):
     try:
         return await registry.agent_command(session_id, req)
@@ -739,7 +767,7 @@ async def agent_command(session_id: str, req: AgentCommandRequest):
 
 
 @app.post(
-    "/v1/sessions/{session_id}/handoff", response_model=HandoffResponse, dependencies=[Depends(require_service_auth)]
+    "/v1/sessions/{session_id}/handoff", response_model=HandoffResponse, dependencies=[Depends(require_agent_auth)]
 )
 async def handoff(session_id: str, req: HandoffRequest, request: Request):
     # Resolve the public base URL before mutating session state so a misconfigured
@@ -765,7 +793,7 @@ async def close(session_id: str):
         raise map_errors(exc) from exc
 
 
-@app.get("/v1/sessions/{session_id}/events", dependencies=[Depends(require_service_auth)])
+@app.get("/v1/sessions/{session_id}/events", dependencies=[Depends(require_agent_auth)])
 async def events(session_id: str):
     try:
         registry.get(session_id)
@@ -829,7 +857,7 @@ async def handover(session_id: str, req: HandoverRequest, request: Request):
         raise map_errors(exc) from exc
 
 
-@app.post("/v1/sessions/{session_id}/agent-claim", dependencies=[Depends(require_service_auth)])
+@app.post("/v1/sessions/{session_id}/agent-claim", dependencies=[Depends(require_agent_auth)])
 async def agent_claim(session_id: str, req: ClaimRequest):
     try:
         return await registry.agent_claim(session_id, req.token)

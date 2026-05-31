@@ -12,6 +12,14 @@ TEST_SERVICE_TOKEN = "test-service-token"
 
 @pytest.fixture(autouse=True)
 def clear_registry():
+    main._jwks_client = None
+    registry.sessions.clear()
+    registry.locks.clear()
+    registry.events.clear()
+    registry.tokens.clear()
+    registry.workers.clear()
+    yield
+    main._jwks_client = None
     registry.sessions.clear()
     registry.locks.clear()
     registry.events.clear()
@@ -19,24 +27,43 @@ def clear_registry():
     registry.workers.clear()
 
 
+def oidc_headers(monkeypatch, token: str = "valid-oidc-token") -> dict[str, str]:
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
+
+    class MockSigningKey:
+        key = "secret_key"
+
+    class MockJWKClient:
+        def get_signing_key_from_jwt(self, token):
+            return MockSigningKey()
+
+    def mock_decode(token, key, algorithms, audience, issuer, options):
+        if token == "valid-oidc-token":
+            return {"sub": "user123"}
+        raise main.jwt.InvalidTokenError("invalid token")
+
+    monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
+    monkeypatch.setattr(main.jwt, "decode", mock_decode)
+    return {"authorization": f"Bearer {token}"}
+
+
 @pytest.mark.asyncio
 async def test_landing_page():
     transport = ASGITransport(app=app)
-    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        unauthorized = await client.get("/")
-        assert unauthorized.status_code == 401
-
-        response = await client.get("/", headers=headers)
+        response = await client.get("/")
         assert response.status_code == 200
         assert "Browser Handoff Service" in response.text
         assert "View Sessions" in response.text
 
         # Under a path prefix the landing page must point its Start call and nav links there.
-        prefixed = await client.get("/", headers={**headers, "x-forwarded-prefix": "/browser"})
+        prefixed = await client.get("/", headers={"x-forwarded-prefix": "/browser"})
         assert prefixed.status_code == 200
         assert 'data-base-path="/browser"' in prefixed.text
         assert 'href="/browser/sessions"' in prefixed.text
+        assert 'credentials: "same-origin"' in prefixed.text
 
 
 @pytest.mark.asyncio
@@ -137,7 +164,7 @@ async def test_agent_side_service_flow_through_http_api(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_human_started_session_hands_over_to_agent_through_http_api():
+async def test_human_started_session_hands_over_to_agent_through_http_api(monkeypatch):
     headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -201,6 +228,13 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
         )
         assert unauth_claim.status_code == 401
 
+        oidc_claim = await client.post(
+            f"/v1/sessions/{session_id}/agent-claim",
+            headers=oidc_headers(monkeypatch),
+            json={"token": handover_token},
+        )
+        assert oidc_claim.status_code == 403
+
         claimed = await client.post(
             f"/v1/sessions/{session_id}/agent-claim",
             headers=headers,
@@ -225,6 +259,41 @@ async def test_human_started_session_hands_over_to_agent_through_http_api():
             json={"token": handover_token},
         )
         assert reused.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_oidc_human_can_start_human_owned_session(monkeypatch):
+    headers = oidc_headers(monkeypatch)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_oidc_human"},
+        )
+
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["state"] == "human_active"
+    assert body["lease_owner"] == "human"
+    assert body["control_token"]
+    assert body["session_url"].endswith(f"/sessions/{body['session_id']}?token={body['control_token']}")
+
+
+@pytest.mark.asyncio
+async def test_oidc_human_cannot_start_agent_owned_session(monkeypatch):
+    headers = oidc_headers(monkeypatch)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_oidc_agent", "initial_owner": "agent"},
+        )
+
+    assert created.status_code == 403
+    assert created.json()["detail"] == "OIDC users can only start human-owned sessions"
+    assert registry.sessions == {}
 
 
 @pytest.mark.asyncio
@@ -382,15 +451,24 @@ async def test_agent_command_on_expired_session_returns_410():
 
 
 @pytest.mark.asyncio
-async def test_session_list_requires_service_auth():
-    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+async def test_session_list_page_requires_auth_but_accepts_oidc(monkeypatch):
+    headers = oidc_headers(monkeypatch)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         unauthorized = await client.get("/sessions")
-        assert unauthorized.status_code == 401
+        response = await client.get("/sessions", headers=headers)
 
-        authorized = await client.get("/sessions", headers=headers)
-        assert authorized.status_code == 200
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_create_session_requires_auth():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/v1/sessions", json={"conversation_id": "conv_unauthorized"})
+
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
