@@ -693,7 +693,7 @@ def _first_forwarded_value(value: str | None) -> str | None:
     return first or None
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
+@app.get("/", response_class=HTMLResponse)
 async def landing_page(request: Request):
     return LANDING_PAGE_TEMPLATE.render(base_path=_public_base_path(request))
 
@@ -941,7 +941,7 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
             pass
 
 
-@app.get("/sessions", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
+@app.get("/sessions", response_class=HTMLResponse)
 async def session_list():
     return SESSION_LIST_TEMPLATE.render(sessions=registry.list_sessions())
 
