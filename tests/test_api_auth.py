@@ -32,8 +32,9 @@ def test_require_service_auth_invalid_header_format(monkeypatch):
 
 def test_require_service_auth_static_token_success(monkeypatch):
     monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", TEST_SERVICE_TOKEN)
-    # Should not raise
-    require_service_auth(f"Bearer {TEST_SERVICE_TOKEN}")
+    auth = require_service_auth(f"Bearer {TEST_SERVICE_TOKEN}")
+
+    assert auth.actor_type == "agent"
 
 
 def test_require_service_auth_static_token_failure(monkeypatch):
@@ -73,8 +74,10 @@ def test_require_service_auth_oidc_success(monkeypatch):
     monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
     monkeypatch.setattr(main.jwt, "decode", mock_decode)
 
-    # Should not raise
-    require_service_auth("Bearer valid-oidc-token")
+    auth = require_service_auth("Bearer valid-oidc-token")
+
+    assert auth.actor_type == "human"
+    assert auth.subject == "user123"
 
 
 def test_require_service_auth_oidc_failure_fallback_success(monkeypatch):
@@ -96,8 +99,10 @@ def test_require_service_auth_oidc_failure_fallback_success(monkeypatch):
     monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
     monkeypatch.setattr(main.jwt, "decode", mock_decode)
 
-    # OIDC fails, but static token matches
-    require_service_auth("Bearer fallback-token")
+    # OIDC fails, but static token matches.
+    auth = require_service_auth("Bearer fallback-token")
+
+    assert auth.actor_type == "agent"
 
 
 def test_require_service_auth_oidc_failure_fallback_failure(monkeypatch):
@@ -161,5 +166,6 @@ def test_require_service_auth_oidc_success_no_audience(monkeypatch):
     monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
     monkeypatch.setattr(main.jwt, "decode", mock_decode)
 
-    # Should not raise
-    require_service_auth("Bearer valid-oidc-token")
+    auth = require_service_auth("Bearer valid-oidc-token")
+
+    assert auth.actor_type == "human"
