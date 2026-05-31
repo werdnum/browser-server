@@ -63,6 +63,7 @@ async def test_landing_page():
         assert prefixed.status_code == 200
         assert 'data-base-path="/browser"' in prefixed.text
         assert 'href="/browser/sessions"' in prefixed.text
+        assert 'credentials: "same-origin"' in prefixed.text
 
 
 @pytest.mark.asyncio
