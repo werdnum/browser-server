@@ -338,6 +338,50 @@ async def test_expiry_loop_invokes_registry_reaper(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_command_on_expired_session_returns_410():
+    """An expired session is Gone (410), distinct from a lease-ownership 403.
+
+    The agent client relies on this to tell "this session is dead, open a new
+    one" apart from "a human owns the lease right now"; conflating them as 403
+    left the client wedged on a dead session until the pod restarted.
+    """
+    from datetime import timedelta
+
+    from browser_handoff_service.models import now_utc
+
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_expired"},
+        )
+        assert created.status_code == 200, created.text
+        session_id = created.json()["session_id"]
+
+        registry.sessions[session_id].idle_expires_at = now_utc() - timedelta(seconds=1)
+        await registry.reap_expired()
+        assert registry.sessions[session_id].state == SessionState.EXPIRED
+
+        gone = await client.post(
+            f"/v1/sessions/{session_id}/agent-command",
+            headers=headers,
+            json={"type": "current_page"},
+        )
+        assert gone.status_code == 410, gone.text
+
+        # A fresh session can be created and driven without any manual intervention.
+        recreated = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_expired"},
+        )
+        assert recreated.status_code == 200, recreated.text
+        assert recreated.json()["session_id"] != session_id
+
+
+@pytest.mark.asyncio
 async def test_session_list_requires_service_auth():
     headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
     transport = ASGITransport(app=app)

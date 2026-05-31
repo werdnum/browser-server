@@ -39,6 +39,16 @@ class ConflictError(RuntimeError):
     pass
 
 
+class SessionInactiveError(ConflictError):
+    """The target session has expired or reached a terminal state.
+
+    Subclasses ConflictError so existing conflict handling still applies, but is
+    distinct so callers can tell "this session is gone, start a new one" apart
+    from "you do not own the lease" (which stays an AuthorizationError). The HTTP
+    layer maps this to 410 Gone.
+    """
+
+
 PAGE_STATE_COMMANDS = {
     "navigate",
     "click",
@@ -296,6 +306,8 @@ class SessionRegistry:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
+            if session.state in TERMINAL_STATES:
+                raise SessionInactiveError(f"session is no longer active ({session.state})")
             if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
                 raise AuthorizationError("agent commands are denied unless the agent owns the lease")
             if session.state not in AGENT_COMMAND_STATES and req.type in OBSERVATION_COMMANDS:
@@ -379,7 +391,7 @@ class SessionRegistry:
         if session.state not in TERMINAL_STATES and (
             session.idle_expires_at <= now_utc() or session.expires_at <= now_utc()
         ):
-            raise ConflictError("session is expired; run expiry reaper")
+            raise SessionInactiveError("session has expired")
 
     def _authorize_human_token_locked(self, session: BrowserSession, token: str, allow_pending: bool = False) -> None:
         allowed_states = {SessionState.HUMAN_ACTIVE, SessionState.HUMAN_SENSITIVE}
