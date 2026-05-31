@@ -69,8 +69,11 @@ def test_human_ui_e2e_with_real_playwright_browser(monkeypatch):
                 expect(page.locator("#state")).to_have_text("completed")
                 browser.close()
 
+            # The session is completed (terminal), so an agent command is rejected as
+            # Gone rather than as a lease-ownership denial: the session no longer exists
+            # to be owned.
             denied = client.post(f"/v1/sessions/{session_id}/agent-command", headers=headers, json={"type": "snapshot"})
-            assert denied.status_code == 403
+            assert denied.status_code == 410
     finally:
         server.should_exit = True
         thread.join(timeout=5)

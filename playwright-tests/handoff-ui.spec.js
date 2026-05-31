@@ -46,6 +46,9 @@ test("human can claim, extend, mark sensitive, and complete from the handoff UI"
   await page.getByRole("button", { name: "Complete" }).click();
   await expect(page.locator("#state")).toHaveText("completed");
 
+  // The session is completed (terminal), so the agent command is Gone (410)
+  // rather than a 403 lease-ownership denial: there is no session left to own.
   const denied = await api(`/v1/sessions/${session.session_id}/agent-command`, { type: "snapshot" });
-  expect(denied.status).toBe(403);
+  expect(denied.status).toBe(410);
 });
+
