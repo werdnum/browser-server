@@ -9,7 +9,12 @@ from browser_handoff_service.models import (
     SessionState,
     now_utc,
 )
-from browser_handoff_service.registry import AuthorizationError, ConflictError, SessionRegistry
+from browser_handoff_service.registry import (
+    AuthorizationError,
+    ConflictError,
+    SessionInactiveError,
+    SessionRegistry,
+)
 from browser_handoff_service.runtime import FakeBrowserWorker
 from browser_handoff_service.transitions import TransitionError, transition
 
@@ -163,7 +168,10 @@ async def test_expiry_reaper_closes_runtime_and_denies_commands():
     assert expired == [session.session_id]
     assert session.state == SessionState.EXPIRED
     assert session.cleanup_completed_at is not None
-    with pytest.raises(AuthorizationError):
+    # An expired (terminal) session reports as inactive, not as a lease-ownership
+    # denial: the agent should start a fresh session rather than be told "access
+    # denied" on a session that simply no longer exists.
+    with pytest.raises(SessionInactiveError):
         await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
 
 

@@ -32,7 +32,7 @@ from .models import (
     SessionState,
     form_factor_profile,
 )
-from .registry import AuthorizationError, ConflictError, NotFoundError, SessionRegistry
+from .registry import AuthorizationError, ConflictError, NotFoundError, SessionInactiveError, SessionRegistry
 from .runtime import remote_display_status
 from .transitions import TransitionError
 
@@ -623,6 +623,8 @@ def map_errors(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail="unknown session")
     if isinstance(exc, AuthorizationError):
         return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, SessionInactiveError):
+        return HTTPException(status_code=410, detail=str(exc))
     if isinstance(exc, (ConflictError, TransitionError)):
         return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=500, detail=str(exc))
