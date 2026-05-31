@@ -199,6 +199,9 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
       status.textContent = "Starting…";
       const res = await fetch(basePath + "/v1/sessions", {
         method: "POST",
+        // The browser authenticates to Envoy with its OIDC session cookie; Envoy
+        // validates it and forwards the OIDC access token upstream as Authorization.
+        credentials: "same-origin",
         headers: {"content-type": "application/json"},
         body: JSON.stringify({
           conversation_id: `conv_${Date.now()}`,
