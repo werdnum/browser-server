@@ -22,18 +22,14 @@ def clear_registry():
 @pytest.mark.asyncio
 async def test_landing_page():
     transport = ASGITransport(app=app)
-    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        unauthorized = await client.get("/")
-        assert unauthorized.status_code == 401
-
-        response = await client.get("/", headers=headers)
+        response = await client.get("/")
         assert response.status_code == 200
         assert "Browser Handoff Service" in response.text
         assert "View Sessions" in response.text
 
         # Under a path prefix the landing page must point its Start call and nav links there.
-        prefixed = await client.get("/", headers={**headers, "x-forwarded-prefix": "/browser"})
+        prefixed = await client.get("/", headers={"x-forwarded-prefix": "/browser"})
         assert prefixed.status_code == 200
         assert 'data-base-path="/browser"' in prefixed.text
         assert 'href="/browser/sessions"' in prefixed.text
@@ -382,15 +378,21 @@ async def test_agent_command_on_expired_session_returns_410():
 
 
 @pytest.mark.asyncio
-async def test_session_list_requires_service_auth():
-    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+async def test_session_list_page_loads_without_app_authorization():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        unauthorized = await client.get("/sessions")
-        assert unauthorized.status_code == 401
+        response = await client.get("/sessions")
 
-        authorized = await client.get("/sessions", headers=headers)
-        assert authorized.status_code == 200
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_create_session_requires_service_auth():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/v1/sessions", json={"conversation_id": "conv_unauthorized"})
+
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
