@@ -6,6 +6,8 @@ from browser_handoff_service.models import AgentCommandRequest
 from browser_handoff_service.runtime import FakeBrowserWorker, PlaywrightBrowserWorker
 from browser_handoff_service.ucp import (
     UCP_WELL_KNOWN_PATH,
+    MerchantUCPProfile,
+    ShoppingEndpoint,
     UCPDetector,
     discover_merchant_ucp_profile,
     format_ucp_hint,
@@ -70,10 +72,19 @@ def test_parse_profile_resolves_relative_endpoint_and_collects_capabilities():
     profile = parse_merchant_profile("https://shop.example.com", _shopping_profile())
     assert profile is not None
     assert profile.supports_shopping
-    assert profile.mcp_endpoints == ("https://shop.example.com/api/ucp/mcp",)
+    assert profile.endpoints == (ShoppingEndpoint("mcp", "https://shop.example.com/api/ucp/mcp"),)
     assert profile.version == "2026-04-08"
     assert profile.service_names == ("dev.ucp.shopping",)
     assert profile.shopping_capabilities() == ("cart", "checkout")
+
+
+def test_parse_profile_surfaces_rest_shopping_transport():
+    # A conforming merchant may publish dev.ucp.shopping over REST only.
+    profile = parse_merchant_profile("https://shop.example.com", _shopping_profile(transport="rest"))
+    assert profile is not None
+    assert profile.supports_shopping
+    assert profile.endpoints == (ShoppingEndpoint("rest", "https://shop.example.com/api/ucp/mcp"),)
+    assert "checkout" in profile.shopping_capabilities()
 
 
 def test_parse_profile_tolerates_unwrapped_envelope():
@@ -81,14 +92,14 @@ def test_parse_profile_tolerates_unwrapped_envelope():
     payload = _shopping_profile()["ucp"]
     profile = parse_merchant_profile("https://shop.example.com", payload)
     assert profile is not None
-    assert profile.mcp_endpoints == ("https://shop.example.com/api/ucp/mcp",)
+    assert [endpoint.url for endpoint in profile.endpoints] == ["https://shop.example.com/api/ucp/mcp"]
 
 
 def test_parse_profile_accepts_absolute_same_scheme_endpoint():
     payload = _shopping_profile(endpoint="https://mcp.example.com/ucp")
     profile = parse_merchant_profile("https://shop.example.com", payload)
     assert profile is not None
-    assert profile.mcp_endpoints == ("https://mcp.example.com/ucp",)
+    assert [endpoint.url for endpoint in profile.endpoints] == ["https://mcp.example.com/ucp"]
 
 
 def test_parse_profile_rejects_non_https_endpoint():
@@ -96,7 +107,7 @@ def test_parse_profile_rejects_non_https_endpoint():
     profile = parse_merchant_profile("https://shop.example.com", payload)
     assert profile is not None
     assert not profile.supports_shopping
-    assert profile.mcp_endpoints == ()
+    assert profile.endpoints == ()
 
 
 def test_parse_profile_ignores_malformed_endpoint_without_raising():
@@ -106,7 +117,7 @@ def test_parse_profile_ignores_malformed_endpoint_without_raising():
     profile = parse_merchant_profile("https://shop.example.com", payload)
     assert profile is not None
     assert not profile.supports_shopping
-    assert profile.mcp_endpoints == ()
+    assert profile.endpoints == ()
 
 
 def test_parse_profile_without_shopping_service_has_no_endpoints():
@@ -121,12 +132,12 @@ def test_parse_profile_without_shopping_service_has_no_endpoints():
     assert profile.service_names == ("dev.ucp.support",)
 
 
-def test_parse_profile_ignores_non_mcp_transport():
-    profile = parse_merchant_profile("https://shop.example.com", _shopping_profile(transport="rest"))
+def test_parse_profile_caps_endpoints():
+    declarations = [{"transport": "mcp", "endpoint": f"https://shop.example.com/mcp/{i}"} for i in range(20)]
+    payload = {"ucp": {"services": {"dev.ucp.shopping": declarations}}}
+    profile = parse_merchant_profile("https://shop.example.com", payload)
     assert profile is not None
-    assert not profile.supports_shopping
-    # Capabilities are still surfaced even when shopping is offered only over REST.
-    assert "checkout" in profile.shopping_capabilities()
+    assert len(profile.endpoints) == 8
 
 
 def test_parse_profile_rejects_non_object_payload():
@@ -221,12 +232,31 @@ async def test_detector_probes_once_and_hints_only_on_origin_change():
     assert first is not None
     assert first["origin"] == "https://shop.example.com"
     assert first["capabilities"] == ["cart", "checkout"]
-    assert first["endpoints"] == ["https://shop.example.com/api/ucp/mcp"]
+    assert first["endpoints"] == [{"transport": "mcp", "url": "https://shop.example.com/api/ucp/mcp"}]
 
     # Same origin again: cached, no re-probe, and no repeated hint.
     second = await detector.snapshot_hint("https://shop.example.com/b")
     assert second is None
     assert calls == ["https://shop.example.com/.well-known/ucp"]
+
+
+@pytest.mark.asyncio
+async def test_detector_caps_structured_arrays():
+    profile = MerchantUCPProfile(
+        origin="https://shop.example.com",
+        endpoints=tuple(ShoppingEndpoint("mcp", f"https://shop.example.com/mcp/{i}") for i in range(8)),
+        capability_names=tuple(f"dev.ucp.shopping.cap{i}" for i in range(30)),
+    )
+
+    async def fetch(_url):
+        return None
+
+    detector = UCPDetector(fetch)
+    detector._cache["https://shop.example.com"] = profile
+    hint = await detector.snapshot_hint("https://shop.example.com/")
+    assert hint is not None
+    assert len(hint["capabilities"]) == 12
+    assert len(hint["endpoints"]) <= 8
 
 
 @pytest.mark.asyncio

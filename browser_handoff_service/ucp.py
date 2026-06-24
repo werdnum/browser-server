@@ -29,8 +29,11 @@ _SHOPPING_CAPABILITY_PREFIX = f"{SHOPPING_SERVICE}."
 # injected into the agent-facing hint.
 _CAPABILITY_SUFFIX_RE = re.compile(r"^[a-z0-9_.-]{1,40}$")
 
-# Cap the number of capabilities rendered into a hint to keep it compact.
-_MAX_HINT_CAPABILITIES = 12
+# Compact caps on the merchant-controlled arrays that reach the agent (rendered
+# hint, structured snapshot fields, and session event metadata), so a hostile or
+# misconfigured profile cannot bloat an API response or in-memory event record.
+_MAX_SHOPPING_CAPABILITIES = 12
+_MAX_SHOPPING_ENDPOINTS = 8
 
 # ``fetch(url) -> parsed JSON | None``: returns the decoded JSON body of a 2xx
 # response, or ``None`` for any failure (network error, non-2xx, invalid JSON).
@@ -57,18 +60,26 @@ def merchant_origin(url: str | None) -> str | None:
 
 
 @dataclass(frozen=True)
+class ShoppingEndpoint:
+    """A shopping service endpoint and the transport an agent reaches it over."""
+
+    transport: str
+    url: str
+
+
+@dataclass(frozen=True)
 class MerchantUCPProfile:
     """A merchant's discovered UCP profile for a single origin."""
 
     origin: str
-    mcp_endpoints: tuple[str, ...] = ()
+    endpoints: tuple[ShoppingEndpoint, ...] = ()
     service_names: tuple[str, ...] = ()
     capability_names: tuple[str, ...] = ()
     version: str | None = None
 
     @property
     def supports_shopping(self) -> bool:
-        return bool(self.mcp_endpoints)
+        return bool(self.endpoints)
 
     def shopping_capabilities(self) -> tuple[str, ...]:
         """Sanitized, deduplicated shopping capability suffixes (e.g. ``cart``).
@@ -118,9 +129,11 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
     declarations). An unwrapped document is tolerated as a fallback.
 
     Tolerates malformed payloads, returning a profile with whatever could be
-    extracted (and ``supports_shopping`` ``False`` when no usable shopping MCP
+    extracted (and ``supports_shopping`` ``False`` when no usable shopping
     endpoint is advertised). Returns ``None`` only when the payload is not an
-    object at all.
+    object at all. Any HTTPS shopping endpoint counts regardless of transport —
+    the conforming UCP guides publish ``dev.ucp.shopping`` over REST as well as
+    MCP — so the transport is surfaced alongside each endpoint.
     """
     if not isinstance(payload, dict):
         return None
@@ -129,7 +142,7 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
         envelope = payload
 
     service_names: list[str] = []
-    endpoints: list[str] = []
+    endpoints: list[ShoppingEndpoint] = []
     raw_services = envelope.get("services")
     if isinstance(raw_services, dict):
         for namespace, declarations in raw_services.items():
@@ -142,14 +155,17 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
                 if not isinstance(declaration, dict):
                     continue
                 transport = declaration.get("transport")
-                if not isinstance(transport, str) or transport.lower() != "mcp":
+                if not isinstance(transport, str) or not transport:
                     continue
                 raw_endpoint = declaration.get("endpoint")
                 if not isinstance(raw_endpoint, str) or not raw_endpoint:
                     continue
                 resolved = _resolve_endpoint(origin, raw_endpoint)
-                if resolved is not None and resolved not in endpoints:
-                    endpoints.append(resolved)
+                if resolved is None:
+                    continue
+                endpoint = ShoppingEndpoint(transport=transport.lower(), url=resolved)
+                if endpoint not in endpoints:
+                    endpoints.append(endpoint)
 
     raw_capabilities = envelope.get("capabilities")
     capability_names = (
@@ -159,7 +175,8 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
     version = envelope.get("version")
     return MerchantUCPProfile(
         origin=origin,
-        mcp_endpoints=tuple(endpoints),
+        # Bound the stored arrays so a hostile profile cannot bloat the per-origin cache.
+        endpoints=tuple(endpoints[:_MAX_SHOPPING_ENDPOINTS]),
         service_names=tuple(dict.fromkeys(service_names)),
         capability_names=tuple(dict.fromkeys(capability_names)),
         version=version if isinstance(version, str) else None,
@@ -170,7 +187,7 @@ def format_ucp_hint(profile: MerchantUCPProfile) -> str | None:
     """Render a single-line, agent-facing hint for a shopping-capable profile."""
     if not profile.supports_shopping:
         return None
-    suffixes = profile.shopping_capabilities()[:_MAX_HINT_CAPABILITIES]
+    suffixes = profile.shopping_capabilities()[:_MAX_SHOPPING_CAPABILITIES]
     capability_text = ", ".join(suffixes) if suffixes else "shopping"
     return f"\U0001f6d2 This site advertises UCP shopping support at {profile.origin}. Capabilities: {capability_text}."
 
@@ -220,8 +237,11 @@ class UCPDetector:
         return {
             "origin": profile.origin,
             "version": profile.version,
-            "capabilities": list(profile.shopping_capabilities()),
-            "endpoints": list(profile.mcp_endpoints),
+            "capabilities": list(profile.shopping_capabilities()[:_MAX_SHOPPING_CAPABILITIES]),
+            "endpoints": [
+                {"transport": endpoint.transport, "url": endpoint.url}
+                for endpoint in profile.endpoints[:_MAX_SHOPPING_ENDPOINTS]
+            ],
             "hint": hint,
         }
 
