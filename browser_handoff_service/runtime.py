@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from .models import AgentCommandRequest
 from .security import redact_url
+from .ucp import UCPDetector
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -179,6 +180,13 @@ class FakeBrowserWorker:
         self.url: str | None = None
         self.title = "Blank"
         self.actions: list[dict[str, Any]] = []
+        # Fixture UCP profiles keyed by well-known URL ("{origin}/.well-known/ucp"),
+        # so tests can simulate a merchant advertising shopping support.
+        self.ucp_documents: dict[str, Any] = {}
+        self._ucp = UCPDetector(self._ucp_fetch)
+
+    async def _ucp_fetch(self, url: str) -> Any:
+        return self.ucp_documents.get(url)
 
     async def start(self) -> None:
         return None
@@ -195,13 +203,17 @@ class FakeBrowserWorker:
             self.actions.append({"type": request.type, "args": request.args})
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "snapshot":
-            return {
+            result: dict[str, Any] = {
                 "url": redact_url(self.url)[0] if self.url else "about:blank",
                 "title": self.title,
                 "forms": 0,
                 "elements": 1,
                 "roots": [{"ref": "e1", "role": "document", "name": self.title}],
             }
+            hint = await self._ucp.snapshot_hint(self.url)
+            if hint is not None:
+                result["ucp"] = hint
+            return result
         if request.type == "screenshot":
             # 1x1 transparent PNG so callers exercising the bytes path get valid image data.
             png = base64.b64decode(
@@ -269,6 +281,24 @@ class PlaywrightBrowserWorker:
         self._page = None
         self.remote_url: str | None = None
         self._display: LocalNovncDisplay | None = None
+        self._ucp = UCPDetector(self._ucp_fetch)
+
+    async def _ucp_fetch(self, url: str) -> Any:
+        """Probe a UCP well-known document through the live browser context.
+
+        Reuses the page's network stack (cookies, TLS, proxy) for a read-only GET
+        to the fixed ``/.well-known/ucp`` path. The response is parsed as JSON and
+        never rendered into the page; any failure yields ``None``.
+        """
+        if self._page is None:
+            return None
+        try:
+            response = await self._page.context.request.get(url, timeout=5000)
+            if not response.ok:
+                return None
+            return await response.json()
+        except Exception:
+            return None
 
     async def start(self) -> None:
         try:
@@ -335,7 +365,11 @@ class PlaywrightBrowserWorker:
             return await self._current_page_result({"accepted": True})
         if request.type == "snapshot":
             result = await page.evaluate(_SNAPSHOT_JS)
-            result["url"] = redact_url(result.get("url", ""))[0]
+            raw_url = result.get("url", "") or page.url
+            result["url"] = redact_url(raw_url)[0]
+            hint = await self._ucp.snapshot_hint(raw_url)
+            if hint is not None:
+                result["ucp"] = hint
             return result
         if request.type == "screenshot":
             png = await page.screenshot(type="png", full_page=False)

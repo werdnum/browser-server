@@ -17,6 +17,7 @@ Implemented:
 - Real Playwright Chromium runtime by default.
 - Headed Chromium plus Xvfb/x11vnc/noVNC launch path when host binaries are installed.
 - Form factor auto-detected from the user's aspect ratio (portrait -> mobile, landscape -> desktop); the noVNC viewport is sized to match.
+- Automatic UCP (Universal Commerce Protocol) discovery: on each accessibility `snapshot` the worker probes the current HTTPS origin's `/.well-known/ucp` profile (once per origin, cached), and when a merchant advertises shopping support it attaches a `ucp` hint to the snapshot so the driving agent can use UCP shopping without merchant-specific endpoints being hardcoded.
 - noVNC access is exposed through the authenticated service proxy; raw worker noVNC ports stay loopback-only.
 - Minimal human UI at `/sessions/{session_id}`.
 - SSE lifecycle event stream.
