@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import shutil
 import socket
@@ -14,6 +16,12 @@ import httpx
 from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
+
+# Bound the merchant-controlled UCP probe so a huge or slow-trickle
+# /.well-known/ucp response cannot tie up the snapshot — which the registry
+# awaits while holding the session lock — past a small fixed budget.
+_UCP_PROBE_TIMEOUT_S = 5.0
+_UCP_PROBE_MAX_BYTES = 256 * 1024
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -286,21 +294,34 @@ class PlaywrightBrowserWorker:
         self._ucp = UCPDetector(self._ucp_fetch)
 
     async def _ucp_fetch(self, url: str) -> Any:
-        """Probe a UCP well-known document with a plain HTTPS GET.
+        """Probe a UCP well-known document with a bounded, plain HTTPS GET.
 
         A read-only GET to the fixed ``/.well-known/ucp`` path using a throwaway
         ``httpx`` client, independent of the browser context: a merchant-controlled
         ``Set-Cookie`` on the response can never reach the live session/cart
         cookies. Redirects are disabled so an HTTPS profile cannot be downgraded to
-        a plaintext ``http://`` response and still be parsed. The response is parsed
-        as JSON and never rendered into the page; any failure yields ``None``.
+        a plaintext ``http://`` response and still be parsed. The response is read
+        under a total deadline and a body-size cap (so a huge or slow-trickle
+        response cannot block the snapshot), parsed as JSON, and never rendered
+        into the page; any failure yields ``None``.
         """
+
+        async def probe() -> Any:
+            async with (
+                httpx.AsyncClient(timeout=_UCP_PROBE_TIMEOUT_S, follow_redirects=False) as client,
+                client.stream("GET", url) as response,
+            ):
+                if response.status_code // 100 != 2:
+                    return None
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > _UCP_PROBE_MAX_BYTES:
+                        return None
+            return json.loads(body)
+
         try:
-            async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
-                response = await client.get(url)
-            if response.status_code // 100 != 2:
-                return None
-            return response.json()
+            return await asyncio.wait_for(probe(), timeout=_UCP_PROBE_TIMEOUT_S)
         except Exception:
             return None
 

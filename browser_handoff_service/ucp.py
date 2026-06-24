@@ -24,6 +24,11 @@ UCP_WELL_KNOWN_PATH = "/.well-known/ucp"
 SHOPPING_SERVICE = "dev.ucp.shopping"
 _SHOPPING_CAPABILITY_PREFIX = f"{SHOPPING_SERVICE}."
 
+# Transports a UCP service declaration may legitimately advertise. Anything else
+# (e.g. "grpc", or a value with embedded newlines) is rejected so a snapshot
+# never advertises shopping over a transport no agent can actually use.
+_SUPPORTED_TRANSPORTS = frozenset({"rest", "mcp", "a2a", "embedded"})
+
 # A capability suffix surfaced to the agent must be a short, safe token: the
 # profile is merchant-controlled, so this prevents newlines or prose from being
 # injected into the agent-facing hint.
@@ -69,12 +74,17 @@ class ShoppingEndpoint:
 
 @dataclass(frozen=True)
 class MerchantUCPProfile:
-    """A merchant's discovered UCP profile for a single origin."""
+    """A merchant's discovered UCP profile for a single origin.
+
+    ``capabilities`` are already the sanitized, bounded shopping suffixes
+    (e.g. ``cart``) — never the raw merchant strings — so nothing unbounded or
+    unsafe is retained in the per-origin cache or handed to the agent.
+    """
 
     origin: str
     endpoints: tuple[ShoppingEndpoint, ...] = ()
     service_names: tuple[str, ...] = ()
-    capability_names: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
     version: str | None = None
 
     @property
@@ -82,20 +92,27 @@ class MerchantUCPProfile:
         return bool(self.endpoints)
 
     def shopping_capabilities(self) -> tuple[str, ...]:
-        """Sanitized, deduplicated shopping capability suffixes (e.g. ``cart``).
+        return self.capabilities
 
-        Only suffixes under the ``dev.ucp.shopping.`` namespace that match the
-        safe-token shape are returned, so a merchant cannot smuggle prose into
-        anything rendered for the agent.
-        """
-        suffixes: list[str] = []
-        for capability in self.capability_names:
-            if not capability.startswith(_SHOPPING_CAPABILITY_PREFIX):
-                continue
-            suffix = capability[len(_SHOPPING_CAPABILITY_PREFIX) :]
-            if _CAPABILITY_SUFFIX_RE.match(suffix) and suffix not in suffixes:
-                suffixes.append(suffix)
-        return tuple(suffixes)
+
+def _shopping_suffixes(capability_keys: Any) -> tuple[str, ...]:
+    """Sanitized, deduplicated, bounded shopping capability suffixes.
+
+    Only suffixes under the ``dev.ucp.shopping.`` namespace that match the
+    safe-token shape are kept (so a merchant cannot smuggle prose into anything
+    rendered for the agent), and collection stops at ``_MAX_SHOPPING_CAPABILITIES``
+    so a hostile profile with thousands of keys cannot bloat the cache.
+    """
+    suffixes: list[str] = []
+    for capability in capability_keys:
+        if not isinstance(capability, str) or not capability.startswith(_SHOPPING_CAPABILITY_PREFIX):
+            continue
+        suffix = capability[len(_SHOPPING_CAPABILITY_PREFIX) :]
+        if _CAPABILITY_SUFFIX_RE.match(suffix) and suffix not in suffixes:
+            suffixes.append(suffix)
+        if len(suffixes) >= _MAX_SHOPPING_CAPABILITIES:
+            break
+    return tuple(suffixes)
 
 
 def _is_shopping_service(namespace: str) -> bool:
@@ -155,7 +172,7 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
                 if not isinstance(declaration, dict):
                     continue
                 transport = declaration.get("transport")
-                if not isinstance(transport, str) or not transport:
+                if not isinstance(transport, str) or transport.lower() not in _SUPPORTED_TRANSPORTS:
                     continue
                 raw_endpoint = declaration.get("endpoint")
                 if not isinstance(raw_endpoint, str) or not raw_endpoint:
@@ -168,9 +185,7 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
                     endpoints.append(endpoint)
 
     raw_capabilities = envelope.get("capabilities")
-    capability_names = (
-        [key for key in raw_capabilities if isinstance(key, str)] if isinstance(raw_capabilities, dict) else []
-    )
+    capabilities = _shopping_suffixes(raw_capabilities if isinstance(raw_capabilities, dict) else ())
 
     version = envelope.get("version")
     return MerchantUCPProfile(
@@ -178,7 +193,7 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
         # Bound the stored arrays so a hostile profile cannot bloat the per-origin cache.
         endpoints=tuple(endpoints[:_MAX_SHOPPING_ENDPOINTS]),
         service_names=tuple(dict.fromkeys(service_names)),
-        capability_names=tuple(dict.fromkeys(capability_names)),
+        capabilities=capabilities,
         version=version if isinstance(version, str) else None,
     )
 

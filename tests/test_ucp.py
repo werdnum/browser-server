@@ -140,6 +140,34 @@ def test_parse_profile_caps_endpoints():
     assert len(profile.endpoints) == 8
 
 
+def test_parse_profile_caps_cached_capabilities():
+    # A hostile profile with thousands of capability keys must not retain unbounded
+    # merchant-controlled strings in the cached profile.
+    many = {f"dev.ucp.shopping.cap{i}": [{"version": "1"}] for i in range(5000)}
+    payload = {
+        "ucp": {"services": {"dev.ucp.shopping": [{"transport": "mcp", "endpoint": "/mcp"}]}, "capabilities": many}
+    }
+    profile = parse_merchant_profile("https://shop.example.com", payload)
+    assert profile is not None
+    assert len(profile.capabilities) == 12
+
+
+@pytest.mark.parametrize("transport", ["a2a", "embedded", "REST"])
+def test_parse_profile_accepts_known_transports(transport):
+    profile = parse_merchant_profile("https://shop.example.com", _shopping_profile(transport=transport))
+    assert profile is not None
+    assert profile.supports_shopping
+    assert profile.endpoints[0].transport == transport.lower()
+
+
+@pytest.mark.parametrize("transport", ["grpc", "rest\nignore", "", "mcp "])
+def test_parse_profile_rejects_unknown_transport(transport):
+    profile = parse_merchant_profile("https://shop.example.com", _shopping_profile(transport=transport))
+    assert profile is not None
+    assert not profile.supports_shopping
+    assert profile.endpoints == ()
+
+
 def test_parse_profile_rejects_non_object_payload():
     assert parse_merchant_profile("https://shop.example.com", ["not", "an", "object"]) is None
 
@@ -219,6 +247,25 @@ async def test_playwright_probe_fetches_over_httpx_and_rejects_redirects(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_playwright_probe_rejects_oversized_body(monkeypatch):
+    oversized = b'{"ucp":{"junk":"' + b"a" * (runtime._UCP_PROBE_MAX_BYTES + 1) + b'"}}'
+
+    def handler(_request):
+        return httpx.Response(200, content=oversized)
+
+    real_client = httpx.AsyncClient
+
+    def make_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.httpx, "AsyncClient", make_client)
+
+    worker = PlaywrightBrowserWorker("worker_probe_big")
+    assert await worker._ucp_fetch(f"https://shop.example.com{UCP_WELL_KNOWN_PATH}") is None
+
+
+@pytest.mark.asyncio
 async def test_detector_probes_once_and_hints_only_on_origin_change():
     calls: list[str] = []
 
@@ -244,8 +291,8 @@ async def test_detector_probes_once_and_hints_only_on_origin_change():
 async def test_detector_caps_structured_arrays():
     profile = MerchantUCPProfile(
         origin="https://shop.example.com",
-        endpoints=tuple(ShoppingEndpoint("mcp", f"https://shop.example.com/mcp/{i}") for i in range(8)),
-        capability_names=tuple(f"dev.ucp.shopping.cap{i}" for i in range(30)),
+        endpoints=tuple(ShoppingEndpoint("mcp", f"https://shop.example.com/mcp/{i}") for i in range(20)),
+        capabilities=tuple(f"cap{i}" for i in range(30)),
     )
 
     async def fetch(_url):
@@ -256,7 +303,7 @@ async def test_detector_caps_structured_arrays():
     hint = await detector.snapshot_hint("https://shop.example.com/")
     assert hint is not None
     assert len(hint["capabilities"]) == 12
-    assert len(hint["endpoints"]) <= 8
+    assert len(hint["endpoints"]) == 8
 
 
 @pytest.mark.asyncio
