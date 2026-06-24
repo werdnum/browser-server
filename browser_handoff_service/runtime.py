@@ -282,18 +282,25 @@ class PlaywrightBrowserWorker:
         self.remote_url: str | None = None
         self._display: LocalNovncDisplay | None = None
         self._ucp = UCPDetector(self._ucp_fetch)
+        self._ucp_request_context: Any = None
 
     async def _ucp_fetch(self, url: str) -> Any:
-        """Probe a UCP well-known document through the live browser context.
+        """Probe a UCP well-known document over an isolated request context.
 
-        Reuses the page's network stack (cookies, TLS, proxy) for a read-only GET
-        to the fixed ``/.well-known/ucp`` path. The response is parsed as JSON and
-        never rendered into the page; any failure yields ``None``.
+        A read-only GET to the fixed ``/.well-known/ucp`` path, parsed as JSON and
+        never rendered into the page. The request runs through a dedicated
+        ``APIRequestContext`` (not the page's), so a merchant-controlled
+        ``Set-Cookie`` on the response cannot mutate the live session/cart cookies.
+        Redirects are disabled so an HTTPS profile cannot be downgraded to a
+        plaintext ``http://`` response and still be parsed. Any failure yields
+        ``None``.
         """
-        if self._page is None:
+        if self._playwright is None:
             return None
         try:
-            response = await self._page.context.request.get(url, timeout=5000)
+            if self._ucp_request_context is None:
+                self._ucp_request_context = await self._playwright.request.new_context()
+            response = await self._ucp_request_context.get(url, timeout=5000, max_redirects=0)
             if not response.ok:
                 return None
             return await response.json()
@@ -460,6 +467,9 @@ class PlaywrightBrowserWorker:
 
     async def close(self) -> None:
         self.closed = True
+        if self._ucp_request_context is not None:
+            await self._ucp_request_context.dispose()
+            self._ucp_request_context = None
         if self._browser is not None:
             await self._browser.close()
             self._browser = None

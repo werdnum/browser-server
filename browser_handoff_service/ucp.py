@@ -87,23 +87,23 @@ class MerchantUCPProfile:
         return tuple(suffixes)
 
 
-def _is_shopping_service(name: str | None, capabilities: list[str]) -> bool:
-    if isinstance(name, str) and (name == SHOPPING_SERVICE or name.startswith(_SHOPPING_CAPABILITY_PREFIX)):
-        return True
-    return any(
-        capability == SHOPPING_SERVICE or capability.startswith(_SHOPPING_CAPABILITY_PREFIX)
-        for capability in capabilities
-    )
+def _is_shopping_service(namespace: str) -> bool:
+    return namespace == SHOPPING_SERVICE or namespace.startswith(_SHOPPING_CAPABILITY_PREFIX)
 
 
 def _resolve_endpoint(origin: str, raw_endpoint: str) -> str | None:
     """Resolve a (possibly relative) endpoint against ``origin``, keeping only HTTPS.
 
     Relative paths like ``/api/ucp/mcp`` resolve against the origin; absolute
-    URLs are accepted as-is. Non-HTTPS or host-less results are rejected.
+    URLs are accepted as-is. Non-HTTPS or host-less results are rejected, as is a
+    merchant-controlled value malformed enough to make ``urlsplit`` raise (e.g.
+    ``https://[::1``) — discovery must never bubble a parse error to the caller.
     """
-    resolved = urljoin(f"{origin}/", raw_endpoint)
-    parts = urlsplit(resolved)
+    try:
+        resolved = urljoin(f"{origin}/", raw_endpoint)
+        parts = urlsplit(resolved)
+    except ValueError:
+        return None
     if parts.scheme != "https" or not parts.hostname:
         return None
     return resolved
@@ -112,6 +112,11 @@ def _resolve_endpoint(origin: str, raw_endpoint: str) -> str | None:
 def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | None:
     """Parse a ``/.well-known/ucp`` document into a :class:`MerchantUCPProfile`.
 
+    Follows the UCP profile envelope (https://ucp.dev/documentation/core-concepts/):
+    discovery data lives under a top-level ``ucp`` object, whose ``services`` and
+    ``capabilities`` are objects keyed by namespace (each value a list of versioned
+    declarations). An unwrapped document is tolerated as a fallback.
+
     Tolerates malformed payloads, returning a profile with whatever could be
     extracted (and ``supports_shopping`` ``False`` when no usable shopping MCP
     endpoint is advertised). Returns ``None`` only when the payload is not an
@@ -119,45 +124,39 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
     """
     if not isinstance(payload, dict):
         return None
-
-    raw_services = payload.get("services")
-    services = raw_services if isinstance(raw_services, list) else []
+    envelope = payload.get("ucp")
+    if not isinstance(envelope, dict):
+        envelope = payload
 
     service_names: list[str] = []
-    capability_names: list[str] = []
     endpoints: list[str] = []
-
-    for service in services:
-        if not isinstance(service, dict):
-            continue
-        name = service.get("name") or service.get("id")
-        if isinstance(name, str) and name:
-            service_names.append(name)
-        raw_capabilities = service.get("capabilities")
-        service_capabilities = (
-            [item for item in raw_capabilities if isinstance(item, str)] if isinstance(raw_capabilities, list) else []
-        )
-        capability_names.extend(service_capabilities)
-
-        if not _is_shopping_service(name if isinstance(name, str) else None, service_capabilities):
-            continue
-        raw_bindings = service.get("bindings")
-        if not isinstance(raw_bindings, list):
-            continue
-        for binding in raw_bindings:
-            if not isinstance(binding, dict):
+    raw_services = envelope.get("services")
+    if isinstance(raw_services, dict):
+        for namespace, declarations in raw_services.items():
+            if not isinstance(namespace, str) or not namespace:
                 continue
-            transport = binding.get("transport") or binding.get("type")
-            if not isinstance(transport, str) or transport.lower() != "mcp":
+            service_names.append(namespace)
+            if not _is_shopping_service(namespace) or not isinstance(declarations, list):
                 continue
-            raw_endpoint = binding.get("endpoint") or binding.get("url")
-            if not isinstance(raw_endpoint, str) or not raw_endpoint:
-                continue
-            resolved = _resolve_endpoint(origin, raw_endpoint)
-            if resolved is not None and resolved not in endpoints:
-                endpoints.append(resolved)
+            for declaration in declarations:
+                if not isinstance(declaration, dict):
+                    continue
+                transport = declaration.get("transport")
+                if not isinstance(transport, str) or transport.lower() != "mcp":
+                    continue
+                raw_endpoint = declaration.get("endpoint")
+                if not isinstance(raw_endpoint, str) or not raw_endpoint:
+                    continue
+                resolved = _resolve_endpoint(origin, raw_endpoint)
+                if resolved is not None and resolved not in endpoints:
+                    endpoints.append(resolved)
 
-    version = payload.get("version")
+    raw_capabilities = envelope.get("capabilities")
+    capability_names = (
+        [key for key in raw_capabilities if isinstance(key, str)] if isinstance(raw_capabilities, dict) else []
+    )
+
+    version = envelope.get("version")
     return MerchantUCPProfile(
         origin=origin,
         mcp_endpoints=tuple(endpoints),
