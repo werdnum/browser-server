@@ -58,6 +58,11 @@ def _shopping_profile(extra_caps=None, endpoint="/api/ucp/mcp", transport="mcp")
     [
         ("https://shop.example.com/products/1?x=1", "https://shop.example.com"),
         ("https://shop.example.com:8443/", "https://shop.example.com:8443"),
+        # Embedded credentials must be stripped, not carried into the origin/probe.
+        ("https://user:pass@shop.example.com/path", "https://shop.example.com"),
+        ("https://user:pass@shop.example.com:8443/", "https://shop.example.com:8443"),
+        ("https://[::1]:8443/", "https://[::1]:8443"),
+        ("https://shop.example.com:bad/", None),  # invalid port
         ("http://shop.example.com/", None),  # non-HTTPS is ineligible
         ("about:blank", None),
         ("", None),

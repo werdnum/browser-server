@@ -48,20 +48,26 @@ _UNSET = object()
 
 
 def merchant_origin(url: str | None) -> str | None:
-    """Return the HTTPS origin (``scheme://netloc``) for ``url``, else ``None``.
+    """Return the HTTPS origin (``scheme://host[:port]``) for ``url``, else ``None``.
 
     Only HTTPS origins are eligible for discovery: a UCP probe (and anything a
-    caller might build on it) must never traverse plaintext.
+    caller builds on it) must never traverse plaintext. The origin is rebuilt from
+    the host and port — never the raw ``netloc`` — so embedded credentials
+    (``https://user:pass@host``) are stripped rather than turning the probe into an
+    authenticated request or leaking into the origin/hint/event.
     """
     if not url:
         return None
     try:
         parts = urlsplit(url)
+        port = parts.port
     except ValueError:
         return None
     if parts.scheme != "https" or not parts.hostname:
         return None
-    return f"{parts.scheme}://{parts.netloc}"
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = host if port is None else f"{host}:{port}"
+    return f"{parts.scheme}://{netloc}"
 
 
 @dataclass(frozen=True)
