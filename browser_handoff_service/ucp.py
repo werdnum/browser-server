@@ -66,10 +66,14 @@ def merchant_origin(url: str | None) -> str | None:
 
 @dataclass(frozen=True)
 class ShoppingEndpoint:
-    """A shopping service endpoint and the transport an agent reaches it over."""
+    """A shopping service declaration: its transport and (where applicable) URL.
+
+    ``url`` is ``None`` only for the ``embedded`` transport, which the UCP spec
+    lets a merchant advertise without a separate endpoint.
+    """
 
     transport: str
-    url: str
+    url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,13 +178,18 @@ def parse_merchant_profile(origin: str, payload: Any) -> MerchantUCPProfile | No
                 transport = declaration.get("transport")
                 if not isinstance(transport, str) or transport.lower() not in _SUPPORTED_TRANSPORTS:
                     continue
+                transport = transport.lower()
                 raw_endpoint = declaration.get("endpoint")
-                if not isinstance(raw_endpoint, str) or not raw_endpoint:
+                url: str | None = None
+                if isinstance(raw_endpoint, str) and raw_endpoint:
+                    url = _resolve_endpoint(origin, raw_endpoint)
+                    if url is None:
+                        # An endpoint was declared but is malformed or non-HTTPS — drop it.
+                        continue
+                elif transport != "embedded":
+                    # Network transports must carry an endpoint; only "embedded" may omit it.
                     continue
-                resolved = _resolve_endpoint(origin, raw_endpoint)
-                if resolved is None:
-                    continue
-                endpoint = ShoppingEndpoint(transport=transport.lower(), url=resolved)
+                endpoint = ShoppingEndpoint(transport=transport, url=url)
                 if endpoint not in endpoints:
                     endpoints.append(endpoint)
 

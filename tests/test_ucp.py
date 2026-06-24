@@ -168,6 +168,24 @@ def test_parse_profile_rejects_unknown_transport(transport):
     assert profile.endpoints == ()
 
 
+def test_parse_profile_surfaces_embedded_without_endpoint():
+    # The embedded transport may omit an endpoint, per the 2026-04-08 spec example.
+    payload = {"ucp": {"services": {"dev.ucp.shopping": [{"transport": "embedded"}]}}}
+    profile = parse_merchant_profile("https://shop.example.com", payload)
+    assert profile is not None
+    assert profile.supports_shopping
+    assert profile.endpoints == (ShoppingEndpoint("embedded", None),)
+
+
+@pytest.mark.parametrize("transport", ["mcp", "rest", "a2a"])
+def test_parse_profile_requires_endpoint_for_network_transports(transport):
+    # A network transport without an endpoint is not usable shopping support.
+    payload = {"ucp": {"services": {"dev.ucp.shopping": [{"transport": transport}]}}}
+    profile = parse_merchant_profile("https://shop.example.com", payload)
+    assert profile is not None
+    assert not profile.supports_shopping
+
+
 def test_parse_profile_rejects_non_object_payload():
     assert parse_merchant_profile("https://shop.example.com", ["not", "an", "object"]) is None
 
