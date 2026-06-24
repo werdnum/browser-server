@@ -135,11 +135,13 @@ def _resolve_endpoint(origin: str, raw_endpoint: str) -> str | None:
     Relative paths like ``/api/ucp/mcp`` resolve against the origin; absolute
     URLs are accepted as-is. Non-HTTPS or host-less results are rejected, as is a
     merchant-controlled value malformed enough to make ``urlsplit`` raise (e.g.
-    ``https://[::1``) — discovery must never bubble a parse error to the caller.
+    ``https://[::1``) or carry an invalid port (e.g. ``https://h:bad``) — discovery
+    must never bubble a parse error to the caller or surface an unusable endpoint.
     """
     try:
         resolved = urljoin(f"{origin}/", raw_endpoint)
         parts = urlsplit(resolved)
+        _ = parts.port  # accessing .port validates it, raising ValueError if malformed
     except ValueError:
         return None
     if parts.scheme != "https" or not parts.hostname:

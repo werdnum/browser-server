@@ -125,6 +125,15 @@ def test_parse_profile_ignores_malformed_endpoint_without_raising():
     assert profile.endpoints == ()
 
 
+def test_parse_profile_rejects_endpoint_with_invalid_port():
+    # urlsplit only raises on .port access, so an invalid port must be validated.
+    payload = _shopping_profile(endpoint="https://mcp.example.com:bad/ucp")
+    profile = parse_merchant_profile("https://shop.example.com", payload)
+    assert profile is not None
+    assert not profile.supports_shopping
+    assert profile.endpoints == ()
+
+
 def test_parse_profile_without_shopping_service_has_no_endpoints():
     payload = {
         "ucp": {
