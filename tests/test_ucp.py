@@ -1,8 +1,9 @@
+import httpx
 import pytest
-from browser_handoff_service import main
+from browser_handoff_service import main, runtime
 from browser_handoff_service.main import app, registry
 from browser_handoff_service.models import AgentCommandRequest
-from browser_handoff_service.runtime import FakeBrowserWorker
+from browser_handoff_service.runtime import FakeBrowserWorker, PlaywrightBrowserWorker
 from browser_handoff_service.ucp import (
     UCP_WELL_KNOWN_PATH,
     UCPDetector,
@@ -168,6 +169,42 @@ async def test_discover_does_not_raise_on_malformed_endpoint():
     profile = await discover_merchant_ucp_profile("https://shop.example.com", fetch)
     assert profile is not None
     assert not profile.supports_shopping
+
+
+@pytest.mark.asyncio
+async def test_playwright_probe_fetches_over_httpx_and_rejects_redirects(monkeypatch):
+    requested: list[str] = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if request.url.host == "redirect.example.com":
+            # An HTTPS profile that tries to redirect (e.g. to plaintext) must not
+            # be followed/parsed.
+            return httpx.Response(302, headers={"location": "http://downgrade.example.com/.well-known/ucp"})
+        return httpx.Response(200, json=_shopping_profile())
+
+    real_client = httpx.AsyncClient
+
+    def make_client(*args, **kwargs):
+        # Confirm the probe disables redirects, then serve via a mock transport.
+        assert kwargs.get("follow_redirects") is False
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.httpx, "AsyncClient", make_client)
+
+    worker = PlaywrightBrowserWorker("worker_probe")
+    ok = await worker._ucp_fetch(f"https://shop.example.com{UCP_WELL_KNOWN_PATH}")
+    assert ok is not None
+    parsed = parse_merchant_profile("https://shop.example.com", ok)
+    assert parsed is not None and parsed.supports_shopping
+
+    rejected = await worker._ucp_fetch(f"https://redirect.example.com{UCP_WELL_KNOWN_PATH}")
+    assert rejected is None
+    assert requested == [
+        f"https://shop.example.com{UCP_WELL_KNOWN_PATH}",
+        f"https://redirect.example.com{UCP_WELL_KNOWN_PATH}",
+    ]
 
 
 @pytest.mark.asyncio

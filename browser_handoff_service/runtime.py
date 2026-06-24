@@ -9,6 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx
+
 from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
@@ -282,28 +284,23 @@ class PlaywrightBrowserWorker:
         self.remote_url: str | None = None
         self._display: LocalNovncDisplay | None = None
         self._ucp = UCPDetector(self._ucp_fetch)
-        self._ucp_request_context: Any = None
 
     async def _ucp_fetch(self, url: str) -> Any:
-        """Probe a UCP well-known document over an isolated request context.
+        """Probe a UCP well-known document with a plain HTTPS GET.
 
-        A read-only GET to the fixed ``/.well-known/ucp`` path, parsed as JSON and
-        never rendered into the page. The request runs through a dedicated
-        ``APIRequestContext`` (not the page's), so a merchant-controlled
-        ``Set-Cookie`` on the response cannot mutate the live session/cart cookies.
-        Redirects are disabled so an HTTPS profile cannot be downgraded to a
-        plaintext ``http://`` response and still be parsed. Any failure yields
-        ``None``.
+        A read-only GET to the fixed ``/.well-known/ucp`` path using a throwaway
+        ``httpx`` client, independent of the browser context: a merchant-controlled
+        ``Set-Cookie`` on the response can never reach the live session/cart
+        cookies. Redirects are disabled so an HTTPS profile cannot be downgraded to
+        a plaintext ``http://`` response and still be parsed. The response is parsed
+        as JSON and never rendered into the page; any failure yields ``None``.
         """
-        if self._playwright is None:
-            return None
         try:
-            if self._ucp_request_context is None:
-                self._ucp_request_context = await self._playwright.request.new_context()
-            response = await self._ucp_request_context.get(url, timeout=5000, max_redirects=0)
-            if not response.ok:
+            async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+                response = await client.get(url)
+            if response.status_code // 100 != 2:
                 return None
-            return await response.json()
+            return response.json()
         except Exception:
             return None
 
@@ -467,9 +464,6 @@ class PlaywrightBrowserWorker:
 
     async def close(self) -> None:
         self.closed = True
-        if self._ucp_request_context is not None:
-            await self._ucp_request_context.dispose()
-            self._ucp_request_context = None
         if self._browser is not None:
             await self._browser.close()
             self._browser = None
