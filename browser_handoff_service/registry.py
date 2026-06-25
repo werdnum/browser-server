@@ -322,6 +322,17 @@ class SessionRegistry:
             result = await worker.command(req)
             if req.type in PAGE_STATE_COMMANDS and "url" in result:
                 self._update_page_metadata(session, result)
+            ucp = result.get("ucp")
+            if isinstance(ucp, dict) and ucp.get("origin"):
+                self._event(
+                    session,
+                    "ucp_detected",
+                    "service",
+                    metadata={
+                        "origin": ucp.get("origin"),
+                        "capabilities": ucp.get("capabilities", []),
+                    },
+                )
             session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
             session.updated_at = now_utc()
             self._event(session, "agent_command", "agent", metadata={"type": req.type})

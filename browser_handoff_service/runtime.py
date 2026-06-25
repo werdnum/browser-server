@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import shutil
 import socket
@@ -9,8 +11,17 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx
+
 from .models import AgentCommandRequest
 from .security import redact_url
+from .ucp import UCPDetector
+
+# Bound the merchant-controlled UCP probe so a huge or slow-trickle
+# /.well-known/ucp response cannot tie up the snapshot — which the registry
+# awaits while holding the session lock — past a small fixed budget.
+_UCP_PROBE_TIMEOUT_S = 5.0
+_UCP_PROBE_MAX_BYTES = 256 * 1024
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -179,6 +190,13 @@ class FakeBrowserWorker:
         self.url: str | None = None
         self.title = "Blank"
         self.actions: list[dict[str, Any]] = []
+        # Fixture UCP profiles keyed by well-known URL ("{origin}/.well-known/ucp"),
+        # so tests can simulate a merchant advertising shopping support.
+        self.ucp_documents: dict[str, Any] = {}
+        self._ucp = UCPDetector(self._ucp_fetch)
+
+    async def _ucp_fetch(self, url: str) -> Any:
+        return self.ucp_documents.get(url)
 
     async def start(self) -> None:
         return None
@@ -195,13 +213,17 @@ class FakeBrowserWorker:
             self.actions.append({"type": request.type, "args": request.args})
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "snapshot":
-            return {
+            result: dict[str, Any] = {
                 "url": redact_url(self.url)[0] if self.url else "about:blank",
                 "title": self.title,
                 "forms": 0,
                 "elements": 1,
                 "roots": [{"ref": "e1", "role": "document", "name": self.title}],
             }
+            hint = await self._ucp.snapshot_hint(self.url)
+            if hint is not None:
+                result["ucp"] = hint
+            return result
         if request.type == "screenshot":
             # 1x1 transparent PNG so callers exercising the bytes path get valid image data.
             png = base64.b64decode(
@@ -269,6 +291,39 @@ class PlaywrightBrowserWorker:
         self._page = None
         self.remote_url: str | None = None
         self._display: LocalNovncDisplay | None = None
+        self._ucp = UCPDetector(self._ucp_fetch)
+
+    async def _ucp_fetch(self, url: str) -> Any:
+        """Probe a UCP well-known document with a bounded, plain HTTPS GET.
+
+        A read-only GET to the fixed ``/.well-known/ucp`` path using a throwaway
+        ``httpx`` client, independent of the browser context: a merchant-controlled
+        ``Set-Cookie`` on the response can never reach the live session/cart
+        cookies. Redirects are disabled so an HTTPS profile cannot be downgraded to
+        a plaintext ``http://`` response and still be parsed. The response is read
+        under a total deadline and a body-size cap (so a huge or slow-trickle
+        response cannot block the snapshot), parsed as JSON, and never rendered
+        into the page; any failure yields ``None``.
+        """
+
+        async def probe() -> Any:
+            async with (
+                httpx.AsyncClient(timeout=_UCP_PROBE_TIMEOUT_S, follow_redirects=False) as client,
+                client.stream("GET", url) as response,
+            ):
+                if response.status_code // 100 != 2:
+                    return None
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > _UCP_PROBE_MAX_BYTES:
+                        return None
+            return json.loads(body)
+
+        try:
+            return await asyncio.wait_for(probe(), timeout=_UCP_PROBE_TIMEOUT_S)
+        except Exception:
+            return None
 
     async def start(self) -> None:
         try:
@@ -335,7 +390,11 @@ class PlaywrightBrowserWorker:
             return await self._current_page_result({"accepted": True})
         if request.type == "snapshot":
             result = await page.evaluate(_SNAPSHOT_JS)
-            result["url"] = redact_url(result.get("url", ""))[0]
+            raw_url = result.get("url", "") or page.url
+            result["url"] = redact_url(raw_url)[0]
+            hint = await self._ucp.snapshot_hint(raw_url)
+            if hint is not None:
+                result["ucp"] = hint
             return result
         if request.type == "screenshot":
             png = await page.screenshot(type="png", full_page=False)
