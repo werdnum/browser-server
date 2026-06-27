@@ -30,9 +30,17 @@ def playwright_error(monkeypatch):
     class _Error(Exception):
         pass
 
-    async_api = types.ModuleType("rebrowser_playwright.async_api")
-    async_api.Error = _Error
-    pkg = types.ModuleType("rebrowser_playwright")
+    # ModuleType subclasses declaring the attributes the lazy
+    # ``from rebrowser_playwright.async_api import Error`` import reaches for,
+    # so the stub satisfies both the type checker and the import machinery.
+    class _AsyncApiModule(types.ModuleType):
+        Error = _Error
+
+    class _PackageModule(types.ModuleType):
+        async_api: types.ModuleType
+
+    async_api = _AsyncApiModule("rebrowser_playwright.async_api")
+    pkg = _PackageModule("rebrowser_playwright")
     pkg.async_api = async_api
     monkeypatch.setitem(sys.modules, "rebrowser_playwright", pkg)
     monkeypatch.setitem(sys.modules, "rebrowser_playwright.async_api", async_api)
