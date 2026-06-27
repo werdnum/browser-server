@@ -345,10 +345,15 @@ class PlaywrightBrowserWorker:
                 args.append(f"--window-size={self.width},{self.height}")
                 args.append("--window-position=0,0")
             self._playwright = await async_playwright().start()
+            # BROWSER_CHROMIUM_PATH lets an operator pin a system/sidecar Chrome instead
+            # of the revision bundled with rebrowser-playwright (also how tests can drive a
+            # real browser when only a different revision is installed). Unset => bundled.
+            executable_path = os.environ.get("BROWSER_CHROMIUM_PATH") or None
             self._browser = await self._playwright.chromium.launch(
                 headless=not self.headed,
                 args=args,
                 env=env,
+                executable_path=executable_path,
             )
             page_kwargs: dict[str, Any] = {"viewport": {"width": self.width, "height": self.height}}
             if self.user_agent:
