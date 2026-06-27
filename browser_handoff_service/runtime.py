@@ -374,7 +374,7 @@ class PlaywrightBrowserWorker:
         if request.type == "navigate":
             url = str(request.args["url"])
             await page.goto(url, wait_until="domcontentloaded")
-            title = await page.title()
+            title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
         if request.type == "click":
             await page.locator(str(request.args["selector"])).click()
@@ -433,10 +433,10 @@ class PlaywrightBrowserWorker:
                 else:
                     await page.wait_for_load_state(state, timeout=timeout_ms)
             except PlaywrightTimeoutError as exc:
-                return {"error": str(exc), "url": redact_url(page.url)[0], "title": await page.title()}
-            return {"accepted": True, "url": redact_url(page.url)[0], "title": await page.title()}
+                return {"error": str(exc), "url": redact_url(page.url)[0], "title": await self._safe_title(page)}
+            return {"accepted": True, "url": redact_url(page.url)[0], "title": await self._safe_title(page)}
         if request.type == "current_page":
-            return {"url": redact_url(page.url)[0], "title": await page.title()}
+            return {"url": redact_url(page.url)[0], "title": await self._safe_title(page)}
         if request.type == "mouse_click":
             await page.mouse.click(float(request.args["x"]), float(request.args["y"]))
             return await self._current_page_result({"accepted": True})
@@ -480,8 +480,39 @@ class PlaywrightBrowserWorker:
         except PlaywrightTimeoutError:
             pass
         result["url"] = redact_url(self._page.url)[0]
-        result["title"] = await self._page.title()
+        result["title"] = await self._safe_title(self._page)
         return result
+
+    async def _safe_title(self, page: Any) -> str:
+        """Read ``document.title`` without letting a navigation race fail the command.
+
+        ``page.title()`` evaluates inside the page's JS execution context. A
+        client-side redirect (meta refresh, ``location =`` in an inline script)
+        that fires immediately after ``goto`` resolves at ``domcontentloaded``
+        destroys that context, so the call raises "Execution context was
+        destroyed, most likely because of a navigation" — which otherwise
+        bubbles up as an opaque HTTP 500. Wait for the replacement document to
+        settle and retry a bounded number of times, falling back to an empty
+        title rather than failing the whole command.
+        """
+        from rebrowser_playwright.async_api import Error as PlaywrightError
+
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                return await page.title()
+            except PlaywrightError as exc:
+                # Only a navigation-induced context teardown is retryable; any
+                # other Playwright failure is a real error worth surfacing.
+                if "context was destroyed" not in str(exc):
+                    raise
+                if attempt == attempts - 1:
+                    break
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except PlaywrightError:
+                    pass
+        return ""
 
     async def close(self) -> None:
         self.closed = True

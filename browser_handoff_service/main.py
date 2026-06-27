@@ -40,6 +40,8 @@ from .transitions import TransitionError
 SERVICE_TOKEN_ENV = "BROWSER_HANDOFF_SERVICE_TOKEN"
 registry = SessionRegistry()
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class AuthContext:
@@ -649,6 +651,11 @@ def map_errors(exc: Exception) -> HTTPException:
         return HTTPException(status_code=410, detail=str(exc))
     if isinstance(exc, (ConflictError, TransitionError)):
         return HTTPException(status_code=409, detail=str(exc))
+    # Unclassified failures collapse into an opaque 500 whose only detail is
+    # str(exc); without the traceback in the container logs there is nothing to
+    # debug from. Emit the full Python stack trace so the originating
+    # runtime/Playwright failure is visible in Kubernetes logs.
+    logger.exception("unhandled error mapped to HTTP 500: %s", exc, exc_info=exc)
     return HTTPException(status_code=500, detail=str(exc))
 
 
