@@ -247,6 +247,14 @@ class SessionRegistry:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
+            # Idempotent re-claim: a handback the agent already won is returned as-is
+            # rather than raising a 409. Reclaiming is common when claim_handback is
+            # retried (the first call succeeded but its response was lost), and the
+            # caller is already authenticated as the agent service, so handing back the
+            # session it already owns is safe. The one-time handover token was consumed
+            # by the first claim, so this path intentionally does not re-check it.
+            if session.state == SessionState.AGENT_ACTIVE and session.lease_owner == LeaseOwner.AGENT:
+                return session
             if session.state != SessionState.HANDOVER_REQUESTED:
                 raise ConflictError("session is not awaiting an agent handover")
             handover_record = self._authorize_token_locked(session, token, token_type="handover")
