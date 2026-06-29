@@ -220,12 +220,41 @@ async def test_handover_token_is_one_time_and_revokes_human_control_token():
     with pytest.raises(AuthorizationError):
         await registry.authorize_remote(session.session_id, control_token)
 
-    # A wrong token cannot claim, and the real token works exactly once.
+    # A wrong token cannot claim, and the real token works to take the lease.
     with pytest.raises(AuthorizationError):
         await registry.agent_claim(session.session_id, "wrong")
+    claimed = await registry.agent_claim(session.session_id, handover_token)
+    assert claimed.state == SessionState.AGENT_ACTIVE
+    # Re-claiming a session the agent already owns is idempotent rather than a 409:
+    # a retried handback must not wedge the browser for the rest of the conversation.
+    reclaimed = await registry.agent_claim(session.session_id, handover_token)
+    assert reclaimed.state == SessionState.AGENT_ACTIVE
+    assert reclaimed.lease_owner == LeaseOwner.AGENT
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_on_already_claimed_session_is_idempotent():
+    """A second claim_handback on a session the agent already owns is a no-op success.
+
+    The agent keeps driving the same browser instead of getting a 409 that would
+    block the browser for the rest of the conversation. The short-circuit does not
+    re-validate the (already consumed) handover token, so even a stale token works.
+    """
+    registry = SessionRegistry()
+    session, control_token = await registry.create_session(
+        CreateSessionRequest(conversation_id="conv_1", initial_owner="human")
+    )
+    assert control_token is not None
+    _, handover_token = await registry.handover(session.session_id, control_token, "")
     await registry.agent_claim(session.session_id, handover_token)
-    with pytest.raises(ConflictError):
-        await registry.agent_claim(session.session_id, handover_token)
+
+    reclaimed = await registry.agent_claim(session.session_id, "any-stale-token")
+
+    assert reclaimed.state == SessionState.AGENT_ACTIVE
+    assert reclaimed.lease_owner == LeaseOwner.AGENT
+    # The reclaimed session still drives commands normally.
+    response = await registry.agent_command(session.session_id, AgentCommandRequest(type="current_page"))
+    assert response.ok is True
 
 
 @pytest.mark.asyncio
