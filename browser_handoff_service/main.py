@@ -619,7 +619,16 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> Au
             subject = claims.get("sub") if isinstance(claims, dict) and isinstance(claims.get("sub"), str) else None
             return AuthContext(actor_type="human", subject=subject)
         except jwt.PyJWTError as e:
-            logging.debug(f"OIDC token invalid: {e}")
+            # An agent authenticates with the opaque service token, which is not a
+            # JWT and always fails here — that's the expected path, so keep it quiet.
+            # A human comes in through the gateway with a real JWT; if that fails we
+            # fall back to the service-token check and the caller sees the misleading
+            # "invalid service token". Surface the real reason (bad audience/issuer,
+            # unreachable JWKS, expired token) at warning so it isn't swallowed.
+            if token.count(".") == 2:
+                logger.warning("OIDC token validation failed, falling back to service token: %s", e)
+            else:
+                logger.debug("Non-JWT bearer token; trying service-token fallback: %s", e)
             pass  # Try fallback
         except Exception as e:
             logging.error(f"Unexpected error during OIDC validation: {e}")
