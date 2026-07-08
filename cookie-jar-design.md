@@ -51,10 +51,15 @@ treatment, and the same disclosure to the user ("saved logins keep the site's se
 caller that wants to exclude origin storage entirely can pass `storage: "cookies_only"` at save
 (see API), accepting that some sites will then reload logged-out.
 
-Note the distinction this preserves: a jar contains **session artifacts** (cookies and the site's
-own client-side session data), never the **credentials** themselves. Passwords and OTPs are typed by
-the human into the page during handoff and are never captured — that is the existing warm-handoff
-guarantee, unchanged.
+Note the distinction this preserves, with one honest caveat: browser-server never **captures** the
+credentials themselves — passwords and OTPs are typed by the human into the page during handoff and
+are never read from form fields (the existing warm-handoff guarantee, unchanged). What it *can*
+persist under `storage: "all"` is whatever the **site itself** wrote into in-scope localStorage/
+IndexedDB, and a site (or a same-origin injected script running before the save) *could* stash a
+credential there. So the guarantee is precise: browser-server does not capture typed credentials, but
+it does not promise a site-persisted copy in origin storage is excluded. A deployment that needs a
+hard "no credential material at rest" guarantee uses `storage: "cookies_only"` (accepting that some
+sites then reload logged-out); jar contents are encrypted at rest regardless.
 
 ## Terminology
 
@@ -157,6 +162,7 @@ class CookieJarMeta(BaseModel):
     last_loaded_at: datetime | None
     version: int                     # increments on refresh
     saved_by: Literal["agent", "human"]
+    owner_subject: str | None        # OIDC subject that saved it (human path); scopes OIDC management
     form_factor: str                 # producing session's form factor/UA; jar loads default to it (below)
     storage_mode: Literal["all", "cookies_only"]   # preserved across refresh unless explicitly changed
     created_session_id: str          # provenance: session the state came from
@@ -219,9 +225,11 @@ redirect-toward-login as stale by matching the redirect `Location` against `logg
   checkout confirmation). The human-UI default navigates to a known stable account/home page (and
   strips query/fragment) before saving.
 
-**URL redaction.** `probe.url` and `logged_out_url_prefix` have query and fragment **stripped** on
-save (scheme + host + path retained) so neither becomes a back door around the
-never-store-sensitive-full-URLs guarantee (`?token=…`, `#access_token=…`, `return_to`, account ids).
+**URL redaction.** `probe.url` and `logged_out_url_prefix` are **reconstructed from scheme, hostname,
+port, and path only** on save — query, fragment, **and userinfo** are dropped — so none becomes a
+back door around the never-store-sensitive-full-URLs guarantee. That includes rejecting/stripping
+embedded credentials in URL userinfo (`https://user:pass@example.com/account`), which `HttpUrl`-style
+validators otherwise accept, as well as `?token=…`, `#access_token=…`, `return_to`, and account ids.
 
 ### Storage and encryption
 
@@ -302,8 +310,14 @@ the reported `jar_origins` understate the true authenticated scope that policy r
 ## API surface
 
 All endpoints follow existing auth conventions: service token (`require_agent_auth`) for
-agent-facing calls, `require_service_auth` (service token or OIDC human) for management, human
-control token for human-initiated save. Every operation emits an audit event.
+agent-facing calls, and the human control token for human-initiated save. **Jar management
+(`GET /v1/jars`, `GET/DELETE /v1/jars/{id}`, `invalidate`) is subject-scoped, not "any OIDC human".**
+Jars are not conversation-scoped and the store holds durable credentials for the whole household, so
+treating management as plain `require_service_auth` would let any OIDC-authenticated user list or
+revoke *everyone's* saved logins. Instead: the **service token** (the FA path) may manage all jars;
+an **OIDC human** may manage only jars they own (matched by owner subject recorded at save) — the
+`/jars` UI shows only the caller's jars — and cross-subject management requires the service token or
+an FA-issued management authorization. Every operation emits a (durable) audit event.
 
 ### Save
 
@@ -343,21 +357,27 @@ control token for human-initiated save. Every operation emits an audit event.
   entries.
 - `storage: "all"` (default) captures cookies plus in-scope origin storage; `"cookies_only"` skips
   localStorage/IndexedDB for a caller that wants to avoid persisting site-side client storage,
-  accepting that some sites reload logged-out. Recorded as `storage_mode` and preserved across
-  refresh (above).
+  accepting that some sites reload logged-out. Recorded as `storage_mode`. On refresh it may only be
+  **preserved or narrowed** (`all` → `cookies_only`): a refresh that tries to widen a `cookies_only`
+  jar back to `all` under the same `jar_id` is **rejected**, since that would add origin storage the
+  creator opted out of without a new jar or fresh policy approval (same rule as `nav_allowlist`
+  widening).
 - `probe` is **required on every save** (create and refresh) — save is rejected without it. The
   earlier idea of skipping the probe when "a persistent cookie exists" is unsound: Playwright cookie
   state carries no marker for *which* cookie is auth-bearing, so the server cannot prove that the
   earliest-expiring persistent cookie is the login (it is often an unrelated analytics/consent
   cookie). Rather than guess, a live freshness probe is mandatory for all jars; `earliest_cookie_expiry`
   and `session_cookies_only` remain as weak supplementary hints, not a substitute for the probe.
-  **A non-technical human never hand-authors a probe.** For a human save the UI derives a default
-  probe automatically — `probe.url` = the current live page URL (redacted to origin+path), and the
-  success indicator defaults to a generic "did not land on a login page" heuristic (final origin
-  still within jar scope ⇒ fresh; redirected to a sign-in URL ⇒ stale) — so the mandatory-probe rule
-  is satisfied without asking the user anything. An agent save, which has observed the page, can
-  supply a precise selector instead. The mandatory-probe requirement is thus a *server default is
-  always producible*, not a *caller must know CSS selectors*.
+  **A non-technical human never hand-authors a probe**, but the default is not "origin in scope ⇒
+  fresh" — that heuristic is explicitly rejected below (a site can render a logged-out wall at the
+  same origin+path with a 200). For a human save the UI derives a default by **navigating to a stable
+  account/home page and auto-detecting an authenticated-only signal** (e.g. a logout control or
+  account-name element) plus, where the site redirects expired sessions to a login/IdP origin, a
+  `logged_out_url_prefix`. If it can capture a concrete authenticated-only signal, that becomes the
+  probe; if it genuinely cannot, the jar's probe result is `uncertain` (surfaced as needing
+  attention), **never silently `fresh`**. An agent save, which has observed the page, can supply a
+  precise selector directly. The mandatory-probe requirement is thus a *server default is always
+  producible*, not a *caller must know CSS selectors* — and never a false "fresh".
 - **Refresh resets `last_probe_*`.** Replacing a jar's blob (refresh after re-login) clears
   `last_probe_at`/`last_probe_result` and `invalidated_at`, so a jar that was `stale`/invalidated
   does not keep showing expired in listings after a successful refresh; freshness is re-established by
@@ -665,6 +685,10 @@ companion doc).
   (narrowing/preserving allowed); widening requires a new jar.
 - Jar load form factor: a jar saved from a desktop session reloads under the desktop UA by default,
   not the mobile agent default.
+- OIDC management scope: an OIDC human sees/deletes only their own (`owner_subject`) jars; another
+  subject's jars are not listed or deletable without the service token; the service token sees all.
+- Origin-storage credential scope: with `cookies_only`, a site-persisted credential in localStorage
+  is not saved; the no-typed-credential-capture guarantee holds under both modes.
 - Direct-OIDC load gate: an OIDC human `create_session` with `jar_id` is rejected; the service-auth
   (FA) path succeeds.
 - Revocation closes the source session: after a save-then-handover flow, `DELETE`/`invalidate` closes
@@ -695,7 +719,10 @@ companion doc).
 - IndexedDB capture: a fixture login that stores its token in IndexedDB survives export→load (the
   export passes `indexed_db=True`); a `cookies_only` jar drops it.
 - Refresh preservation: a bare-`jar_id` refresh of a `cookies_only` jar does not re-add origin
-  storage, and preserves `nav_allowlist`; explicit override still works.
+  storage, and preserves `nav_allowlist`; a refresh that tries to widen storage mode
+  (`cookies_only` → `all`) is rejected, while narrowing (`all` → `cookies_only`) is accepted.
+- Probe URL userinfo: a probe URL with embedded `user:pass@` credentials is persisted with userinfo
+  stripped (scheme+host+port+path only).
 - Probe redirect confinement: a probe whose endpoint 302s to an off-scope origin is aborted before
   any request carries a jar cookie off-scope; an in-scope probe resolves normally.
 - Mandatory probe: every save (create and refresh) is rejected without a `probe` config.
