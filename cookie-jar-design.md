@@ -308,6 +308,17 @@ validators otherwise accept, as well as `?token=…`, `#access_token=…`, `retu
   re-login still re-enables the jar (the earlier "tombstone by `jar_id` alone" would have blocked
   refresh forever). Clearing the cleartext `invalidated_at` or restoring an old jar file cannot
   resurrect a revoked login.
+- **The tombstone head is anchored outside `BROWSER_JAR_DIR`.** An HMAC-chained log still living in the
+  same directory does not survive the *whole-filesystem restore* threat this section addresses: an
+  operator/attacker who rolls back **both** the jar file and the tombstone log to their
+  pre-invalidation versions leaves a self-consistent chain with no higher generation to reject. So the
+  tombstone's **head/high-water generation must be anchored in storage that cannot be rolled back with
+  `BROWSER_JAR_DIR`** — an external monotonic counter (KMS/TPM/DB sequence), WORM/object-versioned
+  storage, or the same secret store that holds `BROWSER_JAR_KEY`. `load`/`probe` check the file's
+  generation against that external head, so a whole-directory rollback is still rejected. Honest
+  residual: a deployment that declines the external anchor gets rollback-proofing only against
+  single-file tampering, not full-filesystem restore; the external anchor is the documented way to get
+  the stronger guarantee, and the limitation is called out rather than overclaimed.
 - Each blob records the `key_id` (a short fingerprint of the key that encrypted it) so the service can
   distinguish "operator rotated the key" from "blob corrupted", and so rotation can be handled
   deliberately.
@@ -380,9 +391,20 @@ agent-facing calls, and the human control token for human-initiated save. **Jar 
 Jars are not conversation-scoped and the store holds durable credentials for the whole household, so
 treating management as plain `require_service_auth` would let any OIDC-authenticated user list or
 revoke *everyone's* saved logins. Instead: the **service token** (the FA path) may manage all jars;
-an **OIDC human** may manage only jars they own (matched by owner subject recorded at save) — the
-`/jars` UI shows only the caller's jars — and cross-subject management requires the service token or
-an FA-issued management authorization. Every operation emits a (durable) audit event.
+an **OIDC human** may manage only jars they own — the `/jars` UI shows only the caller's jars — and
+cross-subject management requires the service token or an FA-issued management authorization. Two
+guards make the owner match trustworthy:
+  - **Ownership is checked against *authenticated* metadata, not cleartext.** `owner_subject` is bound
+    as AEAD AAD, but that only helps if it is actually verified — so a management op
+    (`GET`/`DELETE`/`invalidate`/`probe`) verifies the jar's AEAD envelope (or consults a separately
+    authenticated ownership index) before trusting `owner_subject`. Reading the cleartext `meta` alone
+    would let someone who can edit a jar file without the key rewrite `owner_subject` and list/revoke
+    another subject's jar; verifying the binding makes that tamper fail closed.
+  - **A non-null authenticated subject is required** — exactly like the refresh rule. A subjectless
+    OIDC token (`subject = None`) does **not** match an ownerless jar (`owner_subject = None`); `None
+    == None` is not ownership, so ownerless service-/handoff-created jars stay service/FA-only and a
+    subjectless caller cannot list/delete/probe them.
+  Every operation emits a (durable) audit event.
 
 ### Save
 
@@ -797,7 +819,12 @@ companion doc).
 - Jar load form factor: a jar saved from a desktop session reloads under the desktop UA by default,
   not the mobile agent default.
 - OIDC management scope: an OIDC human sees/deletes/probes only their own (`owner_subject`) jars;
-  another subject's jars are not listed/deletable/refreshable without the service token; service sees all.
+  another subject's jars are not listed/deletable/refreshable without the service token; service sees
+  all. Management verifies the AEAD envelope, so editing cleartext `owner_subject` in a jar file does
+  not transfer management rights (fails closed). A subjectless OIDC token does not match an ownerless
+  jar (no `None == None`); ownerless jars are service/FA-only for management too.
+- Whole-filesystem rollback: restoring both the jar file and the tombstone log to pre-invalidation
+  state still fails closed, because the tombstone head is anchored in external monotonic storage.
 - Metadata tamper fails closed: editing `origins`/`owner_subject`/`nav_allowlist` in the jar file
   without the key makes load fail (AAD/authenticated-metadata check), never silently widening scope.
 - Fresh nonce: two saves of the same jar use different nonces (no GCM nonce reuse).
