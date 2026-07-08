@@ -35,9 +35,14 @@ profiles". Cookie jars are a **deliberate, explicit exception** to that rule, an
   by an explicit save action tied to a session and an actor.
 - Jars store only Playwright `storage_state` (cookies + origin storage — localStorage/IndexedDB),
   filtered to a declared scope, encrypted at rest.
-- Everything else on the never-store list stays never-stored: screenshots, DOM snapshots,
-  accessibility trees from human control, transient form-field values captured during handoff,
-  clipboard, payment data, typed credentials, OTPs, full URLs with sensitive query strings.
+- Everything else on the never-store list stays never-stored *as captured input*: screenshots, DOM
+  snapshots, accessibility trees from human control, transient form-field values captured during
+  handoff, clipboard, payment fields, typed credentials, OTPs, full URLs with sensitive query strings.
+  The same caveat as credentials applies to **payment data and form drafts**: browser-server never
+  *captures* them from form fields, but if a site writes card/checkout metadata into in-scope
+  localStorage/IndexedDB, `storage: "all"` would persist that *site-written* copy — so the "never
+  stored" guarantee is about captured input, and a deployment/flow that needs card data excluded uses
+  `storage: "cookies_only"` (or excludes the checkout origin from scope).
 
 **Origin storage is persisted jar content, and is treated as such.** localStorage and IndexedDB can
 hold more than session tokens — a site may keep profile details, cart/checkout metadata, or form
@@ -308,6 +313,12 @@ validators otherwise accept, as well as `?token=…`, `#access_token=…`, `retu
   re-login still re-enables the jar (the earlier "tombstone by `jar_id` alone" would have blocked
   refresh forever). Clearing the cleartext `invalidated_at` or restoring an old jar file cannot
   resurrect a revoked login.
+- **`delete` tombstones are terminal; only `invalidate` is refreshable.** The tombstone records a
+  **reason** (`invalidated` vs `deleted`). A higher-`generation` refresh re-enables only an
+  `invalidated` (re-login) jar; a `deleted` jar_id is **terminal** — "forget this login" destroys the
+  blob and no `save-jar {jar_id}` (even from a stale FA task or a service caller that still holds the
+  id) may recreate it. Persisting new state for a deleted login requires a **new `jar_id`**, so a
+  user's delete cannot be silently undone by recreating the same id.
 - **The tombstone head is anchored outside `BROWSER_JAR_DIR`.** An HMAC-chained log still living in the
   same directory does not survive the *whole-filesystem restore* threat this section addresses: an
   operator/attacker who rolls back **both** the jar file and the tombstone log to their
@@ -490,7 +501,11 @@ guards make the owner match trustworthy:
     "Save this login for the assistant"; the agent later picks the jar up in a fresh session with no
     handover involved. Also surfaced as a checkbox on the handover form (save-then-handover).
     `saved_by: "human"` is recorded, giving Family Assistant a provenance signal ("human explicitly
-    consented at save time") policy can distinguish.
+    consented at save time") policy can distinguish. **A human save requires a non-null
+    `owner_subject`**: if the session (from create or handoff-claim) carries no authenticated OIDC
+    subject, the save is rejected (or must be made service/FA-owned explicitly) — otherwise it would
+    create an ownerless jar the same human could no longer see or revoke through the subject-scoped
+    `/jars` UI. No subjectless human saves.
   - **Agent save** (no `token`, service auth): allowed only in `AGENT_COMMAND_STATES` with
     `lease_owner == agent`. This falls out of the existing agent-command authorization (the agent
     can save only what it is already driving) rather than being a special restriction — it is not a
@@ -588,9 +603,12 @@ guards make the owner match trustworthy:
   human `create_session`.** Family Assistant is the load-authorization chokepoint (the
   `load_saved_session` confirmation + profile policy). On deployments that expose browser-server's
   OIDC-authenticated API/UI directly, an OIDC human must not be able to seed a human-owned context
-  with any saved jar and bypass that gate — so a direct OIDC create with `jar_id` is rejected. Jar
-  loads happen through the service token (the FA path) or a FA-issued load authorization; the OIDC
-  human path stays limited to jarless human-owned sessions (and the `/jars` UI, which only lists and
+  with any saved jar and bypass that gate — so a direct OIDC create with `jar_id` is rejected. **Jar
+  loads are service-token-only** (the FA path): this is the single supported load path, so there is no
+  ambiguity about representing both an OIDC identity and a grant in one request. (If a future
+  direct-OIDC-with-grant path is wanted, it takes a **distinct `load_authorization` field**, not the
+  already-consumed `Authorization` header — but V1 keeps loads service-token-only.) The OIDC human
+  path stays limited to jarless human-owned sessions (and the `/jars` UI, which only lists and
   deletes).
 - The worker seeds its context from the decrypted jar at creation
   (`browser.new_context(storage_state=...)`). Load-at-creation-only is a deliberate invariant:
@@ -650,13 +668,16 @@ guards make the owner match trustworthy:
   human-first / handover paths above, not a resumable `credentials` handoff. Loading the stale jar
   *before* re-login would also confine the human and block the SSO bounce, so the flow avoids that
   too. **A jar-loaded session that passes to human control is not resumed by the agent as the same
-  context.** If a jar-loaded session enters a resumable human handoff, the human can visit off-scope
-  login/payment/SSO origins and accumulate cookies/storage the jar scope never contained — so its
-  live context now holds *broader* credentials than its `jar_origins` metadata reports. The agent
-  therefore never resumes that exact context: either confinement stays enforced for the whole
-  jar-loaded lifetime (no off-scope human excursion), or the agent resumes only via a **fresh,
-  re-filtered** jar-loaded session (reload from the jar's stored scope), never inheriting the
-  human-widened context. Metadata never under-reports the scope the agent actually operates.
+  context** — enforced as a concrete state-machine rule, not just a principle. If a jar-loaded session
+  enters a human handoff, the human can visit off-scope login/payment/SSO origins and accumulate
+  cookies/storage the jar scope never contained, so its live context would hold *broader* credentials
+  than its `jar_origins` metadata reports. Therefore a **jar-loaded session forces
+  `allowed_resume = never` on any `handoff`** (the `after_sanitize` resumable path is rejected for
+  jar-loaded sessions): `human_complete` transitions it to `COMPLETED` and tears the worker down —
+  there is no "return the same worker as `AGENT_RESUMABLE`" for a jar-loaded context. The agent
+  resumes authenticated browsing only by starting a **fresh, re-filtered** jar-loaded session (reload
+  from the jar's stored scope), never inheriting the human-widened context. Metadata thus never
+  under-reports the scope the agent actually operates.
 
 ### Expiry detection
 
@@ -734,7 +755,11 @@ a "please re-login" task) — browser-server never probes on its own initiative.
   `evil.example.com` must not get the chance to carry a `Domain=.example.com` cookie off-scope — the
   same pre-request guard the freshness probe uses), and it applies to **popups / `window.open` /
   `target=_blank` new pages** (a new top-level document off-scope is blocked or closed, not a hole
-  around main-frame confinement). `JarStore` normalizes labels, redacts probe/logged-out URL
+  around main-frame confinement). **Service workers are disabled in jar-loaded and probe contexts
+  (`service_workers="block"`)**: Playwright's `context.route()` does *not* intercept requests a Service
+  Worker handles, so a jar origin with a registered SW could otherwise route document/form requests
+  around the guard — blocking SWs keeps every request visible to the interceptor. `JarStore`
+  normalizes labels, redacts probe/logged-out URL
   query/fragment on save, records `storage_mode`, and preserves `storage_mode`/`nav_allowlist` across
   refresh unless overridden; refresh also resets `last_probe_*`/`invalidated_at`.
 - New module `jars.py`: `JarStore` (encrypt/decrypt, scope filter, atomic persistence, probe
@@ -825,6 +850,14 @@ companion doc).
   jar (no `None == None`); ownerless jars are service/FA-only for management too.
 - Whole-filesystem rollback: restoring both the jar file and the tombstone log to pre-invalidation
   state still fails closed, because the tombstone head is anchored in external monotonic storage.
+- Delete is terminal: after `DELETE`, a `save-jar {jar_id}` with the same id is rejected (must create
+  a new jar); after `invalidate`, a refresh with a higher generation re-enables the jar.
+- Jar-loaded resumable handoff: a `handoff` on a jar-loaded session cannot request `after_sanitize`
+  resume; `human_complete` completes and tears down the worker (no `AGENT_RESUMABLE` reuse).
+- Service workers: a jar origin with a registered service worker cannot route a document/form request
+  around the confinement guard (context uses `service_workers="block"`).
+- Subjectless human save: a human save from a session with no authenticated subject is rejected
+  (no ownerless human jars).
 - Metadata tamper fails closed: editing `origins`/`owner_subject`/`nav_allowlist` in the jar file
   without the key makes load fail (AAD/authenticated-metadata check), never silently widening scope.
 - Fresh nonce: two saves of the same jar use different nonces (no GCM nonce reuse).
