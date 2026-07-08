@@ -172,6 +172,7 @@ class CookieJarMeta(BaseModel):
     updated_at: datetime             # bumped on refresh
     last_loaded_at: datetime | None
     version: int                     # increments on refresh
+    generation: int                  # monotonic; bound in AAD; tombstone rejects loads <= revoked generation
     saved_by: Literal["agent", "human"]
     owner_subject: str | None        # OIDC subject that saved it (human path); scopes OIDC management
     form_factor: str                 # producing session's form factor/UA; jar loads default to it (below)
@@ -181,7 +182,8 @@ class CookieJarMeta(BaseModel):
     cookie_count: int
     origin_storage_count: int        # number of origins with localStorage/IndexedDB entries
     earliest_cookie_expiry: datetime | None   # min over persistent cookies; None if none are persistent
-    session_cookies_only: bool       # True when the jar holds no persistent cookies (see expiry)
+    session_cookies_only: bool       # True when the jar holds NO persistent cookies
+    contains_session_cookies: bool   # True if ANY cookie is session-lifetime (drives bounded retention)
     has_probe: bool                  # a freshness probe is mandatory; internals are NOT listed (below)
     last_probe_at: datetime | None
     last_probe_result: Literal["fresh", "stale", "uncertain", "error"] | None
@@ -285,22 +287,26 @@ validators otherwise accept, as well as `?token=…`, `#access_token=…`, `retu
   nonce** stored beside the ciphertext+tag (`nonce` field); it is never derived or reused across a
   jar's saves.
 - **Cleartext metadata is authenticated, not just present.** The security-critical `meta` fields —
-  `origins`, `nav_allowlist`, `owner_subject`, `storage_mode`, `key_id`, `jar_id`, **and
+  `origins`, `nav_allowlist`, `owner_subject`, `storage_mode`, `key_id`, `jar_id`, `generation`, **and
   `invalidated_at`** — drive confinement, subject-scoped ownership, and the kill-switch, so they must
   not be tamperable while the ciphertext still decrypts. They are bound to the blob as **AES-GCM
   additional authenticated data (AAD)** (equivalently, a copy is sealed *inside* the ciphertext and
   cross-checked on load, with any mismatch failing closed). Editing `origins`/`owner_subject` in the
   file without the key makes decryption/verification fail, so tampering cannot silently widen
   navigation or transfer ownership.
-- **Revocation is rollback-proof via a mandatory append-only tombstone.** Re-sealing the jar on
-  `invalidate` (re-encrypt, fresh nonce, `invalidated_at` bound as AAD) is *not sufficient on its own*:
-  AES-GCM authenticates a given blob but cannot prove it is the *latest* one, so an attacker/operator
-  with filesystem restore access could roll the file back to an older, still-valid pre-invalidation
-  version. Therefore revocation (both `invalidate` and `delete`) **must** also append the `jar_id` to a
-  separate **append-only, authenticated (HMAC-chained/monotonic) tombstone record**, and `load`/`probe`
-  consult it and **fail closed for any tombstoned `jar_id` even if the jar file itself looks valid or
-  was restored**. Only a subsequent refresh (which writes a new post-tombstone state) makes the jar
-  loadable again. Clearing the cleartext `invalidated_at` or restoring an old jar file cannot
+- **Revocation is rollback-proof via a mandatory, generation-versioned append-only tombstone.**
+  Re-sealing the jar on `invalidate` (re-encrypt, fresh nonce, `invalidated_at` bound as AAD) is *not
+  sufficient on its own*: AES-GCM authenticates a given blob but cannot prove it is the *latest* one,
+  so an attacker/operator with filesystem restore access could roll the file back to an older,
+  still-valid pre-invalidation version. Therefore every jar write carries a **monotonic `generation`
+  counter** (bound in the authenticated envelope), and revocation (`invalidate` and `delete`) appends
+  `(jar_id, revoked_generation)` to a separate **append-only, authenticated (HMAC-chained) tombstone
+  record**. `load`/`probe` consult it and **fail closed whenever the jar file's `generation` is ≤ the
+  tombstoned generation** — so a restored old file (same or lower generation) is rejected, closing the
+  rollback. A legitimate **refresh writes a strictly higher `generation`**, which is *above* the
+  tombstone and therefore loadable again — so the kill-switch is permanent against rollback yet a real
+  re-login still re-enables the jar (the earlier "tombstone by `jar_id` alone" would have blocked
+  refresh forever). Clearing the cleartext `invalidated_at` or restoring an old jar file cannot
   resurrect a revoked login.
 - Each blob records the `key_id` (a short fingerprint of the key that encrypted it) so the service can
   distinguish "operator rotated the key" from "blob corrupted", and so rotation can be handled
@@ -677,9 +683,14 @@ a "please re-login" task) — browser-server never probes on its own initiative.
     promises to capture (and metadata would claim IndexedDB-backed auth was preserved while the
     reloaded jar shows logged-out). For `storage: "cookies_only"` the export still passes the flag
     and `JarStore` drops origin storage during filtering, keeping the capture/filter split clean.
-- New worker methods: `export_storage_state() -> dict` (calling `storage_state(indexed_db=True)`) and
-  a `storage_state` constructor argument. Scope filtering lives in `JarStore`, not the worker, so it
-  is unit-testable without a browser and identical across runtimes.
+- New worker methods: **`export_storage_state(max_bytes: int) -> dict`** — a *bounded* export that
+  enforces the size cap **at the source**, before the whole state is materialized in the service.
+  Rather than a bare `storage_state(indexed_db=True)` that serializes an attacker-inflated IndexedDB
+  into memory and only then lets `JarStore` reject it (already OOM by that point), the worker applies a
+  per-context storage quota / measures incrementally and raises `StorageTooLarge` past `max_bytes`, so
+  the oversized blob is never fully held. Plus a `storage_state` constructor argument for load. Scope
+  filtering still lives in `JarStore` (unit-testable without a browser), but the *size bound* is a
+  worker-API responsibility because only the worker can stop materialization early.
 - `FakeBrowserWorker` gets a settable in-memory storage_state fixture so the full save/load/probe
   flow is testable in the fake runtime.
 - `models.py`: `CreateSessionRequest` gains `jar_id`/`allow_exec`/`confine_navigation`;
@@ -793,7 +804,12 @@ companion doc).
 - Invalidation tamper: clearing `invalidated_at` in the file without the key does not make the jar
   loadable (re-seal/authenticated-revocation check fails closed).
 - Revocation rollback: restoring an older pre-invalidation jar file does not un-revoke it (load/probe
-  consult the append-only tombstone and fail closed).
+  reject `generation` ≤ tombstoned); a legitimate refresh writes a higher `generation` and *does*
+  re-enable the jar (invalidate→refresh→load succeeds, invalidate→restore-old-file→load fails).
+- Bounded export: filling IndexedDB past `max_bytes` makes `export_storage_state` raise
+  `StorageTooLarge` without materializing the full oversized state; the save is rejected.
+- Session-cookie retention: a jar with a session auth cookie plus an unrelated persistent cookie is
+  flagged `contains_session_cookies` and gets the bounded TTL (not treated as durably-expiring).
 - jar_id path traversal: a `jar_id` like `../../etc/x` on refresh/get/delete/probe/create is rejected
   (validated against `jar_[0-9a-f]{32}`) and touches no file outside `BROWSER_JAR_DIR`.
 - Ownerless-jar refresh: a jar with `owner_subject = None` is not refreshable by a non-service caller
@@ -864,9 +880,13 @@ companion doc).
 1. **Retention**: persistent-cookie jars live until deleted or invalidated. Is a `BROWSER_JAR_TTL_DAYS`
    reaper worth it, or is the staleness surfaced in listings (+ human UI delete) enough for a
    household deployment? Leaning: no global TTL for jars with persistent-cookie expiry (probing
-   surfaces dead ones), **but** session-cookie-only jars — which carry no intrinsic expiry — are the
-   case that most wants a bounded TTL on top of their mandatory probe; a shorter default max age for
-   just those is likely worth it. Decide alongside the probe-heuristics work.
+   surfaces dead ones), **but** the bounded/short TTL applies whenever a jar `contains_session_cookies`
+   (any session-lifetime cookie), not only when *all* cookies are session-only. Because the server
+   cannot tell which cookie is auth-bearing, a jar with a session auth cookie plus some unrelated
+   persistent analytics/consent cookie must not be treated as durably-expiring just because
+   `session_cookies_only` is false — that would turn a browser-close login into an indefinitely
+   replayable jar. So the shorter max age keys on `contains_session_cookies`. Decide alongside the
+   probe-heuristics work.
 2. **Probe success heuristics**: is selector-or-URL-prefix enough, or do real household sites need a
    "either of N indicators" list? Decide after milestone 4 contact with reality.
 3. **`saved_by` policy leverage**: should Family Assistant require `saved_by == "human"` for some
