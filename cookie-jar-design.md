@@ -146,23 +146,24 @@ class CookieJarMeta(BaseModel):
     last_loaded_at: datetime | None
     version: int                     # increments on refresh
     saved_by: Literal["agent", "human"]
+    storage_mode: Literal["all", "cookies_only"]   # preserved across refresh unless explicitly changed
     created_session_id: str          # provenance: session the state came from
     conversation_id: str             # provenance only; jars are not conversation-scoped
     cookie_count: int
     origin_storage_count: int        # number of origins with localStorage/IndexedDB entries
     earliest_cookie_expiry: datetime | None   # min over persistent cookies; None if none are persistent
     session_cookies_only: bool       # True when the jar holds no persistent cookies (see expiry)
-    probe: JarProbeConfig | None
+    probe: JarProbeConfig             # always present: a freshness probe is mandatory (see expiry)
     last_probe_at: datetime | None
     last_probe_result: Literal["fresh", "stale", "error"] | None
     invalidated_at: datetime | None  # set by explicit invalidation; cleared on refresh
 
 
 class JarProbeConfig(BaseModel):
-    url: HttpUrl                     # scheme+host+path only; must be within jar scope
+    url: HttpUrl                     # scheme+host+path only (query/fragment stripped); must be in scope
     # Exactly one success indicator:
     logged_in_selector: str | None = None      # selector present => fresh
-    logged_out_url_prefix: str | None = None   # final URL under this prefix => stale
+    logged_out_url_prefix: str | None = None   # scheme+host+path only; final URL under it => stale
 ```
 
 Metadata is cleartext (needed for listing); it contains **no cookie names and no values** — only
@@ -172,8 +173,10 @@ counts and expiry aggregates. Names live inside the encrypted blob with the valu
 so it must not become a back door around the never-store-sensitive-full-URLs guarantee: a caller's
 "logged-in page" URL could carry PII or bearer-style query/fragment parameters (`?token=…`,
 `#access_token=…`). On save, the query and fragment are **stripped** (scheme + host + path retained,
-and the host must be within jar scope); a probe navigates to that origin+path only. This keeps the
-freshness check useful without persisting or exposing sensitive URL parameters.
+and the host must be within jar scope); a probe navigates to that origin+path only. The same
+strip-and-scope validation applies to `logged_out_url_prefix` (an SSO/login-redirect prefix can just
+as easily embed `return_to`, account ids, or state/token parameters). This keeps the freshness check
+useful without persisting or exposing sensitive URL parameters.
 
 ### Storage and encryption
 
@@ -243,6 +246,7 @@ control token for human-initiated save. Every operation emits an audit event.
   "label": "Woolworths (Andrew)",
   "jar_id": null,
   "origins": null,
+  "nav_allowlist": null,
   "storage": "all",
   "probe": {"url": "https://www.example.com/account", "logged_in_selector": "[data-testid=logout]"},
   "token": null
@@ -251,18 +255,31 @@ control token for human-initiated save. Every operation emits an audit event.
 
 - `jar_id: null` creates a new jar; a jar_id refreshes an existing jar in place (version bump,
   `invalidated_at` cleared). Refresh re-filters against the **stored** jar scope — a refresh cannot
-  silently widen scope; widening requires creating a new jar.
-- `origins: null` defaults to the session's current origin (see scope semantics).
+  silently widen scope; widening requires creating a new jar. Refresh likewise **preserves the
+  stored `storage_mode` and `nav_allowlist`** unless the caller explicitly passes a new value: a
+  bare-`jar_id` refresh must not silently flip a `cookies_only` jar back to `all` (adding origin
+  storage the creator opted out of), so omitted fields inherit the stored jar's settings.
+- `origins: null` defaults to the session's current origin (see scope semantics). For a **human
+  save**, "current origin" is read from the **live page under the human control token** at save time
+  (the registry only updates `current_origin` from *agent* command results, which never run while
+  the human is browsing, so it would otherwise be stale/`None`) — resolved server-side and never
+  returned to the agent. If it still cannot be resolved, the save is rejected asking the UI for an
+  explicit origin rather than saving an empty/stale scope.
+- `nav_allowlist: null` → `[]`. Extra **exact** origins a confined jar-loaded session may navigate
+  to without capturing their storage (e.g. a second first-party origin the app legitimately spans).
+  Validated and audited like `origins`; this is the only way to widen navigation reachability, and
+  it is set at save (refresh preserves it unless overridden) — `load` never invents allowlist
+  entries.
 - `storage: "all"` (default) captures cookies plus in-scope origin storage; `"cookies_only"` skips
   localStorage/IndexedDB for a caller that wants to avoid persisting site-side client storage,
-  accepting that some sites reload logged-out.
-- `probe` is **required whenever the jar has no reliable static freshness signal** — save is
-  rejected without it. That covers both `session_cookies_only` jars *and* any jar that persists
-  in-scope origin storage (localStorage/IndexedDB), because a login token kept in origin storage has
-  no cookie-style expiry and `earliest_cookie_expiry` may then point at an unrelated persistent
-  cookie (analytics/consent) that says nothing about auth freshness. Concretely: `probe` is required
-  unless the jar has at least one persistent auth-bearing cookie and no persisted origin storage.
-  When in doubt the server errs toward requiring the probe. Otherwise `probe` is optional.
+  accepting that some sites reload logged-out. Recorded as `storage_mode` and preserved across
+  refresh (above).
+- `probe` is **required on every save** (create and refresh) — save is rejected without it. The
+  earlier idea of skipping the probe when "a persistent cookie exists" is unsound: Playwright cookie
+  state carries no marker for *which* cookie is auth-bearing, so the server cannot prove that the
+  earliest-expiring persistent cookie is the login (it is often an unrelated analytics/consent
+  cookie). Rather than guess, a live freshness probe is mandatory for all jars; `earliest_cookie_expiry`
+  and `session_cookies_only` remain as weak supplementary hints, not a substitute for the probe.
 - Authorization mirrors agent commands, fail closed. Two paths, human-save being the canonical one:
   - **Human save** (`token` = control token): allowed in `human_active`. This is the primary flow —
     the human starts a session, logs into a site, and clicks "Save this login for the assistant";
@@ -326,32 +343,35 @@ control token for human-initiated save. Every operation emits an audit event.
   keeps the decision with Family Assistant policy. (`extract`/`snapshot` return page content, which
   is the point of authenticated browsing; they stay allowed. The assessment's parallel
   snapshot-redaction milestone is complementary and out of scope here.)
-- Handoff/handover interplay is unchanged. In particular the **re-login flow** composes from
-  existing pieces: create session with stale jar → `handoff` with reason `credentials` → human logs
-  in → human completes (sensitive handoffs never resume) or hands the session back via the
-  human-first flow → agent refreshes the jar with `save-jar {jar_id}`.
+- Handoff/handover interplay is unchanged, but **confinement never traps a human re-login.**
+  `confine_navigation` restricts *agent-driven* navigation in a jar-loaded session; it does not apply
+  while a human holds the control token. The re-login flow is therefore designed to run in a **fresh
+  session with no jar loaded** (create human session → `handoff`/human-first login with reason
+  `credentials`, where an off-origin IdP/SSO bounce is unconfined → human completes → agent refreshes
+  the existing jar with `save-jar {jar_id}`). Loading the stale jar *before* re-login would confine
+  the human to the exact jar origins and block the SSO bounce, making SSO-backed jars unrecoverable —
+  so the flow deliberately avoids it. (If a future path must re-login inside an existing jar-loaded
+  session, confinement is suspended for the duration of human control and any newly-visited origin is
+  re-approved before it can be added.)
 
 ### Expiry detection
 
 Three layers, cheapest first — browser-server provides signals, Family Assistant decides when to act:
 
-1. **Static metadata**: `earliest_cookie_expiry` computed at save; listings can flag jars whose
-   persistent cookies have lapsed. (Necessary but weak — servers revoke sessions server-side too,
-   and the earliest-expiring cookie is often an unrelated analytics/consent cookie, not the auth
-   token.) The static signal is only trusted for jars whose auth plausibly lives in a persistent
-   cookie. Two cases where it is *not* trustworthy and a probe is therefore **mandatory at save**
-   (rejected otherwise) so there is always a dynamic freshness check:
-   - **Session-cookie-only jars** (`session_cookies_only: true`): the login relied entirely on
-     browser-session-lifetime cookies with no persistent expiry, so saving and reloading silently
-     promotes session-lifetime credentials into durable ones with no static stale signal.
-   - **Jars persisting in-scope origin storage**: localStorage/IndexedDB auth tokens have no
-     cookie-style expiry, and the presence of some persistent non-auth cookie must not be mistaken
-     for a freshness signal.
-   Both are surfaced in listings as **needing a probe** and are the first candidates for the optional
-   TTL reaper in open question 1.
-2. **Active probe**: `POST /v1/jars/{jar_id}/probe` (service auth). Loads the jar into a throwaway
-   headless context (no session, no worker, no noVNC), navigates to `probe.url`, applies the success
-   indicator, tears the context down. Returns `{"result": "fresh" | "stale" | "error",
+1. **Static metadata** (weak hint only): `earliest_cookie_expiry` and `session_cookies_only` computed
+   at save; listings can flag jars whose persistent cookies have lapsed. This is *only* a hint —
+   servers revoke sessions server-side, the earliest-expiring cookie is often an unrelated
+   analytics/consent cookie rather than the auth token, and Playwright cookie state has no marker for
+   which cookie is auth-bearing, so the server cannot prove a persistent cookie represents the login.
+   Because the static signal can never be trusted to establish freshness, it does **not** gate
+   anything on its own — a live probe is mandatory for every jar (below).
+2. **Active probe (mandatory)**: `POST /v1/jars/{jar_id}/probe` (service auth). Every jar carries a
+   `probe` config (required at save), so freshness is always checkable. Loads the jar into a
+   throwaway headless context (no session, no worker, no noVNC), navigates to `probe.url` **under the
+   same exact-origin navigation guard as a jar-loaded session** — an off-scope redirect (a stale or
+   compromised probe endpoint 302-ing to `evil.example.com` to harvest a `Domain=.example.com`
+   cookie) is aborted before any request carries jar credentials off-scope — applies the success
+   indicator, and tears the context down. Returns `{"result": "fresh" | "stale" | "error",
    "final_origin": "..."}` — never page content. Updates `last_probe_*`. Rate-limited per jar
    (minimum interval, e.g. 15 minutes) so a confused caller cannot hammer a site. Probing is only
    possible when the jar has probe config, which is captured at save (optionally supplied by the
@@ -367,17 +387,24 @@ a "please re-login" task) — browser-server never probes on its own initiative.
 - `PlaywrightBrowserWorker` moves from implicit context (`browser.new_page(**kwargs)`) to explicit
   `browser.new_context(**kwargs)` + `context.new_page()` so that:
   - `storage_state` can be passed at context creation (load), and
-  - `context.storage_state()` can be exported (save), then scope-filtered service-side.
-- New worker methods: `export_storage_state() -> dict` and a `storage_state` constructor argument.
-  Scope filtering lives in `JarStore`, not the worker, so it is unit-testable without a browser and
-  identical across runtimes.
+  - `context.storage_state(indexed_db=True)` can be exported (save), then scope-filtered
+    service-side. The **`indexed_db=True` argument is required** — a bare `context.storage_state()`
+    returns only cookies + localStorage, so omitting it would silently drop the IndexedDB the design
+    promises to capture (and metadata would claim IndexedDB-backed auth was preserved while the
+    reloaded jar shows logged-out). For `storage: "cookies_only"` the export still passes the flag
+    and `JarStore` drops origin storage during filtering, keeping the capture/filter split clean.
+- New worker methods: `export_storage_state() -> dict` (calling `storage_state(indexed_db=True)`) and
+  a `storage_state` constructor argument. Scope filtering lives in `JarStore`, not the worker, so it
+  is unit-testable without a browser and identical across runtimes.
 - `FakeBrowserWorker` gets a settable in-memory storage_state fixture so the full save/load/probe
   flow is testable in the fake runtime.
 - `models.py`: `CreateSessionRequest` gains `jar_id`/`allow_exec`/`confine_navigation`;
   `BrowserSession` gains `jar_id`/`jar_origins`/`jar_registrable_domains`; new jar request/response
-  models. The worker enforces confinement to the jar's exact origins (+ `nav_allowlist`) via a
-  Playwright route/`framenavigated` guard on the main frame. `JarStore` normalizes labels and
-  redacts probe-URL query/fragment on save.
+  models (the save request carries `nav_allowlist`/`storage`/`probe`). The worker enforces
+  confinement to the jar's exact origins (+ `nav_allowlist`) via a Playwright route/`framenavigated`
+  guard on the main frame — the same guard the mandatory freshness probe reuses. `JarStore`
+  normalizes labels, redacts probe/logged-out URL query/fragment on save, records `storage_mode`,
+  and preserves `storage_mode`/`nav_allowlist` across refresh unless overridden.
 - New module `jars.py`: `JarStore` (encrypt/decrypt, scope filter, atomic persistence, probe
   rate-limit state) injected into the app like the registry.
 
@@ -449,6 +476,15 @@ companion doc).
   informational registrable-domain field; refresh cannot widen scope.
 - Label normalization: a save label containing newlines/control characters/markup is stored
   trimmed, length-capped, and plain-text; `list` never emits the raw injected label.
+- IndexedDB capture: a fixture login that stores its token in IndexedDB survives export→load (the
+  export passes `indexed_db=True`); a `cookies_only` jar drops it.
+- Refresh preservation: a bare-`jar_id` refresh of a `cookies_only` jar does not re-add origin
+  storage, and preserves `nav_allowlist`; explicit override still works.
+- Probe redirect confinement: a probe whose endpoint 302s to an off-scope origin is aborted before
+  any request carries a jar cookie off-scope; an in-scope probe resolves normally.
+- Mandatory probe: every save (create and refresh) is rejected without a `probe` config.
+- Human-save origin: with no agent command having run, a human save resolves default scope from the
+  live page under the control token (not a stale/`None` `current_origin`).
 - Keyless mode: all jar endpoints 503, `create_session` with `jar_id` rejected, no plaintext ever
   written.
 - Wrong/rotated key: load fails with explicit error, delete still works.
