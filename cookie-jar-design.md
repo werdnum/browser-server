@@ -157,6 +157,7 @@ class CookieJarMeta(BaseModel):
     last_loaded_at: datetime | None
     version: int                     # increments on refresh
     saved_by: Literal["agent", "human"]
+    form_factor: str                 # producing session's form factor/UA; jar loads default to it (below)
     storage_mode: Literal["all", "cookies_only"]   # preserved across refresh unless explicitly changed
     created_session_id: str          # provenance: session the state came from
     conversation_id: str             # provenance only; jars are not conversation-scoped
@@ -322,8 +323,11 @@ control token for human-initiated save. Every operation emits an audit event.
 
 - `jar_id: null` creates a new jar; a jar_id refreshes an existing jar in place (version bump,
   `invalidated_at` cleared). Refresh re-filters against the **stored** jar scope — a refresh cannot
-  silently widen scope; widening requires creating a new jar. Refresh likewise **preserves the
-  stored `storage_mode` and `nav_allowlist`** unless the caller explicitly passes a new value: a
+  silently widen scope; widening requires creating a new jar. **This applies to `nav_allowlist` too**:
+  since the confinement boundary is `origins + nav_allowlist`, a refresh may only *preserve or narrow*
+  the stored allowlist — adding a reachable origin is a widening that requires a new jar (and its own
+  elevated approval), not a quiet expansion under the existing `jar_id` that policy already approved.
+  Refresh likewise **preserves the stored `storage_mode`** unless the caller explicitly narrows it: a
   bare-`jar_id` refresh must not silently flip a `cookies_only` jar back to `all` (adding origin
   storage the creator opted out of), so omitted fields inherit the stored jar's settings.
 - `origins: null` defaults to the session's current origin (see scope semantics). For a **human
@@ -380,6 +384,15 @@ control token for human-initiated save. Every operation emits an audit event.
   `save_browser_session` wrapper) still gets them. The browser-server UI enumerates the exact origins
   a save will capture and requires an explicit action to add any beyond the current one. FA's wrapper
   adds the *model-facing* confirmation on top for agent-initiated saves.
+- **Human save is intentionally human-authorized, and FA-profile gating on it is an operator option,
+  not a default.** The whole point of human-save-in-place is that a human can log in and persist
+  *their own* login without the agent/policy loop, so browser-server does not by default require an
+  FA save-authorization for the checkbox path (only the human control token + the mechanism
+  constraints above). For locked-down deployments where FA profile policy must forbid credential
+  persistence for some users/profiles even on the human path, browser-server supports an optional
+  config requiring an **FA-issued save-authorization token** for `save-jar` (carrying the profile
+  decision into the UI path); when enabled, an un-authorized human checkbox save is rejected. Default
+  off, because it re-couples the deliberately-decoupled human path to FA.
 - **The saving session records the jar in a `produced_jar_ids` set** (not by overwriting
   `session.jar_id`). This is a **separate provenance field**, for two reasons. (1) A single session
   can save/refresh more than one jar; a scalar tag would be overwritten and revocation of the earlier
@@ -423,11 +436,16 @@ control token for human-initiated save. Every operation emits an audit event.
   (`session.jar_id` matches) **and** any source session that produced it (`jar_id ∈
   session.produced_jar_ids`), via the normal cleanup path. Revocation is not complete until the live
   context is gone, not just the file.
-- **An invalidated jar cannot be loaded.** `invalidate` is a kill-switch/stale marker, so
-  `create_session` with a `jar_id` whose `invalidated_at` is set is **rejected** — otherwise a client
-  could immediately re-create a session from the same still-stored blob right after invalidation,
-  defeating the point. The jar becomes loadable again only when a refresh replaces the blob and clears
-  `invalidated_at`.
+- **An invalidated jar cannot be loaded, and load races with revocation are closed.** `invalidate` is
+  a kill-switch/stale marker, so `create_session` with a `jar_id` whose `invalidated_at` is set is
+  **rejected** — otherwise a client could re-create a session from the still-stored blob right after
+  invalidation. Because a load can race a concurrent `DELETE`/`invalidate` (it may pass the
+  invalidation check and decrypt the blob *before* it registers the new session, so the revocation
+  scan doesn't see it yet), the two are serialized by a **per-jar lock**, and the load performs a
+  **post-registration recheck**: after registering the session it re-reads `invalidated_at`/existence
+  and, if the jar was revoked in the window, immediately closes the just-created context. Revocation
+  is not defeated by an in-flight load. The jar becomes loadable again only when a refresh replaces
+  the blob and clears `invalidated_at`.
 - Human UI: a minimal `/jars` page (OIDC) listing jars with delete buttons, so the household can
   audit and revoke saved logins without going through the assistant.
 
@@ -452,6 +470,11 @@ control token for human-initiated save. Every operation emits an audit event.
   there is no "inject jar into running session" endpoint, so a session's authentication scope never
   changes after the create call that policy gated.
 - One jar per session (V1). One authenticated identity per session keeps the policy story simple.
+- **Jar loads default to the producing session's form factor/UA.** `storage_state` alone does not
+  carry the device profile, and an agent-created session with no client viewport otherwise defaults to
+  mobile — so a jar saved from a desktop OIDC session, reloaded under a mobile UA, can trip
+  device/UA-bound risk scoring (forced MFA, or an apparently logged-out session). The jar records its
+  producing `form_factor`, and a load uses it unless the create call explicitly overrides.
 - The session record and all session responses gain `jar_id`, `jar_origins`, `jar_nav_allowlist`,
   and `jar_registrable_domains` so the Family Assistant side always knows it is operating an
   authenticated session and the full set of origins it can reach — the anchor for origin-scoped
@@ -492,8 +515,14 @@ control token for human-initiated save. Every operation emits an audit event.
   there would be no live context left for `save-jar` to export. The re-login flow therefore uses the
   human-first / handover paths above, not a resumable `credentials` handoff. Loading the stale jar
   *before* re-login would also confine the human and block the SSO bounce, so the flow avoids that
-  too. (If a future path must re-login inside an existing jar-loaded session, confinement is suspended
-  for the duration of human control and any newly-visited origin is re-approved before being added.)
+  too. **A jar-loaded session that passes to human control is not resumed by the agent as the same
+  context.** If a jar-loaded session enters a resumable human handoff, the human can visit off-scope
+  login/payment/SSO origins and accumulate cookies/storage the jar scope never contained — so its
+  live context now holds *broader* credentials than its `jar_origins` metadata reports. The agent
+  therefore never resumes that exact context: either confinement stays enforced for the whole
+  jar-loaded lifetime (no off-scope human excursion), or the agent resumes only via a **fresh,
+  re-filtered** jar-loaded session (reload from the jar's stored scope), never inheriting the
+  human-widened context. Metadata never under-reports the scope the agent actually operates.
 
 ### Expiry detection
 
@@ -630,6 +659,12 @@ companion doc).
   unaffected.
 - Invalidated jar unloadable: `create_session` with an invalidated `jar_id` is rejected; a refresh
   clears `invalidated_at` and re-enables load.
+- Load/revocation race: a load interleaved with `invalidate`/`DELETE` on the same jar does not leave
+  a live authenticated context (per-jar lock + post-registration recheck closes the in-flight load).
+- Refresh cannot widen `nav_allowlist`: a refresh adding a new allowlist origin is rejected
+  (narrowing/preserving allowed); widening requires a new jar.
+- Jar load form factor: a jar saved from a desktop session reloads under the desktop UA by default,
+  not the mobile agent default.
 - Direct-OIDC load gate: an OIDC human `create_session` with `jar_id` is rejected; the service-auth
   (FA) path succeeds.
 - Revocation closes the source session: after a save-then-handover flow, `DELETE`/`invalidate` closes
