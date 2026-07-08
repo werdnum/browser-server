@@ -33,15 +33,28 @@ profiles". Cookie jars are a **deliberate, explicit exception** to that rule, an
 
 - Jars are opt-in twice over: the operator must configure an encryption key, and each jar is created
   by an explicit save action tied to a session and an actor.
-- Jars store only Playwright `storage_state` (cookies + origin storage), filtered to a declared
-  scope, encrypted at rest.
+- Jars store only Playwright `storage_state` (cookies + origin storage — localStorage/IndexedDB),
+  filtered to a declared scope, encrypted at rest.
 - Everything else on the never-store list stays never-stored: screenshots, DOM snapshots,
-  accessibility trees from human control, form values, clipboard, payment data, typed credentials,
-  OTPs, full URLs with sensitive query strings.
+  accessibility trees from human control, transient form-field values captured during handoff,
+  clipboard, payment data, typed credentials, OTPs, full URLs with sensitive query strings.
 
-Note the distinction this preserves: a jar contains **session artifacts** (cookies granted after
-login), never the **credentials** themselves. Passwords and OTPs are typed by the human into the
-page during handoff and are never captured — that is the existing warm-handoff guarantee, unchanged.
+**Origin storage is persisted jar content, and is treated as such.** localStorage and IndexedDB can
+hold more than session tokens — a site may keep profile details, cart/checkout metadata, or form
+drafts there, and `storage_state` captures whatever is present within scope. This does **not**
+contradict the never-store list: that list bars browser-server from capturing the *transient* page
+DOM and form fields a human types during handoff. What origin storage contains is data the *site
+itself* chose to persist client-side, which is inseparable from the authenticated session and is
+exactly what must be restored for a reload to work. It therefore gets the same protections as
+cookies — encryption at rest, scope filtering, never returned/logged, the same retention and audit
+treatment, and the same disclosure to the user ("saved logins keep the site's session data"). A
+caller that wants to exclude origin storage entirely can pass `storage: "cookies_only"` at save
+(see API), accepting that some sites will then reload logged-out.
+
+Note the distinction this preserves: a jar contains **session artifacts** (cookies and the site's
+own client-side session data), never the **credentials** themselves. Passwords and OTPs are typed by
+the human into the page during handoff and are never captured — that is the existing warm-handoff
+guarantee, unchanged.
 
 ## Terminology
 
@@ -96,6 +109,9 @@ What browser-server enforces (mechanism — things that must hold regardless of 
   truthfully reported in session metadata for its whole lifetime.
 - `exec` (and any future command that can read cookie values) is denied in jar-loaded sessions
   unless the creator explicitly opted in.
+- Top-level navigation confinement is available (`confine_navigation`, default on for jar-loaded
+  sessions): the mechanism to keep an authenticated session from navigating off its jar origins
+  exists in browser-server, so the client can rely on it rather than reimplement egress control.
 - Every jar operation is an audited session/service event.
 - The existing no-observation-during-human-control invariant is unchanged; jar endpoints follow the
   same fail-closed authorization as agent commands.
@@ -130,7 +146,8 @@ class CookieJarMeta(BaseModel):
     conversation_id: str             # provenance only; jars are not conversation-scoped
     cookie_count: int
     origin_storage_count: int        # number of origins with localStorage/IndexedDB entries
-    earliest_cookie_expiry: datetime | None   # min over persistent cookies; None if all session-cookies
+    earliest_cookie_expiry: datetime | None   # min over persistent cookies; None if none are persistent
+    session_cookies_only: bool       # True when the jar holds no persistent cookies (see expiry)
     probe: JarProbeConfig | None
     last_probe_at: datetime | None
     last_probe_result: Literal["fresh", "stale", "error"] | None
@@ -164,14 +181,25 @@ counts and expiry aggregates. Names live inside the encrypted blob with the valu
 
 ### Scope semantics
 
-Cookies are domain-scoped, not origin-scoped, so scope filtering works at two levels:
+Cookies are domain/path-scoped and origin storage is origin-scoped, so the filter is defined by
+**what the declared origins would actually see**, not by registrable-domain membership. The latter
+would over-capture: a jar scoped to `https://shop.example.com` must not silently persist a host-only
+cookie or the localStorage of a sibling app like `accounts.example.com` that the login flow happened
+to touch — that would make the jar hold credentials for origins outside its declared scope and make
+the reported `jar_origins` understate the true authenticated scope that policy relies on.
 
-- The jar declares exact `origins` (for display and for future navigation policy) and derives
-  `registrable_domains` from them using the public suffix list (`tldextract`, offline mode — a new
-  dependency; naive suffix matching is wrong for `co.uk`-style domains).
-- At save, a cookie is included iff its domain (leading dot stripped) falls under one of the jar's
-  registrable domains. localStorage/IndexedDB entries are included iff their origin's host falls
-  under a scoped registrable domain.
+- The jar declares exact `origins`. It also derives `registrable_domains` (public suffix list via
+  `tldextract`, offline mode — a new dependency; naive suffix matching is wrong for `co.uk`-style
+  domains), but that list is used **only** for the display/navigation-confinement domain set, not to
+  widen what state is captured.
+- **Cookies**: at save, a cookie is included iff it would actually be sent to at least one declared
+  origin — i.e. standard cookie-matching semantics (domain match honoring the `Domain` attribute and
+  host-only cookies, path match, and `Secure`/scheme). A `Domain=.example.com` cookie is kept
+  because it *is* sent to `shop.example.com`; a host-only `accounts.example.com` cookie is dropped
+  because it is not.
+- **Origin storage** (localStorage/IndexedDB): included iff its origin is **exactly** one of the
+  declared `origins`. No registrable-domain widening — origin storage is not shared across origins,
+  so nothing else is in scope.
 - Default scope when the caller does not pass `origins`: the session's **current origin** at save
   time. This is the minimization default that keeps IdP cookies (google.com etc.) out of the jar
   after an SSO login — capturing IdP state requires explicitly listing the IdP origin, which
@@ -194,6 +222,7 @@ control token for human-initiated save. Every operation emits an audit event.
   "label": "Woolworths (Andrew)",
   "jar_id": null,
   "origins": null,
+  "storage": "all",
   "probe": {"url": "https://www.example.com/account", "logged_in_selector": "[data-testid=logout]"},
   "token": null
 }
@@ -203,6 +232,12 @@ control token for human-initiated save. Every operation emits an audit event.
   `invalidated_at` cleared). Refresh re-filters against the **stored** jar scope — a refresh cannot
   silently widen scope; widening requires creating a new jar.
 - `origins: null` defaults to the session's current origin (see scope semantics).
+- `storage: "all"` (default) captures cookies plus in-scope origin storage; `"cookies_only"` skips
+  localStorage/IndexedDB for a caller that wants to avoid persisting site-side client storage,
+  accepting that some sites reload logged-out.
+- `probe` is **required** when the resulting jar would be `session_cookies_only` (no persistent
+  cookies) — save is rejected without it, so such jars always have a dynamic freshness check (see
+  expiry detection). Otherwise `probe` is optional.
 - Authorization mirrors agent commands, fail closed. Two paths, human-save being the canonical one:
   - **Human save** (`token` = control token): allowed in `human_active`. This is the primary flow —
     the human starts a session, logs into a site, and clicks "Save this login for the assistant";
@@ -232,10 +267,10 @@ control token for human-initiated save. Every operation emits an audit event.
 
 ### Load
 
-`POST /v1/sessions` gains two optional fields:
+`POST /v1/sessions` gains optional fields:
 
 ```json
-{"conversation_id": "...", "jar_id": "jar_...", "allow_exec": false}
+{"conversation_id": "...", "jar_id": "jar_...", "allow_exec": false, "confine_navigation": true}
 ```
 
 - The worker seeds its context from the decrypted jar at creation
@@ -247,6 +282,11 @@ control token for human-initiated save. Every operation emits an audit event.
   `jar_registrable_domains` so the Family Assistant side always knows it is operating an
   authenticated session and at which origins — the anchor for origin-scoped policy.
 - `last_loaded_at` is bumped; event `jar_loaded` is emitted on the new session.
+- **`confine_navigation`** (default `true` for jar-loaded sessions): restricts main-frame document
+  navigations to the jar's registrable domains (see "top-level navigation confinement" below). The
+  Family Assistant side requires this before it will enable `load_saved_session`, so cross-origin
+  egress from an authenticated session is blocked from day one rather than deferred to the taint
+  matrix. A caller can pass `false` to opt out, which is a policy decision that belongs to FA.
 - **`exec` default-deny**: in a jar-loaded session, the `exec` agent command is rejected unless the
   session was created with `allow_exec: true`. Rationale: `page.evaluate` can read `document.cookie`
   and origin storage, handing non-HttpOnly session tokens to the model — the one agent-reachable
@@ -265,6 +305,15 @@ Three layers, cheapest first — browser-server provides signals, Family Assista
 
 1. **Static metadata**: `earliest_cookie_expiry` computed at save; listings can flag jars whose
    persistent cookies have lapsed. (Necessary but weak — servers revoke sessions server-side too.)
+   **Session-cookie-only jars** (`session_cookies_only: true`, i.e. the login relied entirely on
+   browser-session-lifetime cookies with no persistent expiry) are a special case: saving and
+   reloading them silently promotes session-lifetime credentials into durable ones with no static
+   stale signal, so they could stay loadable far longer than the site intended. Such jars are
+   flagged `session_cookies_only` and surfaced in listings as **needing a probe**; save **requires a
+   `probe` config** for a session-cookie-only jar (rejected otherwise) so there is always a dynamic
+   freshness check, and they are the first candidates for the optional TTL reaper in open question 1.
+   IndexedDB/localStorage auth tokens have no cookie-style expiry at all and fall under the same
+   probe-or-TTL treatment.
 2. **Active probe**: `POST /v1/jars/{jar_id}/probe` (service auth). Loads the jar into a throwaway
    headless context (no session, no worker, no noVNC), navigates to `probe.url`, applies the success
    indicator, tears the context down. Returns `{"result": "fresh" | "stale" | "error",
@@ -289,8 +338,10 @@ a "please re-login" task) — browser-server never probes on its own initiative.
   identical across runtimes.
 - `FakeBrowserWorker` gets a settable in-memory storage_state fixture so the full save/load/probe
   flow is testable in the fake runtime.
-- `models.py`: `CreateSessionRequest` gains `jar_id`/`allow_exec`; `BrowserSession` gains
-  `jar_id`/`jar_origins`/`jar_registrable_domains`; new jar request/response models.
+- `models.py`: `CreateSessionRequest` gains `jar_id`/`allow_exec`/`confine_navigation`;
+  `BrowserSession` gains `jar_id`/`jar_origins`/`jar_registrable_domains`; new jar request/response
+  models. The worker enforces confinement via a Playwright route/`framenavigated` guard on the
+  main frame.
 - New module `jars.py`: `JarStore` (encrypt/decrypt, scope filter, atomic persistence, probe
   rate-limit state) injected into the app like the registry.
 
@@ -304,11 +355,17 @@ a "please re-login" task) — browser-server never probes on its own initiative.
   into a context or deleted).
 - No automatic jar refresh on session close (an explicit save keeps the audit trail honest; may be
   revisited once usage shows the refresh nag is real friction).
-- No per-jar navigation confinement in V1. Top-level-navigation confinement to jar origins is
-  feasible via route interception and is sketched as a follow-up (it is the server-side backstop for
-  the taint matrix's "browser cell"), but redirects, SSO bounces, and CDN subresources make a
-  correct implementation non-trivial; policy-side enforcement in FA comes first. The session
-  metadata exposure (`jar_origins`) is designed so this can be added without API changes.
+- **Opt-in top-level navigation confinement is in scope for the load milestone** (moved up from a
+  follow-up). Because the Family Assistant side treats egress confinement as a prerequisite for
+  enabling `load_saved_session` (a load-time confirmation alone does not gate what the authenticated
+  session does afterward), a jar-loaded session created with `confine_navigation: true` restricts
+  **main-frame document navigations** to the jar's `registrable_domains` via route interception;
+  an attempted navigation outside scope is blocked and surfaced as a structured result, not followed.
+  This is the server-side backstop for the taint matrix's "browser cell" and directly blocks
+  cross-origin-egress-under-auth. Deliberately *not* covered in this first cut: sub-resource/CDN
+  loads (normal rendering, left alone) and full redirect-chain/SSO-bounce hardening (a login bounce
+  belongs to the handoff phase, not agent-driven authenticated browsing) — those remain follow-ups,
+  and `jar_origins` in session metadata lets them tighten without API changes.
 
 ## Milestones
 
@@ -320,9 +377,11 @@ companion doc).
 2. **Save path**: explicit-context worker refactor + `export_storage_state`, `save-jar` endpoint
    with agent/human authorization matrix, handover-form checkbox + session-UI action, events. Fake
    runtime + one real-Chromium test asserting a fixture login survives export.
-3. **Load path**: `create_session.jar_id` + `allow_exec`, session metadata exposure, `jar_loaded`
-   event, `exec` default-deny in jar-loaded sessions, jar management endpoints + `/jars` UI page.
-   Real-runtime test: log in on fixture site, save, new session with jar, fixture shows logged-in.
+3. **Load path**: `create_session.jar_id` + `allow_exec` + `confine_navigation`, session metadata
+   exposure, `jar_loaded` event, `exec` default-deny and top-level navigation confinement in
+   jar-loaded sessions, jar management endpoints + `/jars` UI page. Real-runtime test: log in on
+   fixture site, save, new session with jar, fixture shows logged-in; a navigation to an off-scope
+   origin is blocked.
 4. **Expiry**: expiry metadata, probe endpoint with rate limiting, invalidate endpoint.
 5. **family-assistant adapter** (other repo): `save_browser_session` / `list_saved_sessions` /
    `load_saved_session` / `forget_saved_session` tools, policy + confirmation gating, prompts and
@@ -336,17 +395,27 @@ companion doc).
   machine, like existing command-authorization tests).
 - `exec` denied in jar-loaded session by default; allowed with `allow_exec: true`; unaffected in
   jarless sessions.
-- Scope filter property tests: IdP-style third-origin cookies excluded under default scope;
-  `co.uk` registrable-domain handling; refresh cannot widen scope.
+- Navigation confinement: in a jar-loaded session with `confine_navigation: true`, a `navigate` to
+  an off-scope origin is blocked and reported structurally; in-scope navigation proceeds; a jarless
+  or opted-out session is unaffected.
+- Session-cookie-only save is rejected without a `probe` config; the resulting jar carries
+  `session_cookies_only: true` and surfaces as needing a probe.
+- Scope filter property tests: IdP-style third-origin cookies excluded under default scope; a
+  host-only sibling cookie (`accounts.example.com`) and sibling-origin localStorage excluded from a
+  jar scoped to `shop.example.com`; a `Domain=.example.com` cookie included; `co.uk` handling for
+  the confinement domain set; refresh cannot widen scope.
 - Keyless mode: all jar endpoints 503, `create_session` with `jar_id` rejected, no plaintext ever
   written.
 - Wrong/rotated key: load fails with explicit error, delete still works.
 
 ## Open questions
 
-1. **Retention**: jars currently live until deleted or invalidated. Is a `BROWSER_JAR_TTL_DAYS`
+1. **Retention**: persistent-cookie jars live until deleted or invalidated. Is a `BROWSER_JAR_TTL_DAYS`
    reaper worth it, or is the staleness surfaced in listings (+ human UI delete) enough for a
-   household deployment? Leaning: no TTL; expiry probing already surfaces dead jars.
+   household deployment? Leaning: no global TTL for jars with persistent-cookie expiry (probing
+   surfaces dead ones), **but** session-cookie-only jars — which carry no intrinsic expiry — are the
+   case that most wants a bounded TTL on top of their mandatory probe; a shorter default max age for
+   just those is likely worth it. Decide alongside the probe-heuristics work.
 2. **Probe success heuristics**: is selector-or-URL-prefix enough, or do real household sites need a
    "either of N indicators" list? Decide after milestone 4 contact with reality.
 3. **`saved_by` policy leverage**: should Family Assistant require `saved_by == "human"` for some
