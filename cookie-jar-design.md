@@ -45,9 +45,13 @@ page during handoff and are never captured — that is the existing warm-handoff
 
 ## Terminology
 
-- **Cookie jar (jar)**: a named, durable, encrypted blob of Playwright `storage_state` (cookies plus
-  localStorage; optionally IndexedDB where the Playwright version supports
-  `storage_state(indexed_db=True)`), scoped to a declared set of origins, plus cleartext metadata.
+- **Cookie jar (jar)**: a named, durable, encrypted blob of Playwright `storage_state` (cookies,
+  localStorage, and IndexedDB via `storage_state(indexed_db=True)` where the Playwright version
+  supports it), scoped to a declared set of origins, plus cleartext metadata. IndexedDB is captured
+  by default: a growing number of sites keep their auth/session token there rather than in a cookie,
+  and omitting it would silently produce jars that load into a logged-out session — the worst
+  possible failure for this feature. The scope filter applies to IndexedDB origins exactly as it
+  does to cookies, so including it does not widen what a jar can capture.
 - **Scope**: the set of origins (and their registrable domains) whose state a jar may contain.
 - **Jar-loaded session**: a browser session created with `jar_id` set, whose context was seeded from
   that jar at creation time.
@@ -199,14 +203,19 @@ control token for human-initiated save. Every operation emits an audit event.
   `invalidated_at` cleared). Refresh re-filters against the **stored** jar scope — a refresh cannot
   silently widen scope; widening requires creating a new jar.
 - `origins: null` defaults to the session's current origin (see scope semantics).
-- Authorization mirrors agent commands, fail closed:
+- Authorization mirrors agent commands, fail closed. Two paths, human-save being the canonical one:
+  - **Human save** (`token` = control token): allowed in `human_active`. This is the primary flow —
+    the human starts a session, logs into a site, and clicks "Save this login for the assistant";
+    the agent later picks the jar up in a fresh session with no handover involved. Also surfaced as
+    a checkbox on the handover form (save-then-handover) for when the human is handing the task off
+    anyway. `saved_by: "human"` is recorded, giving Family Assistant a provenance signal ("human
+    explicitly consented at save time") policy can distinguish.
   - **Agent save** (no `token`, service auth): allowed only in `AGENT_COMMAND_STATES` with
-    `lease_owner == agent` — the agent cannot harvest state from a human-controlled browser.
-    Typical flow: human-first login → handover → agent claims → agent saves.
-  - **Human save** (`token` = control token): allowed in `human_active`. Surfaced in the session UI
-    as a "Save this login for the assistant" action (and as a checkbox on the handover form, which
-    performs save-then-handover). `saved_by: "human"` is recorded, giving Family Assistant a
-    provenance signal ("human explicitly consented at save time") policy can distinguish.
+    `lease_owner == agent`. This falls out of the existing agent-command authorization (the agent
+    can save only what it is already driving) rather than being a special restriction — it is not a
+    security wall around a valuable secret, just the same lease check every agent command uses.
+    Typical flow: human-first login → handover → agent claims → agent saves. Nothing stops the human
+    from taking the low-friction human-save path instead.
 - Response is `CookieJarMeta` only. Never the blob.
 - Event: `jar_saved` (metadata: jar_id, origins, actor, refresh or create).
 
@@ -338,9 +347,7 @@ companion doc).
 1. **Retention**: jars currently live until deleted or invalidated. Is a `BROWSER_JAR_TTL_DAYS`
    reaper worth it, or is the staleness surfaced in listings (+ human UI delete) enough for a
    household deployment? Leaning: no TTL; expiry probing already surfaces dead jars.
-2. **IndexedDB**: include `indexed_db=True` in the export when available? Some sites keep auth
-   tokens there; it also bloats jars. Leaning: include, since the scope filter applies equally.
-3. **Probe success heuristics**: is selector-or-URL-prefix enough, or do real household sites need a
+2. **Probe success heuristics**: is selector-or-URL-prefix enough, or do real household sites need a
    "either of N indicators" list? Decide after milestone 4 contact with reality.
-4. **`saved_by` policy leverage**: should Family Assistant require `saved_by == "human"` for some
+3. **`saved_by` policy leverage**: should Family Assistant require `saved_by == "human"` for some
    uses (e.g. loading into less-trusted profiles)? Pure FA policy question; the metadata is there.
