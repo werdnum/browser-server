@@ -107,19 +107,26 @@ What browser-server enforces (mechanism — things that must hold regardless of 
 - Jars are encrypted at rest; without the configured key the feature is disabled fail-closed.
 - Save is only possible from a live session by an actor who holds that session's lease (agent) or
   control token (human), and only captures state within the declared scope.
-- Load happens only at session creation. A session's authenticated scope is therefore immutable and
-  truthfully reported in session metadata for its whole lifetime.
+- Load happens only at session creation, and **only via service auth** — a direct OIDC human
+  `create_session` cannot pass `jar_id`, so FA stays the load-authorization chokepoint. A session's
+  authenticated scope is therefore immutable and truthfully reported in session metadata for its
+  whole lifetime.
+- An **invalidated jar is unloadable** until a refresh replaces its blob and clears the flag.
 - `exec` (and any future command that can read cookie values) is denied in jar-loaded sessions
   unless the creator explicitly opted in.
-- Top-level navigation confinement is available (`confine_navigation`, default on for jar-loaded
-  sessions): the mechanism to keep an authenticated session from navigating off its **exact** jar
-  origins exists in browser-server, so the client can rely on it rather than reimplement egress
-  control.
-- Caller-supplied `label` is normalized at save (length cap, control/newline stripping, plain text)
-  so it cannot carry markup or become durable prompt-injection content in later listings.
-- Revocation (delete/invalidate) closes any live session seeded from that jar, not just the stored
-  blob — so "forget this login" is a real-time kill-switch, not a deferred cleanup.
-- Every jar operation is an audited session/service event.
+- Top-level document confinement is available (`confine_navigation`, default on for jar-loaded
+  sessions): the mechanism keeps an authenticated session from issuing an off-scope document/form
+  request in **any** frame (main, child, popup) off its **exact** jar origins, so the client can rely
+  on it rather than reimplement egress control.
+- Caller-supplied `label` is normalized at save, and probe internals (`logged_in_selector`, urls) are
+  never returned in listable metadata — neither can carry markup or become durable prompt-injection
+  content in later listings.
+- Revocation (delete/invalidate) closes any live session seeded from *or that produced* the jar, not
+  just the stored blob — so "forget this login" is a real-time kill-switch, not a deferred cleanup.
+- Captured origin-storage size is bounded (oversized saves rejected) so the durable write path cannot
+  be used to exhaust memory/disk.
+- Every jar operation is a **durably** audited event (jars outlive the in-memory session-event
+  stream).
 - The existing no-observation-during-human-control invariant is unchanged; jar endpoints follow the
   same fail-closed authorization as agent commands.
 
@@ -157,39 +164,60 @@ class CookieJarMeta(BaseModel):
     origin_storage_count: int        # number of origins with localStorage/IndexedDB entries
     earliest_cookie_expiry: datetime | None   # min over persistent cookies; None if none are persistent
     session_cookies_only: bool       # True when the jar holds no persistent cookies (see expiry)
-    probe: JarProbeConfig             # always present: a freshness probe is mandatory (see expiry)
+    has_probe: bool                  # a freshness probe is mandatory; internals are NOT listed (below)
     last_probe_at: datetime | None
-    last_probe_result: Literal["fresh", "stale", "error"] | None
+    last_probe_result: Literal["fresh", "stale", "uncertain", "error"] | None
     invalidated_at: datetime | None  # set by explicit invalidation; cleared on refresh
 
 
-class JarProbeConfig(BaseModel):
-    url: HttpUrl                     # scheme+host+path only (query/fragment stripped); must be in scope
+class JarProbeConfig(BaseModel):     # stored with the encrypted blob, NOT in listable metadata
+    url: HttpUrl                     # scheme+host+path only (query/fragment stripped); within origins+nav_allowlist
     # Exactly one success indicator:
-    logged_in_selector: str | None = None      # selector present => fresh
-    logged_out_url_prefix: str | None = None   # scheme+host+path only; final URL under it => stale
+    logged_in_selector: str | None = None      # authenticated-only selector present => fresh
+    logged_out_url_prefix: str | None = None   # scheme+host+path only; MAY be off-scope (login/IdP); match => stale
 ```
 
 Metadata is cleartext (needed for listing); it contains **no cookie names and no values** — only
-counts and expiry aggregates. Names live inside the encrypted blob with the values.
+counts and expiry aggregates. Names live inside the encrypted blob with the values. **The probe
+config is not part of listable metadata**: `logged_in_selector` can contain user-specific or
+page-influenced text, so returning it through `GET /v1/jars` → `list_saved_sessions` would leak page
+data and create another durable prompt-injection field. The probe config is stored alongside the
+encrypted blob; listings expose only `has_probe` + `last_probe_result`.
 
 **Probes must be safe/idempotent reads, not action URLs.** The scheduled freshness automation
 replays `probe.url` under the saved login, so an in-scope but side-effecting target — `/logout`, a
 "delete session" GET, any state-changing endpoint injected content asked to store — would end or
 corrupt the very session the probe is meant to check. A probe is therefore a plain **GET navigation
-followed by a selector/URL check**, and the recommended (and human-UI-default) form is a
-`logged_in_selector` on a **stable read-only page** (the account/home page), not an action endpoint.
-Same-origin constraint alone is insufficient; the target must be idempotent. (The probe navigation
-issues no form submits and, like a jar-loaded session, aborts off-scope redirects pre-request.)
+followed by a check**, and the required form is a `logged_in_selector` (or `logged_out_url_prefix`)
+on a **stable read-only page** (the account/home page), not an action endpoint. Same-origin alone is
+insufficient; the target must be idempotent. The probe navigation issues no form submits and, like a
+jar-loaded session, aborts off-scope redirects pre-request — but it still **classifies** a
+redirect-toward-login as stale by matching the redirect `Location` against `logged_out_url_prefix`
+*before* aborting.
 
-**Probe URLs are redacted before persistence.** `probe.url` lives in cleartext, listable metadata,
-so it must not become a back door around the never-store-sensitive-full-URLs guarantee: a caller's
-"logged-in page" URL could carry PII or bearer-style query/fragment parameters (`?token=…`,
-`#access_token=…`). On save, the query and fragment are **stripped** (scheme + host + path retained,
-and the host must be within jar scope); a probe navigates to that origin+path only. The same
-strip-and-scope validation applies to `logged_out_url_prefix` (an SSO/login-redirect prefix can just
-as easily embed `return_to`, account ids, or state/token parameters). This keeps the freshness check
-useful without persisting or exposing sensitive URL parameters.
+- **`probe.url` scope**: validated against the **same `origins + nav_allowlist`** boundary the load
+  guard uses, not just captured `origins` — otherwise a jar that reaches a second first-party origin
+  only via `nav_allowlist` (without capturing its storage) could have no valid probe target.
+- **`logged_out_url_prefix` may be off-scope.** It is a *classification pattern*, not a navigation
+  target: expired sessions commonly redirect to an IdP or `login.` subdomain outside the jar scope.
+  Constraining it to in-scope would make those flows report `error` instead of `stale` and never
+  trigger re-login. So it is exempt from the in-scope rule (query/fragment still stripped).
+- **The success signal must be authenticated-only.** A `logged_in_selector` that matches chrome
+  present on *both* the login wall and the authed page (logo, footer) is a false-positive that keeps
+  reporting a dead jar as fresh. The indicator must distinguish logged-in from logged-out (a logout
+  control, account-name element, or the `logged_out_url_prefix` redirect check).
+- **No selector ⇒ `uncertain`, not `fresh`.** The "final origin still in scope" heuristic is not a
+  freshness proof (a site can render a logged-out wall at the same origin+path with a 200). A save
+  must capture a concrete authenticated-only signal; if the non-technical human path genuinely cannot
+  derive one, the probe result is `uncertain` (surfaced as needing attention), never silently `fresh`.
+- **Human default targets a stable page, not the raw current page.** Deriving `probe.url` from
+  whatever page is active would persist a one-time/side-effecting URL (OAuth callback `?code=&state=`,
+  checkout confirmation). The human-UI default navigates to a known stable account/home page (and
+  strips query/fragment) before saving.
+
+**URL redaction.** `probe.url` and `logged_out_url_prefix` have query and fragment **stripped** on
+save (scheme + host + path retained) so neither becomes a back door around the
+never-store-sensitive-full-URLs guarantee (`?token=…`, `#access_token=…`, `return_to`, account ids).
 
 ### Storage and encryption
 
@@ -215,6 +243,14 @@ useful without persisting or exposing sensitive URL parameters.
 - This is browser-server's first durable state. It is deliberately kept out of the in-memory
   `SessionRegistry`: sessions stay ephemeral and shared-fate with the process; jars survive
   restarts. No database is introduced.
+- **Jar audit is durable, unlike session events.** The existing `SessionEvent` stream is in-memory
+  and per-session, so it evaporates on restart and when the source session is cleaned up — but jars
+  are durable credentials whose management (`jar_saved`/`jar_loaded`/`jar_refreshed`/`jar_deleted`/
+  `jar_invalidated`) can happen long after any session is gone. Those jar events are therefore also
+  written to a durable, structured audit sink (an append-only jar-audit log next to `BROWSER_JAR_DIR`,
+  and/or structured service logs) so the credential audit trail outlives sessions and restarts. Jar
+  audit records carry only non-secret metadata (jar_id, origins, actor, op) — never cookie/storage
+  material or probe internals.
 
 ### Scope semantics
 
@@ -336,7 +372,16 @@ control token for human-initiated save. Every operation emits an audit event.
   `save_browser_session` wrapper) still gets them. The browser-server UI enumerates the exact origins
   a save will capture and requires an explicit action to add any beyond the current one. FA's wrapper
   adds the *model-facing* confirmation on top for agent-initiated saves.
-- Response is `CookieJarMeta` only. Never the blob.
+- **The saving session is tagged with the jar's id** on save (its `session.jar_id` is set even
+  though the context was not *seeded* from the jar). This matters for revocation: in a
+  save-then-handover / agent-save flow the authenticated context that *produced* the jar is a live
+  session that revocation would otherwise miss (it enumerates by `jar_id`). Tagging the source session
+  means delete/invalidate closes it too, so the kill-switch does not leave the origin session alive.
+- **Origin-storage size cap.** Because localStorage/IndexedDB are captured by default, a
+  compromised/injected in-scope page could stuff IndexedDB before save so `JarStore` serializes,
+  encrypts, and writes an enormous blob (memory/disk DoS). The export is bounded by a per-jar
+  storage-state size limit; a save exceeding it is rejected rather than written.
+- Response is `CookieJarMeta` only. Never the blob (or probe internals).
 - Event: `jar_saved` (metadata: jar_id, origins, actor, refresh or create).
 
 ### Manage
@@ -361,9 +406,14 @@ control token for human-initiated save. Every operation emits an audit event.
   the stored blob would leave the live authenticated session running after the user "revoked" it.
   Because delete/invalidate is the user's real-time kill-switch for an in-progress abuse (an injected
   page driving same-origin actions under the login — residual #1 that the taint matrix only tightens
-  later), both endpoints enumerate live sessions by `jar_id` (the registry already carries it) and
-  close them via the normal cleanup path. Revocation is not complete until the live context is gone,
-  not just the file.
+  later), both endpoints enumerate live sessions by `jar_id` — matching **both** jar-*loaded* sessions
+  **and** the source session that produced the jar (tagged at save, above) — and close them via the
+  normal cleanup path. Revocation is not complete until the live context is gone, not just the file.
+- **An invalidated jar cannot be loaded.** `invalidate` is a kill-switch/stale marker, so
+  `create_session` with a `jar_id` whose `invalidated_at` is set is **rejected** — otherwise a client
+  could immediately re-create a session from the same still-stored blob right after invalidation,
+  defeating the point. The jar becomes loadable again only when a refresh replaces the blob and clears
+  `invalidated_at`.
 - Human UI: a minimal `/jars` page (OIDC) listing jars with delete buttons, so the household can
   audit and revoke saved logins without going through the assistant.
 
@@ -375,6 +425,14 @@ control token for human-initiated save. Every operation emits an audit event.
 {"conversation_id": "...", "jar_id": "jar_...", "allow_exec": false, "confine_navigation": true}
 ```
 
+- **`jar_id` is accepted only on service-authenticated `create_session`, never on a direct OIDC
+  human `create_session`.** Family Assistant is the load-authorization chokepoint (the
+  `load_saved_session` confirmation + profile policy). On deployments that expose browser-server's
+  OIDC-authenticated API/UI directly, an OIDC human must not be able to seed a human-owned context
+  with any saved jar and bypass that gate — so a direct OIDC create with `jar_id` is rejected. Jar
+  loads happen through the service token (the FA path) or a FA-issued load authorization; the OIDC
+  human path stays limited to jarless human-owned sessions (and the `/jars` UI, which only lists and
+  deletes).
 - The worker seeds its context from the decrypted jar at creation
   (`browser.new_context(storage_state=...)`). Load-at-creation-only is a deliberate invariant:
   there is no "inject jar into running session" endpoint, so a session's authentication scope never
@@ -546,8 +604,20 @@ companion doc).
   registrable domain** (`accounts.example.com` for a `shop.example.com` jar) and a **different port**
   (`example.com:8443` for an `example.com` jar) are also blocked (confinement is exact scheme+host+port,
   not registrable-domain); an **off-scope redirect** from an in-scope page is aborted pre-request; an
-  off-scope **popup/`window.open`** is blocked; in-scope navigation and saved `nav_allowlist` origins
-  proceed; a jarless or opted-out session is unaffected.
+  off-scope **popup/`window.open`** and an **off-scope child-frame document/form POST** are blocked;
+  in-scope navigation and saved `nav_allowlist` origins proceed; a jarless or opted-out session is
+  unaffected.
+- Invalidated jar unloadable: `create_session` with an invalidated `jar_id` is rejected; a refresh
+  clears `invalidated_at` and re-enables load.
+- Direct-OIDC load gate: an OIDC human `create_session` with `jar_id` is rejected; the service-auth
+  (FA) path succeeds.
+- Revocation closes the source session: after a save-then-handover flow, `DELETE`/`invalidate` closes
+  the still-live session that produced the jar (tagged with `jar_id` at save), not only jar-loaded ones.
+- Probe internals hidden: `logged_in_selector`/probe urls never appear in `GET /v1/jars` output.
+- Probe scope: `probe.url` is accepted within `origins + nav_allowlist`; `logged_out_url_prefix` may
+  be off-scope; a probe with no authenticated-only signal yields `uncertain`, not `fresh`.
+- Origin-storage size cap: a save whose exported storage_state exceeds the limit is rejected.
+- Durable audit: `jar_*` events survive a simulated service restart (written to the durable sink).
 - Freshness probe required at save: every save (create and refresh) rejected without a `probe`; a
   human save auto-derives a default probe from the live page so it is never rejected for lack of a
   hand-authored selector.
