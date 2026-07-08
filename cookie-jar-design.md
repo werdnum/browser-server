@@ -173,6 +173,15 @@ class JarProbeConfig(BaseModel):
 Metadata is cleartext (needed for listing); it contains **no cookie names and no values** — only
 counts and expiry aggregates. Names live inside the encrypted blob with the values.
 
+**Probes must be safe/idempotent reads, not action URLs.** The scheduled freshness automation
+replays `probe.url` under the saved login, so an in-scope but side-effecting target — `/logout`, a
+"delete session" GET, any state-changing endpoint injected content asked to store — would end or
+corrupt the very session the probe is meant to check. A probe is therefore a plain **GET navigation
+followed by a selector/URL check**, and the recommended (and human-UI-default) form is a
+`logged_in_selector` on a **stable read-only page** (the account/home page), not an action endpoint.
+Same-origin constraint alone is insufficient; the target must be idempotent. (The probe navigation
+issues no form submits and, like a jar-loaded session, aborts off-scope redirects pre-request.)
+
 **Probe URLs are redacted before persistence.** `probe.url` lives in cleartext, listable metadata,
 so it must not become a back door around the never-store-sensitive-full-URLs guarantee: a caller's
 "logged-in page" URL could carry PII or bearer-style query/fragment parameters (`?token=…`,
