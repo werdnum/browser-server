@@ -218,9 +218,21 @@ approval). The probe navigation issues no form submits and, like a jar-loaded se
 off-scope redirects pre-request — but it still **classifies** a redirect-toward-login as stale by
 matching the redirect `Location` against `logged_out_url_prefix` *before* aborting.
 
-- **`probe.url` scope**: validated against the **same `origins + nav_allowlist`** boundary the load
-  guard uses, not just captured `origins` — otherwise a jar that reaches a second first-party origin
-  only via `nav_allowlist` (without capturing its storage) could have no valid probe target.
+- **`probe.url` scope and path**: validated against the **same `origins + nav_allowlist`** boundary
+  the load guard uses (not just captured `origins`, else a `nav_allowlist`-only origin would have no
+  valid probe target). The **path** is constrained too, not just origin: stripping query/fragment/
+  userinfo is not enough, because a secret or account id can live in the path (`/reset/<magic>`,
+  `/users/12345/account`). A probe target must be an **approved stable path** — the service-derived
+  landing page (`/` or a home/account path the service selects) for agent saves, or a human/FA-approved
+  path — and high-entropy/sensitive path segments are rejected rather than stored.
+- **Agent-chosen freshness selectors are not trusted as authenticated-only.** An agent save on a
+  prompt-injected page could supply a selector like `body` or the logo that is *also* present on the
+  login wall, so later probes keep reading `fresh` after expiry. The server cannot tell arbitrary CSS
+  is authenticated-only, so an agent-supplied selector is either validated by a **logged-out-baseline
+  check** (the service loads the target with no jar and confirms the selector is *absent* when logged
+  out — present-when-in vs absent-when-out proves it discriminates) or, if that can't be established,
+  treated as **`uncertain`** / requires human-FA approval. A human save (the human is looking at the
+  authenticated page) can confirm the signal directly.
 - **`logged_out_url_prefix` may be off-scope.** It is a *classification pattern*, not a navigation
   target: expired sessions commonly redirect to an IdP or `login.` subdomain outside the jar scope.
   Constraining it to in-scope would make those flows report `error` instead of `stale` and never
@@ -255,6 +267,11 @@ validators otherwise accept, as well as `?token=…`, `#access_token=…`, `retu
 - New `JarStore` component with its own lock; storage is one file per jar under
   `BROWSER_JAR_DIR` (default `<data dir>/jars`), mode `0600`, written atomically
   (temp file + rename): `{"meta": {...}, "key_id": "<id>", "nonce": "<base64>", "blob": "<base64>"}`.
+- **Every caller-supplied `jar_id` (refresh, `GET`/`DELETE`/`invalidate`/`probe`, `create_session`) is
+  validated against the strict generated form `jar_[0-9a-f]{32}` before it is ever used to build a
+  path.** A body/path value like `../../etc/...` must never map to a filesystem location, so ids that
+  don't match the pattern are rejected outright — no path traversal reading/overwriting/deleting files
+  outside `BROWSER_JAR_DIR`.
 - `blob` is the AEAD ciphertext of a JSON object `{"storage_state": {...}, "probe": {...}}` — i.e. it
   wraps **both** the scope-filtered Playwright `storage_state` **and** the mandatory probe config, so
   the probe survives restarts and can drive `/probe` without ever appearing in listable metadata (the
@@ -275,12 +292,16 @@ validators otherwise accept, as well as `?token=…`, `#access_token=…`, `retu
   cross-checked on load, with any mismatch failing closed). Editing `origins`/`owner_subject` in the
   file without the key makes decryption/verification fail, so tampering cannot silently widen
   navigation or transfer ownership.
-- **`invalidated_at` is authenticated too, so the kill-switch survives file tampering.** Because it
-  changes *after* the initial write, `invalidate` does not merely flip a cleartext byte — it **re-seals
-  the jar** (re-encrypts with a fresh nonce, binding the new `invalidated_at` as AAD) *and/or* appends
-  the revocation to a separate authenticated (HMAC'd) revocation record that `load`/`probe` consult.
-  Either way, clearing the cleartext `invalidated_at` in the file without the key cannot un-revoke a
-  jar — load/verify fails closed, so a user-revoked login cannot be resurrected by metadata tampering.
+- **Revocation is rollback-proof via a mandatory append-only tombstone.** Re-sealing the jar on
+  `invalidate` (re-encrypt, fresh nonce, `invalidated_at` bound as AAD) is *not sufficient on its own*:
+  AES-GCM authenticates a given blob but cannot prove it is the *latest* one, so an attacker/operator
+  with filesystem restore access could roll the file back to an older, still-valid pre-invalidation
+  version. Therefore revocation (both `invalidate` and `delete`) **must** also append the `jar_id` to a
+  separate **append-only, authenticated (HMAC-chained/monotonic) tombstone record**, and `load`/`probe`
+  consult it and **fail closed for any tombstoned `jar_id` even if the jar file itself looks valid or
+  was restored**. Only a subsequent refresh (which writes a new post-tombstone state) makes the jar
+  loadable again. Clearing the cleartext `invalidated_at` or restoring an old jar file cannot
+  resurrect a revoked login.
 - Each blob records the `key_id` (a short fingerprint of the key that encrypted it) so the service can
   distinguish "operator rotated the key" from "blob corrupted", and so rotation can be handled
   deliberately.
@@ -380,7 +401,10 @@ an FA-issued management authorization. Every operation emits a (durable) audit e
   you may overwrite someone else's durable credentials. So a `jar_id` refresh is authorized only by
   the service token (FA path) or a caller whose `owner_subject` matches the target jar's — otherwise a
   human who merely learns another subject's `jar_id` could overwrite it from a matching live session
-  despite subject-scoped management. **A `jar_id: null` new-jar save is rejected from a *jar-loaded*
+  despite subject-scoped management. The subject match must be a **non-null equality** — `None == None`
+  is *not* ownership: a jar with an unset `owner_subject` (service- or handoff-created) is refreshable
+  only via the service token or FA authorization, never by an arbitrary non-service caller who happens
+  to control another ownerless session, so ownerless durable credentials can't be hijacked. **A `jar_id: null` new-jar save is rejected from a *jar-loaded*
   session**: otherwise an agent driving a loaded jar could snapshot those credentials into a second,
   unlinked blob that `delete`/`invalidate` on the original would never reach — a clone that escapes
   the kill-switch. A jar-loaded session may only refresh its own `jar_id`. Refresh re-filters against
@@ -473,10 +497,13 @@ an FA-issued management authorization. Every operation emits a (durable) audit e
   unfiltered, broader-credential context as if it had the jar's narrow immutable scope. `jar_id` keeps
   its single meaning "seeded from (and scope-filtered to) this jar"; `produced_jar_ids` is provenance
   only, used by revocation to also close the origin context.
-- **Origin-storage size cap.** Because localStorage/IndexedDB are captured by default, a
-  compromised/injected in-scope page could stuff IndexedDB before save so `JarStore` serializes,
-  encrypts, and writes an enormous blob (memory/disk DoS). The export is bounded by a per-jar
-  storage-state size limit; a save exceeding it is rejected rather than written.
+- **Origin-storage size cap, enforced before materialization.** Because localStorage/IndexedDB are
+  captured by default, a compromised/injected in-scope page could stuff IndexedDB before save so the
+  export allocates an enormous object (memory/disk DoS). The cap must apply **before** the whole blob
+  is materialized — a bare `export_storage_state()` that serializes everything and then lets `JarStore`
+  reject it has already paid the allocation. So the export path measures incrementally and aborts past
+  the limit (and/or a browser-context storage quota bounds it at the source); a save exceeding the
+  limit is rejected without ever holding the full oversized blob in memory.
 - Response is `CookieJarMeta` only. Never the blob (or probe internals).
 - Event: `jar_saved` (metadata: jar_id, origins, actor, refresh or create).
 
@@ -619,7 +646,10 @@ Three layers, cheapest first — browser-server provides signals, Family Assista
    is unloadable, so its blob must not be loaded into a context and navigated with its credentials by
    a scheduled probe or a stale FA task; the refresh path clears the flag first. Every valid jar
    carries a `probe` config (required at save), so freshness is always checkable. Loads the jar into a
-   throwaway headless context (no session, no worker, no noVNC), navigates to `probe.url` **under the
+   throwaway headless context **using the jar's recorded `form_factor`/UA** (not the default
+   headless/mobile profile — a desktop-created jar probed under a mobile UA can trip device/UA-bound
+   risk scoring and read stale/`uncertain` even though a normal load would work; save-time verification
+   uses the saved profile for the same reason), navigates to `probe.url` **under the
    same exact-origin navigation guard as a jar-loaded session** — an off-scope redirect (a stale or
    compromised probe endpoint 302-ing to `evil.example.com` to harvest a `Domain=.example.com`
    cookie) is aborted before any request carries jar credentials off-scope — applies the success
@@ -657,9 +687,13 @@ a "please re-login" task) — browser-server never probes on its own initiative.
   `jar_registrable_domains` **and the effective `allow_exec`/`confine_navigation` flags**; a separate
   `produced_jar_ids: set[str]` provenance field (for a session that *saved* one or more jars); and an
   **`owner_subject`** field set from `AuthContext.subject` when a human-owned session is created
-  (there is otherwise no OIDC bearer on the control-token `save-jar` call, so the jar's
-  `owner_subject` is copied from the session — without this, OIDC human/agent-after-handoff saves
-  would land `owner_subject = None` and the subject-scoped `/jars` UI could not list/delete them). New
+  **and captured on the handoff-claim path** (`/v1/sessions/{id}/claim` / the handoff page is
+  token-authorized, so the claiming human's OIDC subject must be recorded onto the session at claim
+  time — otherwise an agent→human handoff where the human claims, saves during control, or hands back
+  for an agent save leaves the session subject-less and its jar invisible in the subject-scoped
+  `/jars` UI). There is no OIDC bearer on the control-token `save-jar` call, so the jar's
+  `owner_subject` is copied from the session; without capture at both create and claim, saves would
+  land `owner_subject = None`. New
   jar request/response models (the save request carries `nav_allowlist`/`storage`/`probe`). **The
   confinement guard is pre-request and covers every top-level document in the context**, not just the
   first navigation the agent asks for: it intercepts via Playwright routing so an **off-scope
@@ -758,6 +792,15 @@ companion doc).
 - Fresh nonce: two saves of the same jar use different nonces (no GCM nonce reuse).
 - Invalidation tamper: clearing `invalidated_at` in the file without the key does not make the jar
   loadable (re-seal/authenticated-revocation check fails closed).
+- Revocation rollback: restoring an older pre-invalidation jar file does not un-revoke it (load/probe
+  consult the append-only tombstone and fail closed).
+- jar_id path traversal: a `jar_id` like `../../etc/x` on refresh/get/delete/probe/create is rejected
+  (validated against `jar_[0-9a-f]{32}`) and touches no file outside `BROWSER_JAR_DIR`.
+- Ownerless-jar refresh: a jar with `owner_subject = None` is not refreshable by a non-service caller
+  controlling another ownerless session (no `None == None` ownership).
+- Agent selector: an agent-supplied selector present on the logged-out baseline is rejected/`uncertain`,
+  not accepted as proof of freshness.
+- Probe profile: a desktop-saved jar is probed/verified under its recorded form factor, not mobile.
 - sessionStorage limitation: a jar whose login lives only in `sessionStorage` fails its save-time
   verification probe (surfaced uncertain/failed), not stored as healthy.
 - Agent probe target: an agent save cannot store an arbitrary `probe.url` (e.g. `/logout`); its probe
