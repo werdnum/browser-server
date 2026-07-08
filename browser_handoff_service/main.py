@@ -21,15 +21,25 @@ from jinja2 import Environment, StrictUndefined, select_autoescape
 from pydantic import HttpUrl, TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .jars import (
+    JarDecryptError,
+    JarDisabledError,
+    JarError,
+    JarNotFoundError,
+    JarRevokedError,
+    JarValidationError,
+)
 from .models import (
     AgentCommandRequest,
     ClaimRequest,
+    CookieJarMeta,
     CreateSessionRequest,
     ExtendRequest,
     HandoffRequest,
     HandoffResponse,
     HandoverRequest,
     HumanActionRequest,
+    SaveJarRequest,
     SessionState,
     form_factor_profile,
 )
@@ -188,6 +198,7 @@ LANDING_PAGE_TEMPLATE = templates.from_string(
       </div>
       <nav class="actions">
         <a class="btn" href="{{ base_path }}/sessions">View Sessions</a>
+        <a class="btn" href="{{ base_path }}/jars">Saved logins</a>
         <a class="btn" href="{{ base_path }}/docs">API Docs</a>
         <a class="btn" href="{{ base_path }}/health">Health Status</a>
       </nav>
@@ -272,6 +283,77 @@ SESSION_LIST_TEMPLATE = templates.from_string(
 </html>"""
 )
 
+JARS_PAGE_TEMPLATE = templates.from_string(
+    _html_head(
+        "Saved logins - Browser Handoff Service",
+        extra_css="""
+    .jar-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: .6rem; }
+    .jar-list li {
+      display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      box-shadow: var(--shadow); padding: .85rem 1rem;
+    }
+    .jar-meta { min-width: 0; }
+    .jar-label { font-weight: 600; word-break: break-word; }
+    .jar-origins { font-size: .82rem; color: var(--muted); word-break: break-all; }
+""",
+    )
+    + """<body data-base-path="{{ base_path }}">
+  <div class="wrap">
+    """
+    + _BRAND
+    + """
+    <nav class="crumbs"><a href="/">Home</a><span class="sep">›</span><span>Saved logins</span></nav>
+    <main>
+      <h1>Saved logins</h1>
+      <p class="lead">Logins you have saved for the assistant. Deleting one is a real-time kill switch: it forgets the stored session and closes any live browser using it.</p>
+      {% if jars %}
+        <ul class="jar-list">
+          {% for j in jars %}
+            <li data-jar-id="{{ j.jar_id }}">
+              <span class="jar-meta">
+                <span class="jar-label">{{ j.label }}</span><br />
+                <span class="jar-origins">{{ j.origins | join(", ") }}</span>
+                <span class="badge">{{ j.last_probe_result or "not probed" }}</span>
+                {% if j.invalidated_at %}<span class="badge">needs re-login</span>{% endif %}
+              </span>
+              <button class="btn btn-danger jar-delete" type="button">Forget</button>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="card"><p class="empty muted" style="margin:0">No saved logins.</p></div>
+      {% endif %}
+      <p id="jars-error" class="muted" role="alert"></p>
+    </main>
+  </div>
+  <script>
+    const basePath = document.body.dataset.basePath || "";
+    document.addEventListener("click", async (event) => {
+      const btn = event.target.closest(".jar-delete");
+      if (!btn) return;
+      const li = btn.closest("li");
+      const jarId = li && li.dataset.jarId;
+      if (!jarId) return;
+      btn.disabled = true;
+      const res = await fetch(`${basePath}/v1/jars/${encodeURIComponent(jarId)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      if (res.ok) {
+        li.remove();
+      } else {
+        btn.disabled = false;
+        let detail = "Could not forget this login.";
+        try { detail = (await res.json()).detail || detail; } catch {}
+        document.querySelector("#jars-error").textContent = detail;
+      }
+    });
+  </script>
+</body>
+</html>"""
+)
+
 SESSION_DETAIL_TEMPLATE = templates.from_string(
     _html_head(
         "Browser handoff {{ session.session_id }}",
@@ -344,6 +426,14 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           <div class="actions">
             <button id="handover" class="btn btn-primary">Hand over to agent</button>
           </div>
+        </div>
+        <div class="field">
+          <label for="save-jar-label">Save this login for the assistant</label>
+          <input id="save-jar-label" type="text" placeholder="Name this login, e.g. Woolworths (me)" />
+          <div class="actions">
+            <button id="save-jar" class="btn">Save this login</button>
+          </div>
+          <p id="save-jar-status" class="muted" role="status" aria-live="polite"></p>
         </div>
         <div class="actions">
           <button id="complete" class="btn">Complete</button>
@@ -492,6 +582,15 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
         + JSON.stringify({token: result.handover_token});
       document.querySelector("#handover-result").hidden = false;
     });
+    document.querySelector("#save-jar").onclick = action(async () => {
+      const status = document.querySelector("#save-jar-status");
+      const label = (document.querySelector("#save-jar-label").value || "").trim() || "Saved login";
+      status.textContent = "Saving this login…";
+      // origins omitted => the server captures the current origin under the control token;
+      // an empty probe is a signal-less probe (surfaced as "uncertain", never a fake "fresh").
+      const result = await post(`/v1/sessions/${sid}/save-jar`, {token, label, probe: {}});
+      status.textContent = `Saved as “${result.label}”. Manage saved logins on the Saved logins page.`;
+    });
     document.querySelector("#complete").onclick = action(() => post(`/v1/sessions/${sid}/complete`, {token, outcome: "done"}));
     document.querySelector("#cancel").onclick = action(() => post(`/v1/sessions/${sid}/cancel`, {token, outcome: "cancelled"}));
     const initialState = document.querySelector("#state").textContent.trim();
@@ -562,7 +661,7 @@ def _renders_html_page(request: Request) -> bool:
     health checks, proxied assets) keeps returning JSON.
     """
     path = request.url.path
-    return path == "/" or path == "/sessions" or path.startswith("/sessions/")
+    return path in ("/", "/sessions", "/jars") or path.startswith("/sessions/")
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -658,6 +757,17 @@ def map_errors(exc: Exception) -> HTTPException:
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, SessionInactiveError):
         return HTTPException(status_code=410, detail=str(exc))
+    # Cookie-jar failures. Order matters: subclasses before the JarError base.
+    if isinstance(exc, JarDisabledError):
+        return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, JarNotFoundError):
+        return HTTPException(status_code=404, detail="unknown jar")
+    if isinstance(exc, JarValidationError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, (JarRevokedError, JarDecryptError)):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, JarError):
+        return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, (ConflictError, TransitionError)):
         return HTTPException(status_code=409, detail=str(exc))
     # Unclassified failures collapse into an opaque 500 whose only detail is
@@ -752,10 +862,20 @@ async def create_session(
         if "initial_owner" in req.model_fields_set and req.initial_owner != "human":
             raise HTTPException(status_code=403, detail="OIDC users can only start human-owned sessions")
         req = req.model_copy(update={"initial_owner": "human"})
+    # Jar loads are the FA (service-token) path only. A direct OIDC human create must not be
+    # able to seed a human-owned context with any saved jar and bypass FA's load-authorization
+    # gate, so jar_id is rejected for OIDC callers.
+    if req.jar_id is not None and auth.actor_type != "agent":
+        raise HTTPException(status_code=403, detail="loading a saved session requires the service token")
     # Resolve (and validate) the public base URL before launching a browser, so a
     # misconfigured BROWSER_HANDOFF_PUBLIC_URL fails fast instead of leaking a started session.
     base_url = public_base_url(request).rstrip("/")
-    session, control_token = await registry.create_session(req)
+    try:
+        session, control_token = await registry.create_session(req, owner_subject=auth.subject)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise map_errors(exc) from exc
     if session.state == SessionState.FAILED:
         raise HTTPException(status_code=503, detail="browser runtime unavailable")
     if control_token is None:
@@ -809,6 +929,90 @@ async def close(session_id: str):
         raise map_errors(exc) from exc
 
 
+@app.post("/v1/sessions/{session_id}/save-jar", response_model=CookieJarMeta)
+async def save_jar(session_id: str, req: SaveJarRequest, authorization: str | None = Header(default=None)):
+    # Two auth paths. A human save carries the control token in the body (no service/OIDC
+    # header needed — the control token is the human authorization primitive). An agent save
+    # carries no control token and must present the service token.
+    if req.token:
+        actor = "human"
+    else:
+        require_agent_auth(authorization)
+        actor = "agent"
+    try:
+        return await registry.save_jar(session_id, req, actor=actor)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.get("/v1/jars", response_model=list[CookieJarMeta])
+async def list_jars(auth: Annotated[AuthContext, Depends(require_service_auth)]):
+    # Subject-scoped: the service token lists all jars; an OIDC human lists only their own.
+    try:
+        metas = registry.list_jars()
+    except Exception as exc:
+        raise map_errors(exc) from exc
+    if auth.actor_type == "agent":
+        return metas
+    subject = auth.subject
+    return [
+        meta
+        for meta in metas
+        if subject is not None and meta.owner_subject == subject and registry.jar_store.verify_owner(meta, meta.jar_id)
+    ]
+
+
+def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
+    """Return the (envelope-verified) jar meta if the caller may manage it, else 403/404/503.
+
+    Ownership is checked against *authenticated* metadata: get_jar verifies the AEAD envelope,
+    so editing cleartext owner_subject in a file without the key cannot transfer management
+    rights. A non-null subject is required — None == None is not ownership."""
+    try:
+        meta = registry.get_jar(jar_id)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+    if auth.actor_type == "agent":
+        return meta
+    if auth.subject is None or meta.owner_subject is None or meta.owner_subject != auth.subject:
+        raise HTTPException(status_code=403, detail="not authorized to manage this jar")
+    return meta
+
+
+@app.get("/v1/jars/{jar_id}", response_model=CookieJarMeta)
+async def get_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
+    return _authorize_jar_management(auth, jar_id)
+
+
+@app.delete("/v1/jars/{jar_id}", response_model=CookieJarMeta)
+async def delete_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
+    _authorize_jar_management(auth, jar_id)
+    try:
+        return await registry.delete_jar(jar_id)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/jars/{jar_id}/invalidate", response_model=CookieJarMeta)
+async def invalidate_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
+    _authorize_jar_management(auth, jar_id)
+    try:
+        return await registry.invalidate_jar(jar_id)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/jars/{jar_id}/probe")
+async def probe_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
+    _authorize_jar_management(auth, jar_id)
+    try:
+        return await registry.probe_jar(jar_id)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
 @app.get("/v1/sessions/{session_id}/events", dependencies=[Depends(require_agent_auth)])
 async def events(session_id: str):
     try:
@@ -829,14 +1033,30 @@ async def events(session_id: str):
 
 
 @app.post("/v1/sessions/{session_id}/claim")
-async def claim(session_id: str, req: ClaimRequest):
+async def claim(session_id: str, req: ClaimRequest, authorization: str | None = Header(default=None)):
+    # The claim itself is authorized by the one-time handoff token, but if the claiming human
+    # also arrives with a valid OIDC bearer (via the gateway) capture their subject onto the
+    # session so a later control-token save-jar records a non-null owner_subject.
+    owner_subject = _best_effort_subject(authorization)
     try:
-        session, control_token = await registry.claim(session_id, req.token)
+        session, control_token = await registry.claim(session_id, req.token, owner_subject=owner_subject)
         response = session.model_dump(mode="json")
         response["control_token"] = control_token
         return response
     except Exception as exc:
         raise map_errors(exc) from exc
+
+
+def _best_effort_subject(authorization: str | None) -> str | None:
+    """Resolve an OIDC subject from an Authorization header without failing the request when it
+    is absent or is the opaque service token."""
+    if not authorization:
+        return None
+    try:
+        auth = require_service_auth(authorization)
+    except HTTPException:
+        return None
+    return auth.subject if auth.actor_type == "human" else None
 
 
 @app.post("/v1/sessions/{session_id}/complete")
@@ -990,6 +1210,26 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
 @app.get("/sessions", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])
 async def session_list():
     return SESSION_LIST_TEMPLATE.render(sessions=registry.list_sessions())
+
+
+@app.get("/jars", response_class=HTMLResponse)
+async def jars_page(request: Request, auth: Annotated[AuthContext, Depends(require_service_auth)]):
+    # OIDC humans see only their own saved logins; the service token sees all. Rendered
+    # server-side from the same subject-scoped view the API enforces.
+    try:
+        metas = registry.list_jars()
+    except Exception as exc:
+        raise map_errors(exc) from exc
+    if auth.actor_type == "human":
+        subject = auth.subject
+        metas = [
+            meta
+            for meta in metas
+            if subject is not None
+            and meta.owner_subject == subject
+            and registry.jar_store.verify_owner(meta, meta.jar_id)
+        ]
+    return JARS_PAGE_TEMPLATE.render(jars=metas, base_path=_public_base_path(request))
 
 
 @app.get("/sessions/{session_id}", response_class=HTMLResponse)

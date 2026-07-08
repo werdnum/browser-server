@@ -4,7 +4,12 @@ import os
 import pytest
 from browser_handoff_service.main import app, registry
 from browser_handoff_service.models import AgentCommandRequest
-from browser_handoff_service.runtime import PlaywrightBrowserWorker, RuntimeUnavailable, remote_display_status
+from browser_handoff_service.runtime import (
+    PlaywrightBrowserWorker,
+    RuntimeUnavailable,
+    StorageTooLarge,
+    remote_display_status,
+)
 from httpx import ASGITransport, AsyncClient
 
 TEST_SERVICE_TOKEN = "test-service-token"
@@ -44,6 +49,50 @@ async def test_real_local_chromium_runtime_smoke(monkeypatch):
 
         executed = await worker.command(AgentCommandRequest(type="exec", args={"code": "document.title"}))
         assert executed["result"] == "fixture"
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_jar_seed_export_and_confinement(monkeypatch):
+    """Exercise the real Playwright explicit-context path the fake runtime can't: seed a
+    storage_state at context creation, export it back out, and confine navigation. No network
+    is needed — the seeded cookie is accepted at context creation and confinement aborts an
+    off-scope navigation pre-request."""
+    monkeypatch.delenv("BROWSER_RUNTIME", raising=False)
+    seed = {
+        "cookies": [
+            {
+                "name": "sid",
+                "value": "SEEDEDSESSIONVALUE",
+                "domain": "allowed.example",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ],
+        "origins": [],
+    }
+    worker = PlaywrightBrowserWorker("worker_jar_real", storage_state=seed, confine_origins=["https://allowed.example"])
+    try:
+        await worker.start()
+    except RuntimeUnavailable as exc:
+        pytest.skip(f"real local Chromium unavailable on this host: {exc}")
+    try:
+        # The seeded cookie survives a real new_context + storage_state export round-trip.
+        state = await worker.export_storage_state(5 * 1024 * 1024)
+        assert "cookies" in state and "origins" in state
+        assert any(c["name"] == "sid" and c["value"] == "SEEDEDSESSIONVALUE" for c in state["cookies"])
+
+        # A tiny budget makes the bounded export raise rather than materialize.
+        with pytest.raises(StorageTooLarge):
+            await worker.export_storage_state(1)
+
+        # Confinement aborts an off-scope top-level navigation before any request is sent.
+        blocked = await worker.command(AgentCommandRequest(type="navigate", args={"url": "https://blocked.example/"}))
+        assert blocked.get("blocked") is True
     finally:
         await worker.close()
 

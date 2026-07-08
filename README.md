@@ -22,6 +22,8 @@ Implemented:
 - Minimal human UI at `/sessions/{session_id}`.
 - SSE lifecycle event stream.
 - Agent-side smoke client in `scripts/agent_client_smoke.py`.
+- Cookie jars: opt-in, encrypted, scope-filtered persistence of authenticated browser state
+  (see "Cookie jars" below).
 - Python and Playwright e2e tests.
 
 ## Session flows
@@ -50,6 +52,45 @@ The service supports handing control of a single browser session in either direc
   The agent — using its existing service credentials — takes over with
   `POST /v1/sessions/{id}/agent-claim` and the `handover_token`, which transitions the session
   to `agent_active` and lets the agent resume with agent commands. Unclaimed handovers expire.
+
+## Cookie jars (persistent authenticated browser state)
+
+A **cookie jar** is a named, durable, encrypted blob of Playwright `storage_state` (cookies +
+localStorage + IndexedDB), scope-filtered to a declared set of origins, captured from a session
+after a human logs in, and loadable into a fresh session's browser context at creation time. The
+canonical flow: a human logs into a site, clicks "Save this login", and the agent picks the
+session up later in a fresh session with no one re-entering credentials. This is the single,
+opt-in exception to the "never store cookies" rule; jars never persist typed credentials, only
+the session artifacts a site grants after login. Full design in `cookie-jar-design.md`.
+
+browser-server provides *mechanism*; policy (confirmation gating, profile placement, taint) lives
+in the Family Assistant client. Mechanism enforced here:
+
+- Jar contents (cookie/storage names and values) are never returned by any endpoint, event, or
+  log — metadata only.
+- Jars are encrypted at rest with AES-256-GCM under an operator key; security-critical metadata is
+  bound as AAD, and revocation is rollback-proof via a generation-versioned tombstone.
+- Loads happen only at `create_session` and only via the service token, so a session's
+  authenticated scope (`jar_origins`/`jar_nav_allowlist`) is immutable and truthfully reported.
+- `exec` is denied by default in jar-loaded sessions (opt in with `allow_exec: true`), and
+  navigation is confined to the jar's exact origins (`confine_navigation`, default on).
+- Save-time scope filtering (default: the session's current origin) keeps IdP/SSO cookies out.
+
+Endpoints: `POST /v1/sessions/{id}/save-jar`, `GET /v1/jars`, `GET`/`DELETE /v1/jars/{id}`,
+`POST /v1/jars/{id}/invalidate`, `POST /v1/jars/{id}/probe`, and `jar_id`/`allow_exec`/
+`confine_navigation` on `create_session`. A minimal OIDC `/jars` page lets a household audit and
+forget saved logins.
+
+The feature fails closed: with no key configured every jar endpoint returns 503 and
+`create_session` rejects `jar_id`. Configure it with:
+
+```bash
+# 32-byte urlsafe-base64 AES-256 key (comma-separated list rotates: new key first for writes).
+export BROWSER_JAR_KEY="$(python -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+export BROWSER_JAR_DIR="/var/lib/browser-handoff/jars"   # optional; default shown
+export BROWSER_JAR_MAX_BYTES="5242880"                    # optional; per-jar export cap
+export BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION="0"         # optional; gate human saves behind FA
+```
 
 ## Setup
 

@@ -105,6 +105,13 @@ class CreateSessionRequest(BaseModel):
     # an explicit "mobile"/"desktop" always wins.
     form_factor: RequestedFormFactor = "auto"
     client_viewport: ClientViewport | None = None
+    # Cookie-jar load (service-token-only; rejected for direct OIDC humans). When set,
+    # the worker context is seeded from the jar at creation, exec is default-denied, and
+    # navigation is confined to the jar's origins unless the caller opts out.
+    jar_id: str | None = None
+    allow_exec: bool = False
+    # None => default (confine when a jar is loaded); an explicit bool always wins.
+    confine_navigation: bool | None = None
 
     def resolved_form_factor(self) -> FormFactorName:
         if self.form_factor != "auto":
@@ -183,6 +190,23 @@ class BrowserSession(BaseModel):
     allowed_resume: str = "never"
     handoff_note: str = ""
     sensitive_since: datetime | None = None
+    # OIDC subject that owns a human-controlled session. Set when a human-owned session
+    # is created and captured on the handoff-claim path so a later human save-jar can
+    # record a non-null owner_subject (there is no OIDC bearer on the control-token call).
+    owner_subject: str | None = None
+    # Cookie-jar provenance and authenticated scope. jar_* fields are set only for a
+    # jar-*loaded* session (its authentication scope is immutable for its whole lifetime);
+    # produced_jar_ids tracks jars this session *saved* (a source session holds the full,
+    # unfiltered login state and is deliberately NOT tagged with the jar's narrow scope).
+    jar_id: str | None = None
+    jar_origins: list[str] | None = None
+    jar_nav_allowlist: list[str] | None = None
+    jar_registrable_domains: list[str] | None = None
+    # Effective safety flags persisted at create time so later commands and policy readers
+    # (which only see the session record) can tell an opt-in apart from the default.
+    allow_exec: bool = False
+    confine_navigation: bool = False
+    produced_jar_ids: set[str] = Field(default_factory=set)
     created_at: datetime
     updated_at: datetime
     idle_expires_at: datetime
@@ -212,6 +236,85 @@ class AgentCommandResponse(BaseModel):
     command_id: str
     ok: bool
     result: dict[str, Any] = Field(default_factory=dict)
+
+
+StorageMode = Literal["all", "cookies_only"]
+ProbeResultName = Literal["fresh", "stale", "uncertain", "error"]
+
+
+class JarProbeConfig(BaseModel):
+    """Freshness-probe config. Stored *inside* the encrypted blob, never in listable metadata:
+    the selector can carry user-/page-influenced text and the urls are sensitive."""
+
+    # scheme+host+port+path only (query/fragment/userinfo stripped on save).
+    url: str
+    # A signal-less probe (both None) is allowed and always resolves to "uncertain".
+    logged_in_selector: str | None = None
+    logged_out_url_prefix: str | None = None
+
+
+class CookieJarMeta(BaseModel):
+    """Cleartext, listable jar metadata: counts and aggregates only — no cookie/storage
+    names or values, and no probe internals."""
+
+    jar_id: str
+    label: str
+    origins: list[str]
+    nav_allowlist: list[str] = Field(default_factory=list)
+    registrable_domains: list[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    last_loaded_at: datetime | None = None
+    version: int = 1
+    # Monotonic; bound in the authenticated envelope. A revocation tombstone rejects any
+    # load/probe whose generation is <= the tombstoned generation (rollback-proof kill-switch).
+    generation: int = 1
+    saved_by: Literal["agent", "human"]
+    owner_subject: str | None = None
+    form_factor: str = DEFAULT_FORM_FACTOR
+    storage_mode: StorageMode = "all"
+    created_session_id: str
+    conversation_id: str
+    cookie_count: int = 0
+    origin_storage_count: int = 0
+    earliest_cookie_expiry: datetime | None = None
+    session_cookies_only: bool = False
+    contains_session_cookies: bool = False
+    has_probe: bool = True
+    last_probe_at: datetime | None = None
+    last_probe_result: ProbeResultName | None = None
+    invalidated_at: datetime | None = None
+
+
+class ProbeSpec(BaseModel):
+    """Caller-supplied probe on a save request. ``url`` is optional: for an agent save the
+    server derives a stable landing page (the agent may only supply the selector)."""
+
+    url: str | None = None
+    logged_in_selector: str | None = None
+    logged_out_url_prefix: str | None = None
+
+
+class SaveJarRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=500)
+    # None => create a new jar; a jar_id refreshes that jar in place (version/generation bump).
+    jar_id: str | None = None
+    origins: list[str] | None = None
+    nav_allowlist: list[str] | None = None
+    storage: StorageMode | None = None
+    # A probe is required on every save (create and refresh); the server can always derive a
+    # default (selector on a stable page), so this is "server default is producible", not
+    # "caller must know CSS".
+    probe: ProbeSpec
+    # Human control token (human-save path); absent for an agent (service-auth) save.
+    token: str | None = None
+    # Optional FA-issued save-authorization, required only when the operator enables the gate.
+    save_authorization: str | None = None
+
+
+class ProbeResult(BaseModel):
+    result: ProbeResultName
+    final_origin: str | None = None
 
 
 def new_session(req: CreateSessionRequest) -> BrowserSession:

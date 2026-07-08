@@ -28,6 +28,25 @@ class RuntimeUnavailable(RuntimeError):
     pass
 
 
+class StorageTooLarge(RuntimeError):
+    """A jar export exceeded its byte budget. Raised by the worker so the oversized
+    ``storage_state`` is never fully held in the service (memory/disk DoS backstop)."""
+
+
+def origin_of(url: str | None) -> str | None:
+    """Exact web origin (scheme + host + port) of a URL, or None."""
+    if not url:
+        return None
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return f"{parsed.scheme}://{netloc}"
+
+
 # In-page DOM walker. Tags interactive/labeled elements with a stable
 # ``data-fa-ref`` attribute and returns a nested accessibility tree. The shape
 # matches the ``Snapshot`` contract consumed by the Family Assistant browser
@@ -180,10 +199,18 @@ class BrowserRuntime(Protocol):
     async def start(self) -> None: ...
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]: ...
     async def close(self) -> None: ...
+    async def export_storage_state(self, max_bytes: int) -> dict[str, Any]: ...
+    async def selector_present(self, selector: str) -> bool: ...
 
 
 class FakeBrowserWorker:
-    def __init__(self, worker_id: str) -> None:
+    def __init__(
+        self,
+        worker_id: str,
+        *,
+        storage_state: dict[str, Any] | None = None,
+        confine_origins: list[str] | None = None,
+    ) -> None:
         self.worker_id = worker_id
         self.closed = False
         self.remote_url: str | None = None
@@ -194,6 +221,18 @@ class FakeBrowserWorker:
         # so tests can simulate a merchant advertising shopping support.
         self.ucp_documents: dict[str, Any] = {}
         self._ucp = UCPDetector(self._ucp_fetch)
+        # Cookie-jar test fixtures. ``storage_state`` is what an export returns (settable so a
+        # test can simulate a login accumulating state); ``confine_origins`` mirrors a
+        # jar-loaded context's navigation confinement; ``present_selectors`` are the selectors
+        # querySelector "finds" (drives probe classification); ``redirect_map`` simulates an
+        # expired session bouncing to a login origin.
+        self.storage_state: dict[str, Any] = (
+            storage_state if storage_state is not None else {"cookies": [], "origins": []}
+        )
+        self.confine_origins = [o for o in (confine_origins or [])]
+        self.present_selectors: set[str] = set()
+        self.redirect_map: dict[str, str] = {}
+        self.last_blocked: dict[str, Any] | None = None
 
     async def _ucp_fetch(self, url: str) -> Any:
         return self.ucp_documents.get(url)
@@ -201,14 +240,43 @@ class FakeBrowserWorker:
     async def start(self) -> None:
         return None
 
+    async def export_storage_state(self, max_bytes: int) -> dict[str, Any]:
+        if len(json.dumps(self.storage_state).encode("utf-8")) > max_bytes:
+            raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
+        return self.storage_state
+
+    async def selector_present(self, selector: str) -> bool:
+        return selector in self.present_selectors
+
+    def _off_scope(self, url: str) -> bool:
+        if not self.confine_origins:
+            return False
+        return origin_of(url) not in set(self.confine_origins)
+
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed:
             raise RuntimeError("worker is closed")
         if request.type == "navigate":
             url = str(request.args["url"])
-            self.url = url
-            self.title = f"Fixture page at {redact_url(url)[1] or url}"
-            return {"url": redact_url(url)[0], "title": self.title}
+            # A configured redirect models an expired session bouncing to login/IdP.
+            target = self.redirect_map.get(url, url)
+            if self._off_scope(target):
+                # Confinement aborts the off-scope document request pre-request; surface it as
+                # a structured block rather than following it.
+                self.last_blocked = {
+                    "blocked": True,
+                    "reason": "off-scope navigation blocked",
+                    "target_origin": origin_of(target),
+                }
+                return {
+                    "blocked": True,
+                    "reason": "off-scope navigation blocked",
+                    "url": redact_url(self.url)[0] if self.url else None,
+                    "target_origin": origin_of(target),
+                }
+            self.url = target
+            self.title = f"Fixture page at {redact_url(target)[1] or target}"
+            return {"url": redact_url(target)[0], "title": self.title}
         if request.type in {"click", "type_text", "select", "press_key"}:
             self.actions.append({"type": request.type, "args": request.args})
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
@@ -279,6 +347,8 @@ class PlaywrightBrowserWorker:
         width: int = DEFAULT_DISPLAY_WIDTH,
         height: int = DEFAULT_DISPLAY_HEIGHT,
         user_agent: str | None = None,
+        storage_state: dict[str, Any] | None = None,
+        confine_origins: list[str] | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
@@ -286,8 +356,13 @@ class PlaywrightBrowserWorker:
         self.width = width
         self.height = height
         self.user_agent = user_agent
+        # Cookie-jar load/confinement. ``storage_state`` seeds the context at creation;
+        # ``confine_origins`` (exact scheme+host+port) restricts every top-level document.
+        self._storage_state = storage_state
+        self.confine_origins = [o for o in (confine_origins or [])]
         self._playwright = None
         self._browser = None
+        self._context = None
         self._page = None
         self.remote_url: str | None = None
         self._display: LocalNovncDisplay | None = None
@@ -355,30 +430,94 @@ class PlaywrightBrowserWorker:
                 env=env,
                 executable_path=executable_path,
             )
-            page_kwargs: dict[str, Any] = {"viewport": {"width": self.width, "height": self.height}}
+            # Explicit context (rather than browser.new_page) so a jar's storage_state can be
+            # seeded at creation and exported back out with context.storage_state(indexed_db=True).
+            context_kwargs: dict[str, Any] = {"viewport": {"width": self.width, "height": self.height}}
             if self.user_agent:
                 # A mobile UA plus touch makes sites render their mobile layout.
-                page_kwargs["user_agent"] = self.user_agent
-                page_kwargs["is_mobile"] = True
-                page_kwargs["has_touch"] = True
+                context_kwargs["user_agent"] = self.user_agent
+                context_kwargs["is_mobile"] = True
+                context_kwargs["has_touch"] = True
             else:
                 # Use a realistic desktop Chrome UA to avoid bot detection.
-                page_kwargs["user_agent"] = (
+                context_kwargs["user_agent"] = (
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 )
-            self._page = await self._browser.new_page(**page_kwargs)
+            if self._storage_state is not None:
+                context_kwargs["storage_state"] = self._storage_state
+            if self.confine_origins:
+                # A Service Worker can serve document/form requests that context.route() never
+                # sees, routing around the guard — so block SWs in confined contexts.
+                context_kwargs["service_workers"] = "block"
+            self._context = await self._browser.new_context(**context_kwargs)
+            if self.confine_origins:
+                await self._install_confinement(self._context)
+            self._page = await self._context.new_page()
         except Exception as exc:
             await self.close()
             raise RuntimeUnavailable(str(exc)) from exc
+
+    async def _install_confinement(self, context: Any) -> None:
+        """Confine top-level documents in *every* frame (main, child, popup) to the jar's exact
+        origins via pre-request route interception, so an off-scope navigation/redirect is
+        aborted before any request can carry a Domain=.example.com cookie off-scope."""
+        allowed = set(self.confine_origins)
+
+        async def route_handler(route: Any) -> None:
+            request = route.request
+            try:
+                is_document = request.resource_type == "document"
+                is_nav = request.is_navigation_request()
+            except Exception:
+                is_document = is_nav = False
+            if is_document and is_nav and origin_of(request.url) not in allowed:
+                await route.abort()
+                return
+            await route.continue_()
+
+        await context.route("**/*", route_handler)
+
+        def on_page(page: Any) -> None:
+            # A popup / window.open / target=_blank new top-level document off-scope is closed,
+            # not left as a hole around main-frame confinement.
+            try:
+                if page.url and page.url != "about:blank" and origin_of(page.url) not in allowed:
+                    asyncio.create_task(page.close())
+            except Exception:
+                pass
+
+        context.on("page", on_page)
 
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed or self._page is None:
             raise RuntimeError("worker is closed")
         page = self._page
         if request.type == "navigate":
+            from rebrowser_playwright.async_api import Error as PlaywrightError
+
             url = str(request.args["url"])
-            await page.goto(url, wait_until="domcontentloaded")
+            if self.confine_origins and origin_of(url) not in set(self.confine_origins):
+                # Fail fast before issuing a request the route guard would abort anyway.
+                return {
+                    "blocked": True,
+                    "reason": "off-scope navigation blocked",
+                    "url": redact_url(page.url)[0],
+                    "target_origin": origin_of(url),
+                }
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+            except PlaywrightError as exc:
+                # A confined off-scope redirect is aborted pre-request, which surfaces as a
+                # navigation error; report it structurally rather than as an opaque 500.
+                if self.confine_origins and ("aborted" in str(exc).lower() or "net::err_" in str(exc).lower()):
+                    return {
+                        "blocked": True,
+                        "reason": "off-scope navigation blocked",
+                        "url": redact_url(page.url)[0],
+                        "target_origin": origin_of(page.url),
+                    }
+                raise
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
         if request.type == "click":
@@ -475,6 +614,33 @@ class PlaywrightBrowserWorker:
             return {"closed": True, "url": None, "title": "Blank"}
         raise ValueError(f"unsupported command {request.type}")
 
+    async def export_storage_state(self, max_bytes: int) -> dict[str, Any]:
+        """Export the context's storage_state (cookies + localStorage + IndexedDB).
+
+        ``indexed_db=True`` is required — a bare storage_state() drops IndexedDB, silently
+        producing jars that reload logged-out for the growing set of sites that keep their
+        auth token there. The result is size-checked so an attacker-inflated store is rejected
+        rather than persisted (V1 materializes then checks; a source-side incremental bound is
+        the documented follow-up)."""
+        if self._context is None:
+            raise RuntimeError("worker is closed")
+        try:
+            state = await self._context.storage_state(indexed_db=True)
+        except TypeError:
+            # Older Playwright without the indexed_db kwarg: fall back to cookies + localStorage.
+            state = await self._context.storage_state()
+        if len(json.dumps(state).encode("utf-8")) > max_bytes:
+            raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
+        return dict(state)
+
+    async def selector_present(self, selector: str) -> bool:
+        if self._page is None:
+            raise RuntimeError("worker is closed")
+        try:
+            return await self._page.evaluate("(sel) => document.querySelector(sel) !== null", selector)
+        except Exception:
+            return False
+
     async def _current_page_result(self, result: dict[str, Any]) -> dict[str, Any]:
         if self._page is None:
             raise RuntimeError("worker is closed")
@@ -521,6 +687,12 @@ class PlaywrightBrowserWorker:
 
     async def close(self) -> None:
         self.closed = True
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
         if self._browser is not None:
             await self._browser.close()
             self._browser = None
@@ -671,16 +843,20 @@ def make_worker(
     width: int = DEFAULT_DISPLAY_WIDTH,
     height: int = DEFAULT_DISPLAY_HEIGHT,
     user_agent: str | None = None,
+    storage_state: dict[str, Any] | None = None,
+    confine_origins: list[str] | None = None,
 ) -> BrowserRuntime:
     runtime = os.environ.get("BROWSER_RUNTIME", "playwright").lower()
     if runtime == "fake":
-        return FakeBrowserWorker(worker_id)
+        return FakeBrowserWorker(worker_id, storage_state=storage_state, confine_origins=confine_origins)
     return PlaywrightBrowserWorker(
         worker_id,
         headed=os.environ.get("BROWSER_HEADED") == "1",
         width=width,
         height=height,
         user_agent=user_agent,
+        storage_state=storage_state,
+        confine_origins=confine_origins,
     )
 
 
