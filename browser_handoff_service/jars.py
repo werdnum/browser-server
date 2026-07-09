@@ -787,6 +787,11 @@ class JarStore:
                 plaintext = AESGCM(key).decrypt(nonce, ct, aad)
             except InvalidTag:
                 continue
+            except ValueError as exc:
+                # A base64-valid but wrong-length nonce/ciphertext makes AESGCM raise ValueError (not
+                # InvalidTag). Treat it as corruption so it fails closed as a JarError rather than a
+                # 500 that would block the service-token delete/invalidate kill-switch.
+                raise JarDecryptError("jar envelope is malformed (bad nonce/blob length)", kind="corruption") from exc
             try:
                 return json.loads(plaintext)
             except ValueError as exc:
@@ -819,11 +824,20 @@ class JarStore:
         probe: JarProbeConfig,
         *,
         before_rename: Callable[[], None] | None = None,
+        enforce_max: bool = False,
     ) -> None:
         payload = {"storage_state": storage_state, "probe": probe.model_dump()}
         sealed = self._encrypt(meta, payload)
         record = {"meta": meta.model_dump(mode="json"), **sealed}
-        _atomic_write(self._path(meta.jar_id), json.dumps(record).encode("utf-8"), before_rename=before_rename)
+        data = json.dumps(record).encode("utf-8")
+        # On a save/refresh, cap the ACTUAL serialized file — full cleartext metadata plus the
+        # base64 (~+33%) ciphertext — not a plaintext estimate, so what lands on the volume is what
+        # was bounded. Checked before the rename so an over-cap record never publishes (and, on a
+        # refresh, never tombstones the old generation). Re-seals (record_probe/invalidate) skip it:
+        # the jar was already bounded at save and only gains a few freshness bytes.
+        if enforce_max and len(data) > self.max_bytes:
+            raise JarValidationError(f"sealed jar record exceeds the {self.max_bytes}-byte limit")
+        _atomic_write(self._path(meta.jar_id), data, before_rename=before_rename)
 
     def _meta_from_record(self, record: dict[str, Any]) -> CookieJarMeta:
         try:
@@ -1073,15 +1087,6 @@ class JarStore:
         now = now_utc()
         new_id = jar_id or f"jar_{os.urandom(16).hex()}"
         reg_domains = sorted({d for o in resolved_origins if (d := registrable_domain(o))})
-
-        # The size cap covers the whole stored record, not just the raw export: the filtered storage
-        # + probe live in the sealed blob, and the cleartext metadata (origins/nav_allowlist/
-        # registrable_domains/label — all AAD-bound) is not otherwise bounded, so a caller could
-        # otherwise write an oversized jar file with empty storage but thousands of origins.
-        payload_bytes = len(json.dumps({"storage_state": filtered, "probe": probe.model_dump()}).encode("utf-8"))
-        meta_bytes = len(json.dumps([resolved_origins, resolved_allowlist, reg_domains, label]).encode("utf-8"))
-        if payload_bytes + meta_bytes > self.max_bytes:
-            raise JarValidationError(f"sealed jar record exceeds the {self.max_bytes}-byte limit")
         # A refresh must publish a generation ABOVE the tombstone high-water, not merely
         # existing.generation + 1: if the on-disk file rolled back behind the log (gen1 restored
         # after gen2 was invalidated), a naive +1 would re-write an already-tombstoned generation
@@ -1133,9 +1138,10 @@ class JarStore:
                 filtered,
                 probe,
                 before_rename=lambda: self._tombstones.record(meta.jar_id, old_generation, "invalidated"),
+                enforce_max=True,
             )
         else:
-            self._write_record(meta, filtered, probe)
+            self._write_record(meta, filtered, probe, enforce_max=True)
         self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by)
         return meta
 

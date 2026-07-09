@@ -23,6 +23,7 @@ from .models import (
     CookieJarMeta,
     CreateSessionRequest,
     HandoffRequest,
+    JarProbeConfig,
     LeaseOwner,
     ProbeResult,
     ProbeResultName,
@@ -626,7 +627,10 @@ class SessionRegistry:
                 raw_storage_state=raw,
                 probe_spec_url=probe_url,
                 probe_selector=probe_selector,
-                probe_logged_out_prefix=req.probe.logged_out_url_prefix,
+                # Agent-supplied logged_out_url_prefix is untrusted like the probe url/selector: a
+                # prompt-injected page could set it to the landing origin so every future probe reads
+                # "stale" before the selector check. Drop it for an agent; only human/FA saves set it.
+                probe_logged_out_prefix=(None if actor == "agent" else req.probe.logged_out_url_prefix),
                 saved_by=saved_by,
                 # New jar => attribute to the authorized owner. Refresh => pass None so JarStore
                 # preserves the *target jar's* stored owner; an agent (whose refresh auth is
@@ -814,17 +818,18 @@ class SessionRegistry:
         a jar-loaded session and one that produced a jar (which holds the unfiltered login state)."""
         if not self.jar_store.enabled:
             return None
+        # Both a produced (source) jar and the loaded jar back a live authenticated context that the
+        # kill-switch must be able to tear down. Fail closed on a tombstone of the captured/seeded
+        # generation, and also when the current file no longer authenticates (removed, corrupted, or
+        # AAD-tampered without a tombstone) — a shared-volume writer must not keep either context
+        # alive past its kill-switch by mangling the file.
         for jar_id, generation in session.produced_jar_generations.items():
-            if self.jar_store.is_revoked_generation(jar_id, generation):
+            if self.jar_store.is_revoked_generation(jar_id, generation) or not self.jar_store.jar_authenticates(jar_id):
                 return jar_id
         if session.jar_id is not None:
-            # The loaded jar backs THIS running context. Fail closed on a tombstone of the seeded
-            # generation, and also when the current file no longer authenticates (removed, corrupted,
-            # or AAD-tampered without a tombstone): a shared-volume writer must not keep a seeded
-            # authenticated context alive past its kill-switch by mangling the file.
-            if self.jar_store.is_revoked_generation(session.jar_id, session.jar_generation):
-                return session.jar_id
-            if not self.jar_store.jar_authenticates(session.jar_id):
+            if self.jar_store.is_revoked_generation(
+                session.jar_id, session.jar_generation
+            ) or not self.jar_store.jar_authenticates(session.jar_id):
                 return session.jar_id
         return None
 
@@ -878,16 +883,34 @@ class SessionRegistry:
         return ProbeResult(result=result, final_origin=final_origin)
 
     async def _run_probe(self, loaded) -> tuple[ProbeResultName, str | None]:
-        probe = loaded.probe
-        profile = form_factor_profile(loaded.meta.form_factor)
-        confine = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
+        return await self._probe_candidate(
+            loaded.storage_state,
+            loaded.meta.form_factor,
+            [*loaded.meta.origins, *loaded.meta.nav_allowlist],
+            loaded.probe,
+            label=f"probe_{loaded.meta.jar_id}",
+        )
+
+    async def _probe_candidate(
+        self,
+        storage_state: dict[str, Any],
+        form_factor: str,
+        confine_origins: list[str],
+        probe: JarProbeConfig,
+        *,
+        label: str,
+    ) -> tuple[ProbeResultName, str | None]:
+        """Seed ``storage_state`` into a throwaway context under the jar's form factor and exact-origin
+        confinement, navigate to the probe target, and classify freshness. Shared by the jar freshness
+        probe and the save-time verification of a just-captured candidate. Never returns page content."""
+        profile = form_factor_profile(form_factor)
         worker = make_worker(
-            f"probe_{loaded.meta.jar_id}",
+            label,
             width=profile.width,
             height=profile.height,
             user_agent=profile.user_agent,
-            storage_state=loaded.storage_state,
-            confine_origins=confine,
+            storage_state=storage_state,
+            confine_origins=confine_origins,
         )
         try:
             await worker.start()

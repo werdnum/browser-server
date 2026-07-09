@@ -2005,3 +2005,74 @@ def test_refresh_survives_anchor_write_failure(tmp_path, monkeypatch):
     (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(gen1)  # restore the old file
     with pytest.raises(JarRevokedError):
         store.load(meta.jar_id)  # old generation still revoked via the log
+
+
+# --- regression tests for Codex review round 15 ---------------------------
+
+
+def test_invalid_nonce_length_is_decrypt_error_not_crash(tmp_path):
+    # A base64-valid but wrong-length nonce makes AESGCM raise ValueError (not InvalidTag); it must
+    # fail closed as a JarError, not a 500 that would block the service-token kill-switch.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["nonce"] = base64.b64encode(b"short").decode()  # 5 bytes, not 12
+    path.write_text(json.dumps(record))
+    with pytest.raises(JarError):
+        store.load(meta.jar_id)
+    assert store.get_meta_unverified(meta.jar_id).label == "(unverified)"  # management path stays usable
+
+
+def test_encoded_record_cap_accounts_for_base64_inflation(tmp_path):
+    # A plaintext payload under the cap can still exceed it once base64-encoded + metadata; the cap
+    # is enforced on the actual serialized file.
+    store = make_store(tmp_path, max_bytes=1200)
+    state = {
+        "cookies": [
+            {
+                "name": "sid",
+                "value": "x" * 800,
+                "domain": "shop.example.com",
+                "path": "/",
+                "expires": -1,
+                "secure": True,
+            }
+        ],
+        "origins": [],
+    }
+    with pytest.raises(JarValidationError):
+        save_login(store, raw_storage_state=state, probe_spec_url="https://shop.example.com/")
+
+
+@pytest.mark.asyncio
+async def test_producing_session_closed_when_jar_file_removed(tmp_path):
+    # A source session that PRODUCED a jar holds the unfiltered login; a shared-volume tamper that
+    # removes the jar file (no tombstone) must fail it closed too, like a jar-loaded session.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    assert meta.jar_id in reg.sessions[human.session_id].produced_jar_ids
+    assert reg.session_jar_revoked(human.session_id) is False
+    (tmp_path / "jars" / f"{meta.jar_id}.json").unlink()  # removed without a tombstone
+    assert reg.session_jar_revoked(human.session_id) is True
+
+
+@pytest.mark.asyncio
+async def test_agent_save_drops_logged_out_prefix(tmp_path):
+    # Agent-supplied logged_out_url_prefix is untrusted: a prompt-injected page could set it to the
+    # landing origin so every probe reads stale. It is dropped on an agent save.
+    reg = registry_with_store(tmp_path)
+    sess, ctl = await _human_login_session(reg, subject="user123")
+    _, ho = await reg.handover(sess.session_id, ctl, "take over")
+    await reg.agent_claim(sess.session_id, ho)
+    meta = await reg.save_jar(
+        sess.session_id,
+        SaveJarRequest(label="Shop", probe=ProbeSpec(logged_out_url_prefix="https://shop.example.com/")),
+        actor="agent",
+    )
+    assert reg.jar_store.load(meta.jar_id).probe.logged_out_url_prefix is None
