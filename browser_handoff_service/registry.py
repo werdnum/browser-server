@@ -598,14 +598,15 @@ class SessionRegistry:
             worker = self.workers.get(session.worker_id or "")
             if worker is None or worker.closed:
                 raise ConflictError("worker is not available")
-            # A cookies_only jar (requested now, or the stored mode of the jar being refreshed)
-            # discards client storage anyway, so export cookies only — otherwise a large IndexedDB
-            # would fail the size cap before JarStore ever filters it out.
-            effective_mode = req.storage if req.storage is not None else (existing.storage_mode if existing else "all")
+            # Export cookies only whenever the STORED result is cookies_only — requested now, or the
+            # mode of the jar being refreshed (a cookies_only jar can never widen to "all", so its
+            # export is always cookies-only). This also avoids materializing localStorage/IndexedDB
+            # for an invalid cookies_only->all widening that JarStore will reject anyway.
+            cookies_only_export = req.storage == "cookies_only" or (
+                existing is not None and existing.storage_mode == "cookies_only"
+            )
             try:
-                raw = await worker.export_storage_state(
-                    self.jar_store.max_bytes, cookies_only=effective_mode == "cookies_only"
-                )
+                raw = await worker.export_storage_state(self.jar_store.max_bytes, cookies_only=cookies_only_export)
             except StorageTooLarge as exc:
                 raise ConflictError(str(exc)) from exc
 
@@ -659,6 +660,12 @@ class SessionRegistry:
                 session.jar_origins = list(meta.origins)
                 session.jar_nav_allowlist = list(meta.nav_allowlist)
                 session.jar_registrable_domains = list(meta.registrable_domains)
+                # Apply the (possibly NARROWED) scope to the live worker's route guard too, so the
+                # running context stops trusting origins the refreshed jar dropped — otherwise the
+                # worker would still allow the wider create-time scope while policy readers see the
+                # narrowed one. Only for a confined session (a human-driven one runs unconfined).
+                if session.confine_navigation and worker is not None and not worker.closed:
+                    worker.set_confine_origins([*meta.origins, *meta.nav_allowlist])
             session.updated_at = now_utc()
             self._event(
                 session,

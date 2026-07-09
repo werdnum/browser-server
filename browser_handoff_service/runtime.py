@@ -201,6 +201,7 @@ class BrowserRuntime(Protocol):
     async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]: ...
     async def selector_present(self, selector: str) -> bool: ...
     def set_confinement_active(self, enabled: bool) -> None: ...
+    def set_confine_origins(self, origins: list[str]) -> None: ...
 
 
 class FakeBrowserWorker:
@@ -256,6 +257,9 @@ class FakeBrowserWorker:
 
     def set_confinement_active(self, enabled: bool) -> None:
         self._confinement_active = enabled
+
+    def set_confine_origins(self, origins: list[str]) -> None:
+        self.confine_origins = [o for o in origins]
 
     def _off_scope(self, url: str) -> bool:
         if not self.confine_origins or not self._confinement_active:
@@ -485,15 +489,19 @@ class PlaywrightBrowserWorker:
         aborted before the document request is sent. Only document/navigation requests are
         blocked — page-JavaScript subresource egress (fetch/beacon/img to an off-scope host) is a
         deliberate, documented residual deferred to the egress-proxy/CSP layer (see the design's
-        "does not do" section); it is bounded meanwhile by exec default-deny."""
-        allowed = set(self.confine_origins)
+        "does not do" section); it is bounded meanwhile by exec default-deny.
+
+        The confinement set is read from ``self.confine_origins`` on every request (not snapshotted),
+        so a jar-loaded session that refreshes its own jar to a NARROWER scope can tighten the live
+        route guard via ``set_confine_origins`` — the running worker must not keep trusting origins
+        the refreshed jar dropped."""
 
         async def route_handler(route: Any) -> None:
             if not self._confinement_active:
                 await route.continue_()
                 return
             request = route.request
-            off_scope = origin_of(request.url) not in allowed
+            off_scope = origin_of(request.url) not in set(self.confine_origins)
             try:
                 is_document = request.resource_type == "document"
                 is_nav = request.is_navigation_request()
@@ -518,7 +526,7 @@ class PlaywrightBrowserWorker:
             if not self._confinement_active:
                 return
             try:
-                if page.url and page.url != "about:blank" and origin_of(page.url) not in allowed:
+                if page.url and page.url != "about:blank" and origin_of(page.url) not in set(self.confine_origins):
                     task = asyncio.ensure_future(page.close())
                     self._popup_tasks.add(task)
                     task.add_done_callback(self._popup_tasks.discard)
@@ -529,6 +537,11 @@ class PlaywrightBrowserWorker:
 
     def set_confinement_active(self, enabled: bool) -> None:
         self._confinement_active = enabled
+
+    def set_confine_origins(self, origins: list[str]) -> None:
+        # The installed route handler reads self.confine_origins per request, so updating it here
+        # tightens (or updates) the live confinement without re-installing the route.
+        self.confine_origins = [o for o in origins]
 
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed or self._page is None:
@@ -690,10 +703,15 @@ class PlaywrightBrowserWorker:
             if len(json.dumps(state).encode("utf-8")) > max_bytes:
                 raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
             return state
-        # Source-side bound: abort if the live page's origin already reports usage over the cap.
-        if self._page is not None:
+        # Source-side bound: abort if ANY open page's origin already reports client-storage usage
+        # over the cap, before the full (all-origin) state is materialized — storage_state below
+        # serializes every origin in the context, not just the active page, so a single-page check
+        # would miss an oversized IdP/other tab. Residual: an origin with persisted IndexedDB but no
+        # open page is not measurable via navigator.storage.estimate() and is only caught by the
+        # post-materialization check below; a per-origin/incremental export is the documented follow-up.
+        for page in list(self._context.pages):
             try:
-                usage = await self._page.evaluate(
+                usage = await page.evaluate(
                     "async () => { try { return (await navigator.storage.estimate()).usage || 0; }"
                     " catch (e) { return 0; } }"
                 )

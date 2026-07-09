@@ -1370,6 +1370,11 @@ class JarStore:
             meta = self._meta_from_record(record)
             if meta.generation != generation or self.probe_allowed_at(meta) is not None:
                 return False
+            # A revocation that landed (from this or another pod) after probe_jar loaded the jar but
+            # before this reservation must still be a kill-switch: do not re-seal an invalidated or
+            # tombstoned jar and run an authenticated throwaway probe against it.
+            if meta.invalidated_at is not None or self._tombstones.blocked_reason(jar_id, meta.generation) is not None:
+                return False
             try:
                 payload = self._decrypt(meta, record)
             except JarError:

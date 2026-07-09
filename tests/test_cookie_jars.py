@@ -2133,3 +2133,74 @@ async def test_save_jar_malformed_id_allocates_no_lock(tmp_path):
             actor="human",
         )
     assert "not-a-jar" not in reg.jar_locks
+
+
+# --- regression tests for Codex review round 17 ---------------------------
+
+
+def test_reserve_probe_fails_when_revoked_by_another_instance(tmp_path):
+    # A revocation that lands (from another pod) after load but before the reservation must still be
+    # a kill-switch: reserve_probe rechecks invalidation/tombstone under the ops lock.
+    key = _key()
+    a = make_store(tmp_path, keys=key)
+    meta = save_login(a)
+    b = make_store(tmp_path, keys=key)
+    b.invalidate(meta.jar_id)  # another pod revokes
+    assert a.reserve_probe(meta.jar_id, meta.generation) is False
+
+
+@pytest.mark.asyncio
+async def test_cookies_only_widening_refresh_does_not_materialize_localstorage(tmp_path):
+    # Refreshing a cookies_only jar with storage="all" is an invalid widening. It must be rejected
+    # as a validation error WITHOUT first materializing the live page's large localStorage.
+    reg = SessionRegistry(jar_store=make_store(tmp_path, max_bytes=4096))
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", storage="cookies_only", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    fake_worker(reg, human.worker_id).storage_state = {
+        "cookies": [
+            {"name": "sid", "value": "x", "domain": "shop.example.com", "path": "/", "expires": -1, "secure": True}
+        ],
+        "origins": [{"origin": "https://shop.example.com", "localStorage": [{"name": "big", "value": "A" * 10000}]}],
+    }
+    with pytest.raises(JarValidationError):
+        await reg.save_jar(
+            human.session_id,
+            SaveJarRequest(
+                label="Shop", jar_id=meta.jar_id, storage="all", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")
+            ),
+            actor="human",
+        )
+
+
+@pytest.mark.asyncio
+async def test_self_refresh_narrowing_tightens_worker_confinement(tmp_path):
+    # A jar-loaded session that refreshes its own jar to a narrower scope must tighten the LIVE
+    # worker's route guard, not just the session metadata.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(
+            label="Shop",
+            origins=["https://shop.example.com", "https://api.example.com"],
+            token=ctl,
+            probe=ProbeSpec(logged_in_selector="[x]"),
+        ),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    worker = fake_worker(reg, loaded.worker_id)
+    assert "https://api.example.com" in worker.confine_origins
+    worker.storage_state = LOGIN_STATE
+
+    await reg.save_jar(
+        loaded.session_id,
+        SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://shop.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert "https://api.example.com" not in worker.confine_origins  # live worker tightened
+    assert "https://shop.example.com" in worker.confine_origins
