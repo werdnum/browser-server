@@ -1221,7 +1221,14 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
     try:
         async with websockets.connect(upstream_url, subprotocols=subprotocols, max_size=None) as upstream:
             await websocket.accept(subprotocol=upstream.subprotocol)
-            await _bridge_websockets(websocket, upstream)
+            # Authorization is checked once at connect, but a jar-backed session can be revoked
+            # mid-stream by another process; poll the shared tombstone and tear the context down so
+            # the kill-switch reaches a live human-driven browser, not just future loads.
+            watchdog = asyncio.create_task(_novnc_revocation_watchdog(session_id))
+            try:
+                await _bridge_websockets(websocket, upstream)
+            finally:
+                watchdog.cancel()
     except WebSocketDisconnect:
         return
     except Exception:
@@ -1229,6 +1236,19 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
             await websocket.close(code=1011)
         except RuntimeError:
             pass
+
+
+async def _novnc_revocation_watchdog(session_id: str) -> None:
+    """Close the session (and its worker/noVNC display) if a jar backing it is revoked while a
+    noVNC connection is live. Closing the worker drops the upstream websocket, ending the bridge."""
+    while True:
+        await asyncio.sleep(5)
+        if registry.session_jar_revoked(session_id):
+            try:
+                await registry.close(session_id)
+            except Exception:
+                logger.warning("failed to close revoked noVNC session %s", session_id, exc_info=True)
+            return
 
 
 @app.get("/sessions", response_class=HTMLResponse, dependencies=[Depends(require_service_auth)])

@@ -38,6 +38,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import tempfile
@@ -52,6 +53,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .models import CookieJarMeta, JarProbeConfig, ProbeResultName, StorageMode, now_utc
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -697,7 +700,12 @@ class JarStore:
         _atomic_write(self._path(meta.jar_id), json.dumps(record).encode("utf-8"))
 
     def _meta_from_record(self, record: dict[str, Any]) -> CookieJarMeta:
-        meta = CookieJarMeta.model_validate(record["meta"])
+        try:
+            meta = CookieJarMeta.model_validate(record["meta"])
+        except (KeyError, TypeError, ValueError) as exc:
+            # Missing/invalid metadata (pydantic ValidationError subclasses ValueError) is a
+            # controlled corruption case, not a 500 — so delete/invalidate can still kill-switch it.
+            raise JarDecryptError("jar metadata is malformed (corrupted)", kind="corruption") from exc
         # Re-normalize the label on every read: even a file edited without the key cannot make a
         # listing emit control characters/newlines/over-length markup (defense in depth on top of
         # the AAD binding, which fails the *verified* paths closed on any label tamper).
@@ -717,8 +725,18 @@ class JarStore:
         return meta
 
     def get_meta_unverified(self, jar_id: str) -> CookieJarMeta:
+        """Metadata without requiring the blob to decrypt (so rotated/corrupt jars stay
+        manageable). The *label* is still authenticated — a jar whose envelope does not verify
+        gets a safe placeholder — so a filesystem writer cannot surface attacker-chosen prompt
+        text through the service-token detail/list paths."""
         self._require_enabled()
-        return self._meta_from_record(self._read_record(jar_id))
+        record = self._read_record(jar_id)
+        meta = self._meta_from_record(record)
+        try:
+            self._decrypt(meta, record)
+        except JarError:
+            meta.label = "(unverified)"
+        return meta
 
     def list_meta(self) -> list[CookieJarMeta]:
         """All jar metadata (cleartext). Ownership filtering is applied by the caller."""
@@ -1063,33 +1081,30 @@ class JarStore:
     def _invalidate_locked(self, jar_id: str, actor: str) -> CookieJarMeta:
         try:
             record = self._read_record(jar_id)
+            meta = self._meta_from_record(record)
         except JarNotFoundError:
             raise
         except JarError:
-            # Corrupt/unparseable/id-mismatched file: honor the kill-switch anyway. The generation
-            # is unknowable, so block every version fail-closed (the file stays but is unloadable).
+            # Corrupt/unparseable/id-mismatched/invalid-metadata file: honor the kill-switch
+            # anyway. The generation is unknowable, so block every version fail-closed (the file
+            # stays but is unloadable).
             self._tombstones.record(jar_id, _MAX_GENERATION, "invalidated")
             stub = _stub_meta(jar_id)
             self._audit("jar_invalidated", stub, actor)
             return stub
-        meta = self._meta_from_record(record)
         # Authenticate the generation BEFORE recording the tombstone: `generation` is AAD-bound,
         # so a successful decrypt proves the cleartext generation is genuine. Tombstoning a
         # tampered (lowered) generation would let a restored original file with the real, higher
         # generation slip past blocked_reason and load a supposedly-revoked login.
         try:
             payload = self._decrypt(meta, record)
-        except JarDecryptError as exc:
-            if exc.kind == "rotation":
-                # key_id not configured: unloadable under all configured keys anyway, so the
-                # cleartext generation is a safe-enough tombstone (a restored file also cannot
-                # decrypt). Persist the cleartext invalidated_at (no blob to re-seal).
-                self._tombstones.record(jar_id, meta.generation, "invalidated")
-            else:
-                # Tampered/corrupt metadata under a configured key: the real generation is
-                # unknowable, so block EVERY version of the id fail-closed rather than trust a
-                # possibly-lowered cleartext generation.
-                self._tombstones.record(jar_id, _MAX_GENERATION, "invalidated")
+        except JarDecryptError:
+            # The generation cannot be authenticated — whether the blob was tampered (corruption)
+            # or the cleartext key_id was edited to an unconfigured value (rotation) — so block
+            # EVERY version of this id fail-closed rather than trust a possibly-lowered cleartext
+            # generation. A genuinely rotated jar is un-refreshable anyway (get_meta_verified fails
+            # on refresh), so this loses nothing; delete still works, and re-login uses a new id.
+            self._tombstones.record(jar_id, _MAX_GENERATION, "invalidated")
             meta.invalidated_at = now_utc()
             meta.updated_at = meta.invalidated_at
             record["meta"] = meta.model_dump(mode="json")
@@ -1164,10 +1179,17 @@ class JarStore:
         }
         try:
             self._audit_path.parent.mkdir(parents=True, exist_ok=True)
+            newly_created = not self._audit_path.exists()
             with self._audit_path.open("a") as handle:
                 handle.write(json.dumps(entry) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())  # durable: the credential audit trail must survive a crash
+            if newly_created:
+                _fsync_dir(self._audit_path.parent)
         except OSError:
-            pass
+            # A failed audit write must not defeat a kill-switch (availability of revocation beats
+            # the audit record), but it is a real operational problem — surface it, don't swallow.
+            logger.warning("failed to append jar-audit record for %s (%s)", meta.jar_id, op, exc_info=True)
 
 
 def jar_store_from_env() -> JarStore:

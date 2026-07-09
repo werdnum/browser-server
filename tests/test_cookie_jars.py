@@ -15,6 +15,7 @@ import pytest
 from browser_handoff_service.jars import (
     JarDecryptError,
     JarDisabledError,
+    JarError,
     JarRevokedError,
     JarStore,
     JarValidationError,
@@ -1198,3 +1199,61 @@ async def test_live_session_closed_when_its_generation_is_revoked_despite_relogi
     # ...but reg_a's session was seeded from gen 1, which is still tombstoned, so it is closed.
     with pytest.raises(SessionInactiveError):
         await reg_a.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))
+
+
+# --- regression tests for Codex review round 6 ----------------------------
+
+
+def test_invalidate_works_on_malformed_metadata(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    del record["meta"]["origins"]  # remove a required field -> pydantic ValidationError on read
+    path.write_text(json.dumps(record))
+    store.invalidate(meta.jar_id)  # kill-switch still lands
+    with pytest.raises(JarError):
+        store.load(meta.jar_id)
+
+
+def test_get_meta_unverified_substitutes_unverified_label(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["label"] = "malicious instructions"  # plain text, no control chars
+    path.write_text(json.dumps(record))
+    assert store.get_meta_unverified(meta.jar_id).label == "(unverified)"
+
+
+def test_invalidate_blocks_all_versions_on_key_id_tamper(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+    save_login(store, jar_id=meta.jar_id)  # gen 2 (authentic)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    authentic_gen2 = path.read_bytes()
+    record = json.loads(path.read_text())
+    record["key_id"] = "deadbeefcafe"  # unconfigured => decrypt hits the "rotation" branch
+    record["meta"]["generation"] = 1  # ...and the generation is lowered
+    path.write_text(json.dumps(record))
+    store.invalidate(meta.jar_id)  # must block every version, not just gen 1
+    path.write_bytes(authentic_gen2)  # restore the real gen-2 file
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+@pytest.mark.asyncio
+async def test_session_jar_revoked_helper_across_instances(tmp_path):
+    key = _key()
+    reg_a = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    producer, ctl = await _human_login_session(reg_a)
+    meta = await reg_a.save_jar(
+        producer.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg_a.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    assert reg_a.session_jar_revoked(loaded.session_id) is False
+    reg_b = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    await reg_b.delete_jar(meta.jar_id)
+    assert reg_a.session_jar_revoked(loaded.session_id) is True

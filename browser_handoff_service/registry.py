@@ -566,6 +566,11 @@ class SessionRegistry:
             except StorageTooLarge as exc:
                 raise ConflictError(str(exc)) from exc
 
+            # Re-check revocation AFTER the export await: another process could have revoked the
+            # backing jar while the (browser/IndexedDB) export was in flight, and publishing a
+            # refreshed higher generation now would undo that kill-switch.
+            await self._enforce_jar_not_revoked_locked(session)
+
             meta = self.jar_store.save(
                 jar_id=req.jar_id,
                 label=req.label,
@@ -717,6 +722,14 @@ class SessionRegistry:
             session.updated_at = now_utc()
             self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked", "jar_id": revoked})
             raise SessionInactiveError("the jar backing this session was revoked")
+
+    def session_jar_revoked(self, session_id: str) -> bool:
+        """Whether a jar backing this session has been revoked (possibly by another process).
+        Used to poll during a long-lived noVNC bridge, where no per-command recheck runs."""
+        session = self.sessions.get(session_id)
+        if session is None or session.state in TERMINAL_STATES:
+            return False
+        return self._revoked_jar_for(session) is not None
 
     def _revoked_jar_for(self, session: BrowserSession) -> str | None:
         """Return a jar id backing ``session`` whose *seeded* generation is now revoked
