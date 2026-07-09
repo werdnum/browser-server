@@ -294,6 +294,11 @@ class CookieJarMeta(BaseModel):
     earliest_cookie_expiry: datetime | None = None
     session_cookies_only: bool = False
     contains_session_cookies: bool = False
+    # Anchor for the session-cookie bounded-retention window: set to now on a NEW save or a HUMAN
+    # re-login (a fresh session cookie resets the deadline), but PRESERVED across an agent self-
+    # refresh so an agent cannot keep a browser-close credential replayable indefinitely by
+    # periodically re-capturing the same session cookie. Falls back to updated_at when unset.
+    session_ttl_anchor: datetime | None = None
     has_probe: bool = True
     last_probe_at: datetime | None = None
     last_probe_result: ProbeResultName | None = None

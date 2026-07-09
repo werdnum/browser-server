@@ -16,7 +16,7 @@ Security invariants enforced here:
 - Jars are encrypted with AES-256-GCM under an operator key; keyless => feature disabled, 503.
 - Security-critical cleartext metadata (origins, nav_allowlist, owner_subject, storage_mode,
   key_id, jar_id, generation, invalidated_at, the freshness fields last_probe_at/last_probe_result,
-  and the retention inputs contains_session_cookies/updated_at) is bound as AES-GCM AAD, so
+  and the retention inputs contains_session_cookies/updated_at/session_ttl_anchor) is bound as AES-GCM AAD, so
   tampering with the file without the key fails decryption closed.
 - Revocation is rollback-proof via a monotonic ``generation`` counter and an append-only,
   HMAC-authenticated tombstone log whose high-water mark is re-derived (verified) on each check.
@@ -661,10 +661,11 @@ _AAD_FIELDS = (
     "last_probe_at",
     "last_probe_result",
     # Session-cookie retention inputs: a filesystem writer must not be able to clear
-    # contains_session_cookies or push updated_at forward to keep an expired session-cookie jar
-    # loadable past its bounded TTL. Both are set at save and never patched in cleartext.
+    # contains_session_cookies or push the retention anchor forward to keep an expired session-cookie
+    # jar loadable past its bounded TTL. All set at save and never patched in cleartext.
     "contains_session_cookies",
     "updated_at",
+    "session_ttl_anchor",
 )
 
 
@@ -682,6 +683,7 @@ def _aad_for(meta: CookieJarMeta, key_id: str) -> bytes:
         "last_probe_result": meta.last_probe_result,
         "contains_session_cookies": meta.contains_session_cookies,
         "updated_at": meta.updated_at.isoformat(),
+        "session_ttl_anchor": meta.session_ttl_anchor.isoformat() if meta.session_ttl_anchor else None,
         "key_id": key_id,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1149,6 +1151,13 @@ class JarStore:
         # after gen2 was invalidated), a naive +1 would re-write an already-tombstoned generation
         # and the "successful" refresh would still be unloadable.
         new_generation = (max(existing.generation, self._tombstones.high_water(new_id)) + 1) if existing else 1
+        # Session-cookie retention anchor: reset to now on a new save or a HUMAN re-login (fresh
+        # session cookie), but PRESERVE the stored anchor on an agent self-refresh so re-capturing
+        # the same browser-close cookie cannot push the deadline out indefinitely without a human.
+        if existing is not None and saved_by != "human":
+            ttl_anchor = existing.session_ttl_anchor or existing.updated_at
+        else:
+            ttl_anchor = now
         meta = CookieJarMeta(
             jar_id=new_id,
             label=normalize_label(label),
@@ -1176,6 +1185,7 @@ class JarStore:
             earliest_cookie_expiry=stats.earliest_cookie_expiry,
             session_cookies_only=stats.session_cookies_only,
             contains_session_cookies=stats.contains_session_cookies,
+            session_ttl_anchor=ttl_anchor,
             has_probe=True,
             # Refresh resets freshness/invalidation so a re-login jar no longer reads stale.
             last_probe_at=None,
@@ -1199,7 +1209,8 @@ class JarStore:
             )
         else:
             self._write_record(meta, filtered, probe, enforce_max=True)
-        self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by)
+        # Strict: a durable credential must not be acknowledged without a durable audit record.
+        self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by, strict=True)
         return meta
 
     def resolve_refresh_scope(
@@ -1322,11 +1333,13 @@ class JarStore:
 
     def _session_ttl_expired(self, meta: CookieJarMeta) -> bool:
         """A jar that captured a browser-session cookie is loadable only within a bounded window of
-        its last save (updated_at); after that a browser-close login must not remain replayable.
+        its retention anchor (last new save / human re-login — NOT an agent self-refresh, which
+        preserves the anchor); after that a browser-close login must not remain replayable.
         Persistent-cookie-only jars have no such cap (their staleness surfaces via probing)."""
         if not meta.contains_session_cookies:
             return False
-        return now_utc() - meta.updated_at > self.session_ttl
+        anchor = meta.session_ttl_anchor or meta.updated_at
+        return now_utc() - anchor > self.session_ttl
 
     def touch_loaded(self, jar_id: str) -> None:
         with self._ops_lock():
@@ -1511,9 +1524,14 @@ class JarStore:
             return meta
 
     # -- audit --------------------------------------------------------------
-    def _audit(self, op: str, meta: CookieJarMeta, actor: str) -> None:
+    def _audit(self, op: str, meta: CookieJarMeta, actor: str, *, strict: bool = False) -> None:
         """Durable, structured jar-audit record (non-secret metadata only). Jars outlive the
-        in-memory session-event stream, so their audit trail must too."""
+        in-memory session-event stream, so their audit trail must too.
+
+        ``strict`` (save/refresh): a durable credential must not be acknowledged without its audit
+        record — the audit is the only persistent log of a jar's lifecycle — so a failed append
+        RAISES. Revocation (invalidate/delete) leaves it best-effort: availability of the committed
+        kill-switch beats the audit record, so a failed append there only logs."""
         entry = {
             "ts": now_utc().isoformat(),
             "op": op,
@@ -1532,10 +1550,10 @@ class JarStore:
                 os.fsync(handle.fileno())  # durable: the credential audit trail must survive a crash
             if newly_created:
                 _fsync_dir(self._audit_path.parent)
-        except OSError:
-            # A failed audit write must not defeat a kill-switch (availability of revocation beats
-            # the audit record), but it is a real operational problem — surface it, don't swallow.
+        except OSError as exc:
             logger.warning("failed to append jar-audit record for %s (%s)", meta.jar_id, op, exc_info=True)
+            if strict:
+                raise JarError(f"jar {op} audit record could not be written durably") from exc
 
 
 def jar_store_from_env() -> JarStore:

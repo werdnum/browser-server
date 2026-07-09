@@ -134,6 +134,10 @@ class SessionRegistry:
         confine_origins: list[str] | None = None
         loaded = None
         if req.jar_id is not None:
+            # Validate the id BEFORE allocating a per-jar lock, so a caller passing malformed/random
+            # ids cannot leave permanent self.jar_locks entries per failed create (as the save path
+            # already guards).
+            validate_jar_id(req.jar_id)
             # Take the jar lock only for the load (serialize it against a concurrent invalidate/
             # delete), then release it before the slow worker.start() below so a same-process
             # revocation is not queued behind browser startup. The post-start recheck re-verifies

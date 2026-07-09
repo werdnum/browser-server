@@ -2524,3 +2524,61 @@ async def test_probe_in_scope_err_failed_is_error_not_stale(tmp_path, monkeypatc
     monkeypatch.setattr(registry_module, "make_worker", mk)
     result = await reg.probe_jar(meta.jar_id)
     assert result.result == "error"
+
+
+# --- regression tests for Codex review round 22 ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_malformed_jar_id_allocates_no_lock(tmp_path):
+    reg = registry_with_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        await reg.create_session(CreateSessionRequest(conversation_id="c1", jar_id="not-a-jar"))
+    assert "not-a-jar" not in reg.jar_locks
+
+
+def test_save_fails_when_audit_append_fails(tmp_path, monkeypatch):
+    # A durable credential must not be acknowledged without its durable audit record.
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    real_open = jars_mod.Path.open
+
+    def boom_open(self, *args, **kwargs):
+        if self.name == "jar-audit.jsonl":
+            raise OSError("audit volume full")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(jars_mod.Path, "open", boom_open)
+    with pytest.raises(JarError):
+        save_login(store)
+
+
+def test_agent_self_refresh_preserves_session_ttl_anchor(tmp_path):
+    # An agent self-refresh must not reset the session-cookie retention anchor (that would let it
+    # keep a browser-close credential replayable indefinitely); a human re-login does reset it.
+    store = make_store(tmp_path)
+    meta = save_login(store, saved_by="human")  # LOGIN_STATE has a session cookie
+    assert meta.contains_session_cookies is True
+    anchor = meta.session_ttl_anchor
+    assert anchor is not None
+
+    agent_refresh = save_login(store, jar_id=meta.jar_id, saved_by="agent")
+    assert agent_refresh.session_ttl_anchor == anchor  # preserved, not extended
+
+    human_refresh = save_login(store, jar_id=meta.jar_id, saved_by="human")
+    assert human_refresh.session_ttl_anchor is not None
+    assert human_refresh.session_ttl_anchor > anchor
+
+
+def test_session_ttl_anchor_is_authenticated(tmp_path):
+    # The retention anchor gates the TTL, so a filesystem writer must not push it forward to dodge
+    # retention: it is AAD-bound.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["session_ttl_anchor"] = (datetime.now(UTC) + timedelta(days=3650)).isoformat()
+    path.write_text(json.dumps(record))
+    with pytest.raises(JarError):
+        store.load(meta.jar_id)
