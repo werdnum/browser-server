@@ -114,6 +114,9 @@ filesystem semantics so it works on a **shared directory** — a single RWO volu
 replicated RWX volume (e.g. a Longhorn volume) shared by several pods next. There is no database:
 
 - Each jar is one file, written atomically (temp file + `fsync` + rename).
+- The revocation state (tombstone log, signed anchor, audit log, and the cross-process lock) lives
+  **inside `BROWSER_JAR_DIR`** alongside the jars — mounting that one directory carries both the
+  encrypted logins and their kill-switch, so a revoke cannot be stranded off the shared volume.
 - Revocation is an append-only, HMAC-authenticated tombstone log, `fsync`'d on write and re-read
   fresh on every check (NFS close-to-open consistency), so one pod's kill-switch is visible to
   the others without a restart.

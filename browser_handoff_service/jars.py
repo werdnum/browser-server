@@ -644,10 +644,14 @@ def _stub_meta(jar_id: str, label: str = "(unreadable jar)") -> CookieJarMeta:
 class JarStore:
     """Encrypt/decrypt, scope-filter, atomically persist, and revoke cookie jars.
 
-    One file per jar under ``jar_dir`` (``jar_<id>.json``, mode 0600). The tombstone log and
-    anchor live in ``jar_dir``'s parent so a rollback of the jar directory alone cannot revive
-    a revoked login. Injected into the app like the registry; sessions stay in-memory while
-    jars survive restarts."""
+    One file per jar under ``jar_dir`` (``jar_<id>.json``, mode 0600). The revocation state
+    (tombstone log, signed anchor, audit log, and cross-process ops lock, all ``jar-*`` — no
+    collision with the ``jar_*.json`` jars) lives INSIDE ``jar_dir`` so a single mounted/shared
+    ``BROWSER_JAR_DIR`` carries the jars AND their kill-switch together: putting them in the parent
+    would leave revocations outside the volume operators actually mount, so an invalidated jar could
+    reload after a restart or from another pod. The remaining residual is a rollback of the whole
+    directory at once (jars + tombstone together), which an external monotonic/WORM anchor closes.
+    Injected into the app like the registry; sessions stay in-memory while jars survive restarts."""
 
     def __init__(
         self,
@@ -663,7 +667,9 @@ class JarStore:
         self.max_bytes = max_bytes
         self.require_save_authorization = require_save_authorization
         self.session_ttl = session_ttl
-        anchor_dir = self.jar_dir.parent
+        # Revocation state lives INSIDE jar_dir (see class docstring) so mounting BROWSER_JAR_DIR
+        # captures the kill-switch, not just the encrypted jars.
+        anchor_dir = self.jar_dir
         # A tombstone HMAC key per configured data key (needs no separate secret; an attacker
         # without any key cannot forge a consistent chain). Passing *all* keys means the log stays
         # verifiable across a BROWSER_JAR_KEY=new,old rotation — entries signed under the old key
@@ -703,7 +709,7 @@ class JarStore:
         already provided by synchronous execution — every jar_store mutation is a sync call with
         no ``await`` inside, so the event loop cannot interleave two of them — and the lock is
         held only briefly (encrypt + atomic rename)."""
-        lock_path = self.jar_dir.parent / "jar-ops.lock"
+        lock_path = self.jar_dir / "jar-ops.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "w") as handle:
             fcntl.lockf(handle.fileno(), fcntl.LOCK_EX)

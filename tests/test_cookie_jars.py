@@ -767,7 +767,7 @@ def test_forged_tombstone_log_entry_is_ignored(tmp_path):
     store = make_store(tmp_path)
     meta = save_login(store)
     store.delete(meta.jar_id)  # terminal tombstone (authenticated)
-    log = tmp_path / "jar-tombstones.jsonl"
+    log = tmp_path / "jars" / "jar-tombstones.jsonl"
     forged = {"jar_id": meta.jar_id, "generation": 9999, "reason": "invalidated", "hmac": "00" * 32}
     with log.open("a") as handle:
         handle.write(json.dumps(forged) + "\n")
@@ -782,7 +782,9 @@ def test_external_anchor_cannot_lower_revoked_generation(tmp_path):
     meta = save_login(store)
     store.invalidate(meta.jar_id)
     # An attacker who can edit the plaintext anchor file (but not the key) tries to clear it.
-    (tmp_path / "jar-anchor.json").write_text(json.dumps({meta.jar_id: {"generation": 0, "reason": "invalidated"}}))
+    (tmp_path / "jars" / "jar-anchor.json").write_text(
+        json.dumps({meta.jar_id: {"generation": 0, "reason": "invalidated"}})
+    )
     with pytest.raises(JarRevokedError):
         store.load(meta.jar_id)  # high-water comes from the authenticated log, not the anchor
 
@@ -870,7 +872,7 @@ def test_refresh_tombstones_superseded_generation(tmp_path):
 def test_forged_line_does_not_hide_a_later_revocation(tmp_path):
     store = make_store(tmp_path)
     meta = save_login(store)
-    log = tmp_path / "jar-tombstones.jsonl"
+    log = tmp_path / "jars" / "jar-tombstones.jsonl"
     with log.open("a") as handle:  # inject a forged line BEFORE the real revocation
         handle.write(
             json.dumps({"jar_id": "jar_" + "0" * 32, "generation": 1, "reason": "invalidated", "hmac": "bad"}) + "\n"
@@ -896,7 +898,7 @@ def test_jar_audit_records_the_real_actor(tmp_path):
     store = make_store(tmp_path)
     meta = save_login(store)
     store.delete(meta.jar_id, actor="subject:alice")
-    audit = (tmp_path / "jar-audit.jsonl").read_text().splitlines()
+    audit = (tmp_path / "jars" / "jar-audit.jsonl").read_text().splitlines()
     last = json.loads(audit[-1])
     assert last["op"] == "jar_deleted" and last["actor"] == "subject:alice"
 
@@ -1136,7 +1138,7 @@ def test_log_tamper_cannot_lower_high_water(tmp_path):
     pre = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
     store.invalidate(meta.jar_id)
     (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(pre)  # roll the file back
-    (tmp_path / "jar-tombstones.jsonl").write_text("")  # attacker wipes the log
+    (tmp_path / "jars" / "jar-tombstones.jsonl").write_text("")  # attacker wipes the log
     with pytest.raises(JarRevokedError):
         store.load(meta.jar_id)  # signed anchor still carries the high-water
 
@@ -1148,7 +1150,7 @@ def test_signed_anchor_survives_log_wipe(tmp_path):
     pre = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
     store.invalidate(meta.jar_id)
     (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(pre)
-    (tmp_path / "jar-tombstones.jsonl").unlink()  # wipe the log entirely
+    (tmp_path / "jars" / "jar-tombstones.jsonl").unlink()  # wipe the log entirely
     other = make_store(tmp_path, keys=key)  # only the signed anchor remains
     with pytest.raises(JarRevokedError):
         other.load(meta.jar_id)
@@ -1795,7 +1797,7 @@ def test_tombstone_log_with_undecodable_byte_does_not_jam_killswitch(tmp_path):
     store = make_store(tmp_path)
     a = save_login(store)
     store.invalidate(a.jar_id)
-    log = tmp_path / "jar-tombstones.jsonl"  # anchor/log live in the jar dir's parent
+    log = tmp_path / "jars" / "jar-tombstones.jsonl"  # anchor/log live inside the jar dir
     with open(log, "ab") as fh:
         fh.write(b"\xff\xfe not valid utf-8 or json\n")
     # blocked_reason/high_water still work: the earlier invalidation is still observed...
@@ -1891,3 +1893,49 @@ async def test_create_releases_jar_lock_before_worker_start(tmp_path, monkeypatc
     with pytest.raises(JarRevokedError):
         await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
     assert invalidated == [True]
+
+
+# --- regression tests for Codex review round 13 ---------------------------
+
+
+def test_revocation_state_lives_inside_jar_dir(tmp_path):
+    # The tombstone/anchor/audit/lock must live INSIDE jar_dir so mounting BROWSER_JAR_DIR captures
+    # the kill-switch — not in the parent, which operators do not mount.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.invalidate(meta.jar_id)
+    jars_dir = tmp_path / "jars"
+    assert (jars_dir / "jar-tombstones.jsonl").exists()
+    assert (jars_dir / "jar-anchor.json").exists()
+    assert not (tmp_path / "jar-tombstones.jsonl").exists()  # not stranded in the parent
+    assert not (tmp_path / "jar-anchor.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_agent_selector_dropped_when_baseline_nav_errors(tmp_path, monkeypatch):
+    # If the logged-out baseline navigation fails in-scope (DNS/TLS/outage -> "error"), the agent's
+    # selector must NOT be trusted as authenticated-only.
+    reg = registry_with_store(tmp_path)
+    sess, _ = await reg.create_session(CreateSessionRequest(conversation_id="c1"))
+    worker = fake_worker(reg, sess.worker_id)
+    worker.url = "https://shop.example.com/home"
+    worker.storage_state = LOGIN_STATE
+
+    from browser_handoff_service import registry as registry_module
+
+    real_make_worker = registry_module.make_worker
+
+    def make_worker_baseline_outage(worker_id, **kwargs):
+        w = cast(FakeBrowserWorker, real_make_worker(worker_id, **kwargs))
+        if worker_id.startswith("baseline_probe"):
+            w.nav_error_urls.add("https://shop.example.com/")  # baseline nav fails in-scope
+        return w
+
+    monkeypatch.setattr(registry_module, "make_worker", make_worker_baseline_outage)
+    meta = await reg.save_jar(
+        sess.session_id,
+        SaveJarRequest(label="Shop", probe=ProbeSpec(logged_in_selector="[data-testid=logout]")),
+        actor="agent",
+    )
+    loaded = reg.jar_store.load(meta.jar_id)
+    assert loaded.probe.logged_in_selector is None  # dropped: no real logged-out baseline

@@ -679,7 +679,10 @@ class SessionRegistry:
             return False
         try:
             nav = await worker.command(AgentCommandRequest(type="navigate", args={"url": url}))
-            if nav.get("blocked"):
+            if nav.get("blocked") or nav.get("error"):
+                # No baseline could be established (off-scope block, or an in-scope DNS/TLS/outage
+                # error): the selector must NOT be trusted as authenticated-only, or a prompt-injected
+                # selector that is absent on a blank/failed page would later read a stale login "fresh".
                 return False
             present_when_logged_out = await worker.selector_present(selector)
             return not present_when_logged_out

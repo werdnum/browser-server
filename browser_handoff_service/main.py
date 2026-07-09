@@ -29,6 +29,7 @@ from .jars import (
     JarRevokedError,
     JarValidationError,
     _stub_meta,
+    validate_jar_id,
 )
 from .models import (
     AgentCommandRequest,
@@ -981,10 +982,16 @@ def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
     non-null subject is required — None == None is not ownership."""
     if auth.actor_type == "agent":
         try:
+            # A malformed jar_id (bad format) is a 400 here too, matching the mutating paths —
+            # don't let it masquerade as a real jar via the stub fallback below.
+            validate_jar_id(jar_id)
+        except JarValidationError as exc:
+            raise map_errors(exc) from exc
+        try:
             return registry.get_jar_unverified(jar_id)
         except (JarValidationError, JarDecryptError):
-            # A corrupt/unreadable file must not block the service-token kill-switch: return a
-            # stub so DELETE/invalidate still reach the store (which tombstones by path id).
+            # A corrupt / id-mismatched file for a WELL-FORMED id must not block the service-token
+            # kill-switch: return a stub so DELETE/invalidate still reach the store (tombstone by id).
             return _stub_meta(jar_id)
         except Exception as exc:
             raise map_errors(exc) from exc

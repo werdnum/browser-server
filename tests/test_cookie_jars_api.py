@@ -293,6 +293,16 @@ async def test_save_button_hidden_when_save_auth_gate_enabled(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_malformed_jar_id_rejected_on_service_read(tmp_path):
+    # A malformed jar_id must be a 400 on the service-token detail read too, not a synthetic 200
+    # stub that only the mutating paths would later reject.
+    enable_jars(tmp_path)
+    async with client() as ac:
+        resp = await ac.get("/v1/jars/not-a-jar", headers=agent_headers())
+        assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_service_token_can_delete_jar_after_key_rotation(tmp_path, monkeypatch):
     # A jar under a rotated/removed key can no longer be decrypted, but the service-token
     # "forget" kill-switch must still work (management must not decrypt to authorize the service).
