@@ -25,12 +25,15 @@ Security invariants enforced here:
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -124,13 +127,20 @@ def normalize_label(label: str) -> str:
 
 
 def normalize_origin(value: str) -> str | None:
-    """Reduce a URL/origin to exact ``scheme://host[:port]`` (no path/query/fragment/userinfo)."""
+    """Reduce a URL/origin to exact ``scheme://host[:port]`` (no path/query/fragment/userinfo).
+
+    Returns None for anything unparseable — including a malformed port (``host:bad``), whose
+    ``.port`` access raises ``ValueError`` — so a bad scope value is rejected as an invalid
+    origin rather than bubbling up as a 500."""
     from urllib.parse import urlsplit
 
-    parsed = urlsplit(value.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    try:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        netloc = _canonical_netloc(parsed.scheme, parsed.hostname.lower(), parsed.port)
+    except ValueError:
         return None
-    netloc = _canonical_netloc(parsed.scheme, parsed.hostname.lower(), parsed.port)
     return f"{parsed.scheme}://{netloc}"
 
 
@@ -141,10 +151,13 @@ def redact_probe_url(value: str) -> str | None:
     back door around the never-store-sensitive-full-URLs guarantee."""
     from urllib.parse import urlsplit, urlunsplit
 
-    parsed = urlsplit(value.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    try:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        netloc = _canonical_netloc(parsed.scheme, parsed.hostname.lower(), parsed.port)
+    except ValueError:
         return None
-    netloc = _canonical_netloc(parsed.scheme, parsed.hostname.lower(), parsed.port)
     return urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
 
 
@@ -439,13 +452,24 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 
 # Security-critical meta fields bound as AES-GCM AAD (a tamper of any of these without the key
-# fails decryption closed).
-_AAD_FIELDS = ("jar_id", "origins", "nav_allowlist", "owner_subject", "storage_mode", "generation", "invalidated_at")
+# fails decryption closed). ``label`` is included because it is durable prompt-injection surface
+# that must not be rewritable in the file without detection.
+_AAD_FIELDS = (
+    "jar_id",
+    "label",
+    "origins",
+    "nav_allowlist",
+    "owner_subject",
+    "storage_mode",
+    "generation",
+    "invalidated_at",
+)
 
 
 def _aad_for(meta: CookieJarMeta, key_id: str) -> bytes:
     payload = {
         "jar_id": meta.jar_id,
+        "label": meta.label,
         "origins": sorted(meta.origins),
         "nav_allowlist": sorted(meta.nav_allowlist),
         "owner_subject": meta.owner_subject,
@@ -511,6 +535,22 @@ class JarStore:
     def _path(self, jar_id: str) -> Path:
         return self.jar_dir / f"{validate_jar_id(jar_id)}.json"
 
+    @contextlib.contextmanager
+    def _ops_lock(self) -> Iterator[None]:
+        """Serialize tombstone-mutating operations (save/invalidate/delete) *across processes*
+        sharing the jar directory, via an exclusive OS file lock. Without it two workers can
+        append tombstones chained from the same tail (one silently dropped as forged) or a
+        refresh can publish a higher generation over another worker's just-written invalidation.
+        Held briefly (encrypt + rename), so it does not meaningfully stall the event loop."""
+        lock_path = self.jar_dir.parent / "jar-ops.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     # -- crypto -------------------------------------------------------------
     def _encrypt(self, meta: CookieJarMeta, payload: dict[str, Any]) -> dict[str, Any]:
         key_id, key = self._write_key
@@ -527,15 +567,23 @@ class JarStore:
                 "jar was encrypted under a key that is not configured; re-login after key rotation",
                 kind="rotation",
             )
-        nonce = _b64d(record["nonce"])
-        ct = _b64d(record["blob"])
+        # Malformed envelope (missing/undecodable nonce or blob) is a corruption case, not an
+        # uncaught 500 — surface it fail-closed like an authentication failure.
+        try:
+            nonce = _b64d(record["nonce"])
+            ct = _b64d(record["blob"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise JarDecryptError("jar envelope is malformed (tampered or corrupted)", kind="corruption") from exc
         for kid, key in candidates:
             aad = _aad_for(meta, kid)
             try:
                 plaintext = AESGCM(key).decrypt(nonce, ct, aad)
             except InvalidTag:
                 continue
-            return json.loads(plaintext)
+            try:
+                return json.loads(plaintext)
+            except ValueError as exc:
+                raise JarDecryptError("jar plaintext is not valid JSON (corrupted)", kind="corruption") from exc
         raise JarDecryptError("jar blob failed authentication (tampered or corrupted)", kind="corruption")
 
     # -- persistence --------------------------------------------------------
@@ -552,7 +600,12 @@ class JarStore:
         _atomic_write(self._path(meta.jar_id), json.dumps(record).encode("utf-8"))
 
     def _meta_from_record(self, record: dict[str, Any]) -> CookieJarMeta:
-        return CookieJarMeta.model_validate(record["meta"])
+        meta = CookieJarMeta.model_validate(record["meta"])
+        # Re-normalize the label on every read: even a file edited without the key cannot make a
+        # listing emit control characters/newlines/over-length markup (defense in depth on top of
+        # the AAD binding, which fails the *verified* paths closed on any label tamper).
+        meta.label = normalize_label(meta.label)
+        return meta
 
     def get_meta_verified(self, jar_id: str) -> CookieJarMeta:
         """Read a jar's metadata and *verify the AEAD envelope* before trusting it.
@@ -659,6 +712,46 @@ class JarStore:
         agent_supplied_probe: bool,
     ) -> CookieJarMeta:
         self._require_enabled()
+        # Hold the cross-process ops lock across the whole read-existing -> tombstone-old ->
+        # write-new sequence so a refresh cannot interleave with another worker's invalidate.
+        with self._ops_lock():
+            return self._save_locked(
+                jar_id=jar_id,
+                label=label,
+                origins=origins,
+                nav_allowlist=nav_allowlist,
+                storage_mode=storage_mode,
+                raw_storage_state=raw_storage_state,
+                probe_spec_url=probe_spec_url,
+                probe_selector=probe_selector,
+                probe_logged_out_prefix=probe_logged_out_prefix,
+                saved_by=saved_by,
+                owner_subject=owner_subject,
+                form_factor=form_factor,
+                created_session_id=created_session_id,
+                conversation_id=conversation_id,
+                agent_supplied_probe=agent_supplied_probe,
+            )
+
+    def _save_locked(
+        self,
+        *,
+        jar_id: str | None,
+        label: str,
+        origins: list[str],
+        nav_allowlist: list[str] | None,
+        storage_mode: StorageMode | None,
+        raw_storage_state: dict[str, Any],
+        probe_spec_url: str | None,
+        probe_selector: str | None,
+        probe_logged_out_prefix: str | None,
+        saved_by: str,
+        owner_subject: str | None,
+        form_factor: str,
+        created_session_id: str,
+        conversation_id: str,
+        agent_supplied_probe: bool,
+    ) -> CookieJarMeta:
         self._enforce_size(raw_storage_state)
 
         existing: CookieJarMeta | None = None
@@ -822,6 +915,10 @@ class JarStore:
     def invalidate(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_enabled()
         validate_jar_id(jar_id)
+        with self._ops_lock():
+            return self._invalidate_locked(jar_id, actor)
+
+    def _invalidate_locked(self, jar_id: str, actor: str) -> CookieJarMeta:
         record = self._read_record(jar_id)
         meta = self._meta_from_record(record)
         # Tombstone FIRST (needs only the cleartext generation), so the kill-switch lands even
@@ -852,14 +949,15 @@ class JarStore:
     def delete(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_enabled()
         validate_jar_id(jar_id)
-        record = self._read_record(jar_id)
-        meta = self._meta_from_record(record)
-        # A delete is terminal: tombstone by reason before destroying the blob so the id can
-        # never be recreated, even by a caller that still holds it.
-        self._tombstones.record(jar_id, meta.generation, "deleted")
-        self._path(jar_id).unlink(missing_ok=True)
-        self._audit("jar_deleted", meta, actor)
-        return meta
+        with self._ops_lock():
+            record = self._read_record(jar_id)
+            meta = self._meta_from_record(record)
+            # A delete is terminal: tombstone by reason before destroying the blob so the id can
+            # never be recreated, even by a caller that still holds it.
+            self._tombstones.record(jar_id, meta.generation, "deleted")
+            self._path(jar_id).unlink(missing_ok=True)
+            self._audit("jar_deleted", meta, actor)
+            return meta
 
     # -- probe --------------------------------------------------------------
     def probe_allowed_at(self, meta: CookieJarMeta) -> datetime | None:

@@ -398,6 +398,9 @@ class SessionRegistry:
         async with self.locks[session_id]:
             self._raise_if_expired(session)
             self._authorize_human_token_locked(session, token)
+            # A jar-loaded session handed to a human keeps a live authenticated context behind
+            # noVNC; recheck the shared tombstone so a cross-process revoke tears it down here too.
+            await self._enforce_jar_not_revoked_locked(session)
             return session
 
     async def authorize_handoff_page(self, session_id: str, token: str) -> BrowserSession:
@@ -410,6 +413,7 @@ class SessionRegistry:
                 # allow_pending lets the page reload while a handover is pending: the human
                 # still holds their control token and can see state / cancel from the UI.
                 self._authorize_human_token_locked(session, token, allow_pending=True)
+            await self._enforce_jar_not_revoked_locked(session)
             return session
 
     async def agent_command(self, session_id: str, req: AgentCommandRequest) -> AgentCommandResponse:
@@ -432,14 +436,7 @@ class SessionRegistry:
             # session set, so a jar-loaded (or jar-producing) session would keep serving an
             # authenticated context until it noticed. Consulting the shared, durable tombstone
             # before each command turns the kill-switch into a near-real-time, cross-process one.
-            revoked = self._revoked_jar_for(session)
-            if revoked is not None:
-                session.lease_owner = LeaseOwner.NONE
-                session.state = SessionState.CANCELLED
-                await self._cleanup_locked(session)
-                session.updated_at = now_utc()
-                self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked", "jar_id": revoked})
-                raise SessionInactiveError("the jar backing this session was revoked")
+            await self._enforce_jar_not_revoked_locked(session)
             worker = self.workers.get(session.worker_id or "")
             if worker is None or worker.closed:
                 session.lease_owner = LeaseOwner.NONE
@@ -697,6 +694,22 @@ class SessionRegistry:
             meta = self.jar_store.delete(jar_id, actor=actor)
             await self._close_sessions_for_jar(jar_id, reason="jar_deleted")
             return meta
+
+    async def _enforce_jar_not_revoked_locked(self, session: BrowserSession) -> None:
+        """If a jar backing this session was revoked (possibly by another process), close the
+        session and its worker and raise. Called from every path that keeps an authenticated
+        context alive — agent commands AND noVNC/human-control authorization — so the kill-switch
+        also tears down a live human-driven browser, not just future loads."""
+        if session.state in TERMINAL_STATES:
+            return
+        revoked = self._revoked_jar_for(session)
+        if revoked is not None:
+            session.lease_owner = LeaseOwner.NONE
+            session.state = SessionState.CANCELLED
+            await self._cleanup_locked(session)
+            session.updated_at = now_utc()
+            self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked", "jar_id": revoked})
+            raise SessionInactiveError("the jar backing this session was revoked")
 
     def _revoked_jar_for(self, session: BrowserSession) -> str | None:
         """Return a jar id backing ``session`` that is now revoked (invalidated/deleted/rolled
