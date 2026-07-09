@@ -42,6 +42,17 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .models import CookieJarMeta, JarProbeConfig, ProbeResultName, StorageMode, now_utc
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_netloc(scheme: str, host: str, port: int | None) -> str:
+    """Host plus port, with the scheme's default port canonicalized away so ``https://h`` and
+    ``https://h:443`` compare equal (else confinement/probe treat them as different origins)."""
+    if port is not None and port != _DEFAULT_PORTS.get(scheme):
+        return f"{host}:{port}"
+    return host
+
+
 JAR_KEY_ENV = "BROWSER_JAR_KEY"
 JAR_DIR_ENV = "BROWSER_JAR_DIR"
 JAR_MAX_BYTES_ENV = "BROWSER_JAR_MAX_BYTES"
@@ -115,8 +126,7 @@ def normalize_origin(value: str) -> str | None:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
-    host = parsed.hostname.lower()
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    netloc = _canonical_netloc(parsed.scheme, parsed.hostname.lower(), parsed.port)
     return f"{parsed.scheme}://{netloc}"
 
 
@@ -130,8 +140,7 @@ def redact_probe_url(value: str) -> str | None:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
-    host = parsed.hostname.lower()
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    netloc = _canonical_netloc(parsed.scheme, parsed.hostname.lower(), parsed.port)
     return urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
 
 
@@ -298,54 +307,98 @@ class TombstoneStore:
     closed whenever a file's generation is <= the tombstoned generation — so a restored old
     jar file is rejected, closing the rollback.
 
-    The anchor lives *outside* ``BROWSER_JAR_DIR`` (its parent by default). Honest residual: a
-    deployment that keeps the anchor on the same filesystem gets rollback-proofing only
-    against single-file tampering, not a whole-filesystem restore; a KMS/DB/WORM anchor is the
-    documented way to get the stronger guarantee."""
+    The high-water mark is derived by replaying the **HMAC-authenticated** log on each check
+    (not from a trusted plaintext file), and re-derived whenever the log changes on disk — so
+    another worker/pod's revocation is observed without a restart, and editing a single
+    plaintext anchor file cannot lower a revoked generation. Forged log entries (appended
+    without ``BROWSER_JAR_KEY``) fail the chain and are ignored.
 
-    def __init__(self, log_path: Path, anchor_path: Path, hmac_key: bytes) -> None:
+    ``external_anchor_path`` is an *optional* operator-provided trusted high-water (a KMS/DB/WORM
+    export) that can only *raise* the mark, closing the one residual — truncation of the on-disk
+    log — that HMAC chaining alone cannot detect. Absent it, protection is against single-file
+    tampering and forged appends, not a whole-filesystem restore that also truncates the log."""
+
+    def __init__(self, log_path: Path, external_anchor_path: Path, hmac_key: bytes) -> None:
         self._log_path = log_path
-        self._anchor_path = anchor_path
+        self._external_anchor_path = external_anchor_path
         self._hmac_key = hmac_key
-        self._anchor: dict[str, dict[str, Any]] = {}
-        self._load_anchor()
-
-    def _load_anchor(self) -> None:
-        if self._anchor_path.exists():
-            try:
-                self._anchor = json.loads(self._anchor_path.read_text())
-            except Exception:
-                self._anchor = {}
-
-    def _persist_anchor(self) -> None:
-        _atomic_write(self._anchor_path, json.dumps(self._anchor).encode("utf-8"))
+        self._cache: dict[str, dict[str, Any]] = {}
+        self._cache_mtime: float | None = None
+        self._cache_valid = False
 
     def _chain_hmac(self, prev: str, payload: str) -> str:
         return hmac.new(self._hmac_key, (prev + "\n" + payload).encode("utf-8"), hashlib.sha256).hexdigest()
 
+    def _payload(self, jar_id: str, generation: int, reason: str) -> str:
+        return json.dumps({"jar_id": jar_id, "generation": generation, "reason": reason}, sort_keys=True)
+
+    @staticmethod
+    def _fold(anchor: dict[str, dict[str, Any]], jar_id: str, generation: int, reason: str) -> None:
+        current = anchor.get(jar_id, {"generation": 0, "reason": reason})
+        # A delete is terminal and always wins over an invalidation at the same generation.
+        new_reason = "deleted" if reason == "deleted" or current.get("reason") == "deleted" else "invalidated"
+        anchor[jar_id] = {"generation": max(generation, current.get("generation", 0)), "reason": new_reason}
+
+    def _rebuild(self) -> dict[str, dict[str, Any]]:
+        anchor: dict[str, dict[str, Any]] = {}
+        if self._log_path.exists():
+            prev = ""
+            for line in self._log_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    expected = self._chain_hmac(
+                        prev, self._payload(record["jar_id"], record["generation"], record["reason"])
+                    )
+                except Exception:
+                    break
+                if not hmac.compare_digest(expected, str(record.get("hmac", ""))):
+                    # Tampered/forged entry: the verified prefix is authoritative; stop here.
+                    break
+                prev = record["hmac"]
+                self._fold(anchor, record["jar_id"], record["generation"], record["reason"])
+        # An optional trusted external anchor may only RAISE the mark (close the truncation gap).
+        if self._external_anchor_path.exists():
+            try:
+                external = json.loads(self._external_anchor_path.read_text())
+            except Exception:
+                external = {}
+            for jar_id, entry in external.items() if isinstance(external, dict) else []:
+                self._fold(anchor, jar_id, int(entry.get("generation", 0)), str(entry.get("reason", "invalidated")))
+        return anchor
+
+    def _current(self) -> dict[str, dict[str, Any]]:
+        try:
+            mtime = self._log_path.stat().st_mtime if self._log_path.exists() else None
+        except OSError:
+            mtime = None
+        if not self._cache_valid or mtime != self._cache_mtime:
+            self._cache = self._rebuild()
+            self._cache_mtime = mtime
+            self._cache_valid = True
+        return self._cache
+
     def record(self, jar_id: str, generation: int, reason: str) -> None:
         prev = ""
         if self._log_path.exists():
-            lines = self._log_path.read_text().splitlines()
-            if lines:
-                try:
-                    prev = json.loads(lines[-1])["hmac"]
-                except Exception:
-                    prev = ""
-        payload = json.dumps({"jar_id": jar_id, "generation": generation, "reason": reason}, sort_keys=True)
+            for line in reversed(self._log_path.read_text().splitlines()):
+                if line.strip():
+                    try:
+                        prev = json.loads(line)["hmac"]
+                    except Exception:
+                        prev = ""
+                    break
+        payload = self._payload(jar_id, generation, reason)
         record = {"jar_id": jar_id, "generation": generation, "reason": reason, "hmac": self._chain_hmac(prev, payload)}
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._log_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
-        current = self._anchor.get(jar_id, {"generation": 0, "reason": reason})
-        if generation >= current.get("generation", 0) or reason == "deleted":
-            # A delete is terminal and always wins over an invalidation at the same generation.
-            new_reason = "deleted" if reason == "deleted" or current.get("reason") == "deleted" else "invalidated"
-            self._anchor[jar_id] = {"generation": max(generation, current.get("generation", 0)), "reason": new_reason}
-            self._persist_anchor()
+        self._cache_valid = False  # force a re-derive from the authenticated log on next check
 
     def blocked_reason(self, jar_id: str, generation: int) -> str | None:
         """Return why a jar file at ``generation`` is blocked, or None if loadable."""
-        entry = self._anchor.get(jar_id)
+        entry = self._current().get(jar_id)
         if entry is None:
             return None
         if entry.get("reason") == "deleted":
@@ -355,7 +408,7 @@ class TombstoneStore:
         return None
 
     def is_deleted(self, jar_id: str) -> bool:
-        entry = self._anchor.get(jar_id)
+        entry = self._current().get(jar_id)
         return bool(entry and entry.get("reason") == "deleted")
 
 
@@ -573,7 +626,7 @@ class JarStore:
         jar_id: str | None,
         label: str,
         origins: list[str],
-        nav_allowlist: list[str],
+        nav_allowlist: list[str] | None,
         storage_mode: StorageMode | None,
         raw_storage_state: dict[str, Any],
         probe_spec_url: str | None,
@@ -604,7 +657,7 @@ class JarStore:
             resolved_origins = [o for o in (normalize_origin(x) for x in origins) if o]
             if not resolved_origins:
                 raise JarValidationError("a jar must declare at least one origin")
-            resolved_allowlist = [o for o in (normalize_origin(x) for x in nav_allowlist) if o]
+            resolved_allowlist = [o for o in (normalize_origin(x) for x in (nav_allowlist or [])) if o]
             resolved_storage_mode = storage_mode or "all"
 
         probe = self.build_probe(
@@ -633,7 +686,12 @@ class JarStore:
             version=(existing.version + 1) if existing else 1,
             generation=(existing.generation + 1) if existing else 1,
             saved_by="human" if saved_by == "human" else "agent",
-            owner_subject=owner_subject,
+            # Preserve the stored owner on refresh when the caller has no subject (an agent/service
+            # refresh of a human-owned jar), so it does not silently become ownerless and vanish
+            # from the human's subject-scoped /jars view.
+            owner_subject=owner_subject
+            if owner_subject is not None
+            else (existing.owner_subject if existing else None),
             form_factor=form_factor,
             storage_mode=resolved_storage_mode,
             created_session_id=existing.created_session_id if existing else created_session_id,
@@ -657,7 +715,7 @@ class JarStore:
         self,
         existing: CookieJarMeta,
         origins: list[str],
-        nav_allowlist: list[str],
+        nav_allowlist: list[str] | None,
         storage_mode: StorageMode | None,
     ) -> tuple[list[str], list[str], StorageMode]:
         """A refresh may only preserve or narrow scope: it re-filters against the *stored* scope,
@@ -672,13 +730,15 @@ class JarStore:
             resolved_origins = list(existing.origins)
 
         stored_allowlist = set(existing.nav_allowlist)
-        if nav_allowlist is not None and nav_allowlist:
+        if nav_allowlist is None:
+            # Omitted => preserve the stored allowlist.
+            resolved_allowlist = list(existing.nav_allowlist)
+        else:
+            # Explicit (including []) => narrow to exactly this subset (an empty list clears it).
             requested_allow = {o for o in (normalize_origin(x) for x in nav_allowlist) if o}
             if not requested_allow <= stored_allowlist:
                 raise JarValidationError("refresh cannot widen nav_allowlist; create a new jar")
             resolved_allowlist = sorted(requested_allow)
-        else:
-            resolved_allowlist = list(existing.nav_allowlist)
 
         if storage_mode is None:
             resolved_mode: StorageMode = existing.storage_mode
@@ -743,16 +803,23 @@ class JarStore:
         # for a jar whose blob can no longer be decrypted after a key rotation. The tombstone —
         # not the cleartext invalidated_at — is the rollback-proof block on load/probe.
         self._tombstones.record(jar_id, meta.generation, "invalidated")
-        meta.invalidated_at = now_utc()
-        meta.updated_at = meta.invalidated_at
+        # Decrypt with the ORIGINAL metadata first — invalidated_at is AAD-bound, so mutating it
+        # before decrypt would change the AAD and make the current-key decrypt fail spuriously.
         try:
             payload = self._decrypt(meta, record)
         except JarDecryptError:
-            # Rotated/corrupt key: cannot re-seal (invalidated_at is not AAD-bound here), but the
-            # jar is already unloadable (decrypt fails on load too) and the tombstone blocks it.
+            # Rotated/corrupt key: cannot re-seal, but still persist the cleartext invalidated_at
+            # (so listings/UI show "needs re-login") without re-encrypting the undecryptable blob.
+            meta.invalidated_at = now_utc()
+            meta.updated_at = meta.invalidated_at
+            record["meta"] = meta.model_dump(mode="json")
+            _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
             self._audit("jar_invalidated", meta, "service")
             return meta
-        # Re-seal with invalidated_at bound as AAD so clearing it in cleartext fails closed.
+        # Now set invalidated_at and re-seal so it is bound as AAD (clearing it in cleartext then
+        # fails closed).
+        meta.invalidated_at = now_utc()
+        meta.updated_at = meta.invalidated_at
         self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
         self._audit("jar_invalidated", meta, "service")
         return meta

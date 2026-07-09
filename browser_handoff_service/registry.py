@@ -180,6 +180,12 @@ class SessionRegistry:
                 self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked"})
                 raise JarRevokedError("jar was revoked during load")
             self.jar_store.touch_loaded(req.jar_id or "")
+            # Confinement gates only agent-driven navigation. If the jar is loaded straight into a
+            # human-owned session (service token + initial_owner="human"), the human drives via
+            # noVNC and the handoff toggle never runs, so disable confinement now — otherwise the
+            # route guard would block the human's off-scope SSO/re-login navigation.
+            if session.lease_owner == LeaseOwner.HUMAN:
+                worker.set_confinement_active(False)
             self._event(
                 session,
                 "jar_loaded",
@@ -548,7 +554,9 @@ class SessionRegistry:
                 jar_id=req.jar_id,
                 label=req.label,
                 origins=origins,
-                nav_allowlist=list(req.nav_allowlist) if req.nav_allowlist else [],
+                # Pass None (omitted) vs [] (explicit) through so a refresh can distinguish
+                # "keep the stored allowlist" from "narrow it to no extra origins".
+                nav_allowlist=list(req.nav_allowlist) if req.nav_allowlist is not None else None,
                 storage_mode=req.storage,
                 raw_storage_state=raw,
                 probe_spec_url=probe_url,

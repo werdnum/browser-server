@@ -427,6 +427,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
             <button id="handover" class="btn btn-primary">Hand over to agent</button>
           </div>
         </div>
+        {% if not session.jar_id %}
         <div class="field">
           <label for="save-jar-label">Save this login for the assistant</label>
           <input id="save-jar-label" type="text" placeholder="Name this login, e.g. Woolworths (me)" />
@@ -435,6 +436,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           </div>
           <p id="save-jar-status" class="muted" role="status" aria-live="polite"></p>
         </div>
+        {% endif %}
         <div class="actions">
           <button id="complete" class="btn">Complete</button>
           <button id="cancel" class="btn btn-danger">Cancel</button>
@@ -582,7 +584,10 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
         + JSON.stringify({token: result.handover_token});
       document.querySelector("#handover-result").hidden = false;
     });
-    document.querySelector("#save-jar").onclick = action(async () => {
+    // The "Save this login" action is only rendered for a jarless session (a jar-loaded
+    // session is re-filtered from its stored scope, never re-saved from the live page).
+    const saveJarBtn = document.querySelector("#save-jar");
+    if (saveJarBtn) saveJarBtn.onclick = action(async () => {
       const status = document.querySelector("#save-jar-status");
       const label = (document.querySelector("#save-jar-label").value || "").trim() || "Saved login";
       status.textContent = "Saving this login…";

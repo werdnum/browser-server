@@ -21,6 +21,7 @@ from browser_handoff_service.jars import (
     filter_storage_state,
     load_jar_keys,
     normalize_label,
+    normalize_origin,
     redact_probe_url,
     registrable_domain,
 )
@@ -712,3 +713,112 @@ async def test_agent_selector_dropped_when_present_on_logged_out_baseline(tmp_pa
     # A non-discriminating agent selector is dropped, so the jar reads uncertain, never fake-fresh.
     loaded = reg.jar_store.load(meta.jar_id)
     assert loaded.probe.logged_in_selector is None
+
+
+# --- regression tests for Codex review comments ---------------------------
+
+
+def test_normalize_origin_canonicalizes_default_ports():
+    assert normalize_origin("https://shop.example.com:443/x") == "https://shop.example.com"
+    assert normalize_origin("http://shop.example.com:80/x") == "http://shop.example.com"
+    # A non-default port is preserved.
+    assert normalize_origin("https://shop.example.com:8443/x") == "https://shop.example.com:8443"
+
+
+def test_invalidate_persists_cleartext_flag_under_current_key(tmp_path):
+    # Regression: setting invalidated_at before decrypt made the current-key re-seal fail, so the
+    # cleartext flag was never written and listings showed the jar as not needing re-login.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.invalidate(meta.jar_id)
+    # The re-sealed jar still decrypts (current key) and its metadata shows the invalidation.
+    assert store.get_meta_verified(meta.jar_id).invalidated_at is not None
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+def test_owner_subject_preserved_on_agent_refresh(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store, owner_subject="user123")
+    # An agent/service refresh carries no subject; the human owner must survive.
+    refreshed = save_login(store, jar_id=meta.jar_id, owner_subject=None)
+    assert refreshed.owner_subject == "user123"
+
+
+def test_tombstone_visible_across_instances_sharing_the_dir(tmp_path):
+    key = _key()
+    a = make_store(tmp_path, keys=key)
+    meta = save_login(a)
+    b = make_store(tmp_path, keys=key)  # separate long-lived instance, same jar dir
+    assert b.load(meta.jar_id).meta.jar_id == meta.jar_id
+    a.invalidate(meta.jar_id)  # revoked via instance A
+    with pytest.raises(JarRevokedError):
+        b.load(meta.jar_id)  # instance B re-derives from the shared log and observes it
+
+
+def test_forged_tombstone_log_entry_is_ignored(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.delete(meta.jar_id)  # terminal tombstone (authenticated)
+    log = tmp_path / "jar-tombstones.jsonl"
+    forged = {"jar_id": meta.jar_id, "generation": 9999, "reason": "invalidated", "hmac": "00" * 32}
+    with log.open("a") as handle:
+        handle.write(json.dumps(forged) + "\n")
+    # The forged entry fails the HMAC chain, so the verified prefix (deleted) still stands: a
+    # re-save of the deleted id is refused despite the forged "invalidated" line.
+    with pytest.raises(JarRevokedError):
+        save_login(store, jar_id=meta.jar_id)
+
+
+def test_external_anchor_cannot_lower_revoked_generation(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.invalidate(meta.jar_id)
+    # An attacker who can edit the plaintext anchor file (but not the key) tries to clear it.
+    (tmp_path / "jar-anchor.json").write_text(json.dumps({meta.jar_id: {"generation": 0, "reason": "invalidated"}}))
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)  # high-water comes from the authenticated log, not the anchor
+
+
+def test_refresh_explicit_empty_nav_allowlist_narrows(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store, nav_allowlist=["https://api.example.com"])
+    assert meta.nav_allowlist == ["https://api.example.com"]
+    # Explicit [] clears the allowlist; None preserves it.
+    narrowed = store.save(
+        jar_id=meta.jar_id,
+        label="Shop",
+        origins=[],
+        nav_allowlist=[],
+        storage_mode=None,
+        raw_storage_state=LOGIN_STATE,
+        probe_spec_url=None,
+        probe_selector="[x]",
+        probe_logged_out_prefix=None,
+        saved_by="human",
+        owner_subject="user123",
+        form_factor="desktop",
+        created_session_id="bs_1",
+        conversation_id="conv_1",
+        agent_supplied_probe=False,
+    )
+    assert narrowed.nav_allowlist == []
+
+
+@pytest.mark.asyncio
+async def test_human_owned_jar_load_disables_confinement(tmp_path):
+    # A service-token create with initial_owner="human" + jar_id loads a jar into a human-driven
+    # session; confinement (agent-only) must be off so the human is not trapped.
+    reg = registry_with_store(tmp_path)
+    producer, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        producer.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    human_loaded, _ = await reg.create_session(
+        CreateSessionRequest(conversation_id="c2", initial_owner="human", jar_id=meta.jar_id),
+        owner_subject="user123",
+    )
+    assert human_loaded.jar_id == meta.jar_id
+    assert fake_worker(reg, human_loaded.worker_id)._confinement_active is False
