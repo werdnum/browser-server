@@ -17,6 +17,7 @@ from browser_handoff_service.jars import (
     JarDecryptError,
     JarDisabledError,
     JarError,
+    JarNotFoundError,
     JarRevokedError,
     JarStore,
     JarValidationError,
@@ -2204,3 +2205,47 @@ async def test_self_refresh_narrowing_tightens_worker_confinement(tmp_path):
     )
     assert "https://api.example.com" not in worker.confine_origins  # live worker tightened
     assert "https://shop.example.com" in worker.confine_origins
+
+
+# --- regression tests for Codex review round 18 ---------------------------
+
+
+def test_invalidate_succeeds_when_reseal_fails_after_tombstone(tmp_path, monkeypatch):
+    # If the post-tombstone re-seal fails (disk full), invalidate must still succeed: the tombstone
+    # is the durable commit, so the caller can close live sessions and the jar stays revoked.
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    real_atomic = jars_mod._atomic_write
+
+    def flaky(path, data, mode=0o600, *, before_rename=None):
+        if path.name == f"{meta.jar_id}.json":  # the jar re-seal, not the tombstone/anchor
+            raise OSError("jar volume full")
+        return real_atomic(path, data, mode, before_rename=before_rename)
+
+    monkeypatch.setattr(jars_mod, "_atomic_write", flaky)
+    result = store.invalidate(meta.jar_id)  # must not raise
+    assert result.invalidated_at is not None
+    monkeypatch.undo()
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)  # still revoked via the committed tombstone
+
+
+def test_jar_file_deleted_mid_read_is_not_found_not_crash(tmp_path, monkeypatch):
+    # A shared-volume race where the file vanishes between exists() and read must surface as a
+    # controlled JarNotFoundError, not an opaque 500.
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    real_read_text = jars_mod.Path.read_text
+
+    def vanishing_read_text(self, *args, **kwargs):
+        if self.name == f"{meta.jar_id}.json":
+            raise FileNotFoundError(self)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(jars_mod.Path, "read_text", vanishing_read_text)
+    with pytest.raises(JarNotFoundError):
+        store.load(meta.jar_id)

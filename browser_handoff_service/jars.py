@@ -805,6 +805,10 @@ class JarStore:
             raise JarNotFoundError(jar_id)
         try:
             record = json.loads(path.read_text())
+        except FileNotFoundError as exc:
+            # Raced another pod's DELETE on the shared volume between exists() and open(): the jar is
+            # gone, so surface a controlled missing/revoked response, not an opaque 500.
+            raise JarNotFoundError(jar_id) from exc
         except ValueError as exc:
             # Unparseable file (corrupted/tampered): a controlled corruption error, not a 500.
             raise JarDecryptError("jar file is not valid JSON (corrupted)", kind="corruption") from exc
@@ -1309,7 +1313,7 @@ class JarStore:
             meta.invalidated_at = now_utc()
             meta.updated_at = meta.invalidated_at
             record["meta"] = meta.model_dump(mode="json")
-            _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
+            self._write_cleartext_best_effort(jar_id, json.dumps(record).encode("utf-8"))
             self._audit("jar_invalidated", meta, actor)
             return meta
         # Decryptable: the generation is authenticated. Tombstone it, then re-seal with
@@ -1317,9 +1321,24 @@ class JarStore:
         self._tombstones.record(jar_id, meta.generation, "invalidated")
         meta.invalidated_at = now_utc()
         meta.updated_at = meta.invalidated_at
-        self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
+        # The fsync'd tombstone above is the durable commit; the re-seal is best-effort. If it fails
+        # (disk full / unwritable) the kill-switch still holds — blocked_reason reads the tombstone —
+        # and the caller (registry.invalidate_jar) still closes live sessions on return, so a failed
+        # re-seal must not abort the invalidate.
+        try:
+            self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
+        except OSError:
+            logger.warning("jar %s re-seal after invalidate failed; tombstone remains authoritative", jar_id)
         self._audit("jar_invalidated", meta, actor)
         return meta
+
+    def _write_cleartext_best_effort(self, jar_id: str, data: bytes) -> None:
+        # For the un-decryptable invalidate branch: the tombstone is already committed, so a failure
+        # to stamp cleartext invalidated_at into the (already un-loadable) file must not abort.
+        try:
+            _atomic_write(self._path(jar_id), data)
+        except OSError:
+            logger.warning("jar %s cleartext invalidate stamp failed; tombstone remains authoritative", jar_id)
 
     def delete(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_enabled()
