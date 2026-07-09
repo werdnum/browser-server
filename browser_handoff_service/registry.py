@@ -143,6 +143,7 @@ class SessionRegistry:
             if confine:
                 confine_origins = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
             session.jar_id = loaded.meta.jar_id
+            session.jar_generation = loaded.meta.generation
             session.jar_origins = list(loaded.meta.origins)
             session.jar_nav_allowlist = list(loaded.meta.nav_allowlist)
             session.jar_registrable_domains = list(loaded.meta.registrable_domains)
@@ -587,6 +588,7 @@ class SessionRegistry:
             # Provenance only: a set, because one session can produce several jars, and the
             # producing context holds the *unfiltered* login state (never tagged with jar_id).
             session.produced_jar_ids.add(meta.jar_id)
+            session.produced_jar_generations[meta.jar_id] = meta.generation
             session.updated_at = now_utc()
             self._event(
                 session,
@@ -717,16 +719,18 @@ class SessionRegistry:
             raise SessionInactiveError("the jar backing this session was revoked")
 
     def _revoked_jar_for(self, session: BrowserSession) -> str | None:
-        """Return a jar id backing ``session`` that is now revoked (invalidated/deleted/rolled
-        back), consulting the shared durable tombstone — or None. Covers both a jar-loaded
-        session and one that produced a jar (which holds the unfiltered login state)."""
+        """Return a jar id backing ``session`` whose *seeded* generation is now revoked
+        (invalidated/deleted), consulting the shared durable tombstone — or None. Compares the
+        authenticated generation captured at load/produce time, so a later higher-generation
+        re-login cannot mask that the running context's own generation was tombstoned. Covers both
+        a jar-loaded session and one that produced a jar (which holds the unfiltered login state)."""
         if not self.jar_store.enabled:
             return None
-        candidates = list(session.produced_jar_ids)
+        candidates: list[tuple[str, int | None]] = list(session.produced_jar_generations.items())
         if session.jar_id is not None:
-            candidates.append(session.jar_id)
-        for jar_id in candidates:
-            if not self.jar_store.recheck_loadable(jar_id):
+            candidates.append((session.jar_id, session.jar_generation))
+        for jar_id, generation in candidates:
+            if self.jar_store.is_revoked_generation(jar_id, generation):
                 return jar_id
         return None
 
@@ -753,14 +757,19 @@ class SessionRegistry:
         probe target under the same exact-origin guard as a jar-loaded session, apply the
         success indicator, and tear the context down. Never returns page content. Rate-limited."""
         self._require_jars_enabled()
+        # Hold the jar lock only for the load + rate-check, then release it before the network
+        # probe (browser startup + navigation) so a concurrent DELETE/invalidate — the real-time
+        # kill-switch — is not blocked behind a slow probe target. record_probe re-takes the lock.
         async with self._jar_lock(jar_id):
             loaded = self.jar_store.load(jar_id)  # raises if invalidated/revoked/disabled
             next_allowed = self.jar_store.probe_allowed_at(loaded.meta)
             if next_allowed is not None:
                 raise ConflictError("probe is rate-limited; try again later")
-            result, final_origin = await self._run_probe(loaded)
+        result, final_origin = await self._run_probe(loaded)
+        # If the jar was revoked/deleted while the probe ran, skip persisting a stale result.
+        if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
             self.jar_store.record_probe(jar_id, result)
-            return ProbeResult(result=result, final_origin=final_origin)
+        return ProbeResult(result=result, final_origin=final_origin)
 
     async def _run_probe(self, loaded) -> tuple[ProbeResultName, str | None]:
         probe = loaded.probe

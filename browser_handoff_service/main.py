@@ -28,6 +28,7 @@ from .jars import (
     JarNotFoundError,
     JarRevokedError,
     JarValidationError,
+    _stub_meta,
 )
 from .models import (
     AgentCommandRequest,
@@ -981,6 +982,10 @@ def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
     if auth.actor_type == "agent":
         try:
             return registry.get_jar_unverified(jar_id)
+        except (JarValidationError, JarDecryptError):
+            # A corrupt/unreadable file must not block the service-token kill-switch: return a
+            # stub so DELETE/invalidate still reach the store (which tombstones by path id).
+            return _stub_meta(jar_id)
         except Exception as exc:
             raise map_errors(exc) from exc
     try:

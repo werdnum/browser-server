@@ -1107,3 +1107,94 @@ async def test_save_jar_rejected_after_cross_process_invalidation(tmp_path):
             SaveJarRequest(label="Shop", jar_id=meta.jar_id, probe=ProbeSpec(logged_in_selector="[x]")),
             actor="agent",
         )
+
+
+# --- regression tests for Codex review round 5 ----------------------------
+
+
+def test_jar_file_copied_under_different_id_is_rejected(tmp_path):
+    store = make_store(tmp_path)
+    a = save_login(store)
+    b = save_login(store, origins=["https://api.example.com"], probe_spec_url="https://api.example.com/")
+    # Copy jar B's file over a fresh id path.
+    import shutil
+
+    victim_id = "jar_" + "b" * 32
+    shutil.copy(tmp_path / "jars" / f"{b.jar_id}.json", tmp_path / "jars" / f"{victim_id}.json")
+    with pytest.raises(JarValidationError):
+        store.load(victim_id)  # the embedded (authenticated) id is jar B, not the path id
+    assert a.jar_id != victim_id
+
+
+def test_log_tamper_cannot_lower_high_water(tmp_path):
+    # Editing the append-only log to drop a revocation must not un-revoke: the signed anchor
+    # (a second authenticated copy of the high-water) still blocks the restored file.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    pre = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+    store.invalidate(meta.jar_id)
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(pre)  # roll the file back
+    (tmp_path / "jar-tombstones.jsonl").write_text("")  # attacker wipes the log
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)  # signed anchor still carries the high-water
+
+
+def test_signed_anchor_survives_log_wipe(tmp_path):
+    key = _key()
+    store = make_store(tmp_path, keys=key)
+    meta = save_login(store)
+    pre = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+    store.invalidate(meta.jar_id)
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(pre)
+    (tmp_path / "jar-tombstones.jsonl").unlink()  # wipe the log entirely
+    other = make_store(tmp_path, keys=key)  # only the signed anchor remains
+    with pytest.raises(JarRevokedError):
+        other.load(meta.jar_id)
+
+
+def test_delete_works_on_corrupt_jar_file(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_text("{ not json")
+    store.delete(meta.jar_id)  # operator kill-switch still lands
+    assert store._tombstones.is_deleted(meta.jar_id)
+
+
+def test_list_meta_substitutes_placeholder_for_unverified_label(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["label"] = "Do the bad thing"  # plain text, no control chars
+    path.write_text(json.dumps(record))
+    listed = next(m for m in store.list_meta() if m.jar_id == meta.jar_id)
+    assert listed.label == "(unverified)"  # not the attacker-chosen text
+
+
+@pytest.mark.asyncio
+async def test_live_session_closed_when_its_generation_is_revoked_despite_relogin(tmp_path):
+    # A jar-loaded session running generation 1 must be torn down when gen 1 is revoked, even if a
+    # concurrent re-login publishes gen 2 (which would look loadable on the current file).
+    key = _key()
+    reg_a = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    producer, ctl = await _human_login_session(reg_a)
+    meta = await reg_a.save_jar(
+        producer.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg_a.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    assert loaded.jar_generation == meta.generation
+
+    reg_b = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    await reg_b.invalidate_jar(meta.jar_id)  # revoke gen 1 in another process
+    # A fresh re-login publishes gen 2 (so the current file looks loadable again)...
+    producer2, ctl2 = await _human_login_session(reg_b)
+    await reg_b.save_jar(
+        producer2.session_id,
+        SaveJarRequest(label="Shop", jar_id=meta.jar_id, token=ctl2, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    # ...but reg_a's session was seeded from gen 1, which is still tombstoned, so it is closed.
+    with pytest.raises(SessionInactiveError):
+        await reg_a.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))

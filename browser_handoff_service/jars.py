@@ -328,23 +328,23 @@ def load_jar_keys() -> list[tuple[str, bytes]]:
 
 
 class TombstoneStore:
-    """Append-only, HMAC-chained revocation log plus an external high-water anchor.
+    """Rollback-proof revocation high-water, kept as TWO authenticated copies:
 
-    The log records ``(jar_id, generation, reason)`` for every revocation; the anchor keeps
-    the max tombstoned generation per jar. ``load``/``probe`` consult the anchor and fail
-    closed whenever a file's generation is <= the tombstoned generation — so a restored old
-    jar file is rejected, closing the rollback.
+    1. An append-only, HMAC-chained log of ``(jar_id, generation, reason)`` — the audit trail.
+       Replayed and verified on every check; a forged/tampered line fails the chain and is
+       skipped, and new entries chain from the last *verified* entry (an injected line cannot
+       poison later revocations).
+    2. A self-maintained, HMAC-*signed* anchor file (a second authenticated copy of the per-jar
+       max). ``load``/``probe`` fold BOTH and block whenever a jar file's generation is <= the
+       resulting high-water.
 
-    The high-water mark is derived by replaying the **HMAC-authenticated** log on each check
-    (not from a trusted plaintext file), and re-derived whenever the log changes on disk — so
-    another worker/pod's revocation is observed without a restart, and editing a single
-    plaintext anchor file cannot lower a revoked generation. Forged log entries (appended
-    without ``BROWSER_JAR_KEY``) fail the chain and are ignored.
-
-    ``external_anchor_path`` is an *optional* operator-provided trusted high-water (a KMS/DB/WORM
-    export) that can only *raise* the mark, closing the one residual — truncation of the on-disk
-    log — that HMAC chaining alone cannot detect. Absent it, protection is against single-file
-    tampering and forged appends, not a whole-filesystem restore that also truncates the log."""
+    The two copies close single-file tampering: editing the log alone cannot lower the mark (the
+    signed anchor still carries it); editing the anchor alone breaks its HMAC and it is ignored
+    (the log covers it). Both are re-read fresh per check (no cache) for NFS close-to-open
+    consistency, so another pod's revocation is seen without a restart. Documented residual: a
+    whole-filesystem rollback that reverts BOTH the log and the anchor together — that needs the
+    anchor on external monotonic/WORM storage, which an operator can mount at
+    ``external_anchor_path``."""
 
     def __init__(self, log_path: Path, external_anchor_path: Path, hmac_keys: list[bytes]) -> None:
         self._log_path = log_path
@@ -369,12 +369,11 @@ class TombstoneStore:
         new_reason = "deleted" if reason == "deleted" or current.get("reason") == "deleted" else "invalidated"
         anchor[jar_id] = {"generation": max(generation, current.get("generation", 0)), "reason": new_reason}
 
-    def _replay(self) -> tuple[dict[str, dict[str, Any]], str]:
-        """Replay the log, verifying each line's HMAC against any configured key. A forged or
-        malformed line is SKIPPED (not a stop) and does not advance the chain, so a legitimate
-        revocation appended after an injected line is still observed — and its ``prev`` chains
-        from the last *verified* entry, never a forged tail. Returns (high-water anchor,
-        last-verified hmac)."""
+    def _replay_log(self) -> tuple[dict[str, dict[str, Any]], str]:
+        """Replay only the append-only log, verifying each line's HMAC against any configured key.
+        A forged or malformed line is SKIPPED (not a stop) and does not advance the chain, so a
+        legitimate revocation appended after an injected line is still observed — and its ``prev``
+        chains from the last *verified* entry. Returns (high-water anchor, last-verified hmac)."""
         anchor: dict[str, dict[str, Any]] = {}
         prev = ""
         if self._log_path.exists():
@@ -390,30 +389,55 @@ class TombstoneStore:
                     continue  # forged/tampered line: skip without advancing the verified chain
                 prev = record["hmac"]
                 self._fold(anchor, record["jar_id"], record["generation"], record["reason"])
-        # An optional trusted external anchor may only RAISE the mark (close the truncation gap).
-        if self._external_anchor_path.exists():
-            try:
-                external = json.loads(self._external_anchor_path.read_text())
-            except Exception:
-                external = {}
-            for jar_id, entry in external.items() if isinstance(external, dict) else []:
-                self._fold(anchor, jar_id, int(entry.get("generation", 0)), str(entry.get("reason", "invalidated")))
+        return anchor, prev
+
+    def _anchor_mac(self, jars: dict[str, dict[str, Any]]) -> str:
+        canonical = json.dumps(jars, sort_keys=True, separators=(",", ":"))
+        return self._chain_hmac("", canonical, self._hmac_keys[0])
+
+    def _read_signed_anchor(self) -> dict[str, dict[str, Any]]:
+        """The self-maintained, HMAC-signed high-water anchor. It is a second *authenticated*
+        copy of the mark, so tampering the log alone (dropping a revocation line) cannot lower the
+        effective high-water — the signed anchor still carries it. A tampered anchor fails its
+        HMAC and is ignored (the log then covers it). Defeating both at once requires forging this
+        HMAC (needs the key) or deleting the anchor *and* tampering the log — the documented
+        whole-filesystem-rollback residual that an external monotonic/WORM anchor closes."""
+        if not self._external_anchor_path.exists():
+            return {}
+        try:
+            doc = json.loads(self._external_anchor_path.read_text())
+            jars = doc["jars"]
+            mac = str(doc["hmac"])
+        except Exception:
+            return {}
+        if not isinstance(jars, dict):
+            return {}
+        if not any(
+            hmac.compare_digest(self._chain_hmac("", json.dumps(jars, sort_keys=True, separators=(",", ":")), k), mac)
+            for k in self._hmac_keys
+        ):
+            return {}
+        return jars
+
+    def _replay(self) -> tuple[dict[str, dict[str, Any]], str]:
+        anchor, prev = self._replay_log()
+        for jar_id, entry in self._read_signed_anchor().items():
+            self._fold(anchor, jar_id, int(entry.get("generation", 0)), str(entry.get("reason", "invalidated")))
         return anchor, prev
 
     def _current(self) -> dict[str, dict[str, Any]]:
-        # Re-derive from the on-disk log on every revocation-critical check rather than caching:
-        # on a shared (NFS-backed, e.g. Longhorn RWX) volume, opening the log fresh gives
-        # close-to-open consistency with another pod's just-committed revocation, whereas an
+        # Re-derive from the on-disk log + signed anchor on every revocation-critical check rather
+        # than caching: on a shared (NFS-backed, e.g. Longhorn RWX) volume, opening them fresh
+        # gives close-to-open consistency with another pod's just-committed revocation, whereas an
         # mtime/attr cache could keep serving a revoked login for the NFS attribute-cache window.
-        # The log is small (one line per revoke/refresh) so a full verified replay is cheap;
-        # compaction is a future optimization, not a correctness need.
+        # Both are small so a full verified replay is cheap; compaction is a future optimization.
         anchor, _ = self._replay()
         return anchor
 
     def record(self, jar_id: str, generation: int, reason: str) -> None:
         # Chain from the last *verified* entry, not the last physical line, so an injected line
         # cannot poison the chain for subsequent real revocations.
-        _, prev = self._replay()
+        _, prev = self._replay_log()
         payload = self._payload(jar_id, generation, reason)
         record = {
             "jar_id": jar_id,
@@ -430,12 +454,13 @@ class TombstoneStore:
         if newly_created:
             # Persist the new directory entry too, so a crash right after acknowledging a
             # revocation cannot lose the whole log file from the page cache.
-            with contextlib.suppress(OSError):
-                dir_fd = os.open(str(self._log_path.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+            _fsync_dir(self._log_path.parent)
+        # Update the signed high-water anchor (a second authenticated copy of the mark) so a later
+        # tamper of the log alone cannot lower the effective high-water below this point.
+        combined, _ = self._replay()
+        self._fold(combined, jar_id, generation, reason)
+        doc = {"jars": combined, "hmac": self._anchor_mac(combined)}
+        _atomic_write(self._external_anchor_path, json.dumps(doc).encode("utf-8"))
 
     def blocked_reason(self, jar_id: str, generation: int) -> str | None:
         """Return why a jar file at ``generation`` is blocked, or None if loadable."""
@@ -460,8 +485,18 @@ class TombstoneStore:
         return int(entry.get("generation", 0)) if entry else 0
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Durably commit a directory entry (a create/rename) so it survives a crash."""
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    """Write ``data`` to ``path`` atomically (temp file + fsync + rename), mode 0600."""
+    """Write ``data`` to ``path`` atomically (temp file + fsync + rename + dir fsync), mode 0600."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_")
     try:
@@ -471,6 +506,9 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
+        # fsync the directory so the rename (the new/updated entry) is itself durable — else a
+        # crash can lose an acknowledged save/refresh even though the temp file was fsync'd.
+        _fsync_dir(path.parent)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -511,6 +549,23 @@ class LoadedJar:
     meta: CookieJarMeta
     storage_state: dict[str, Any]
     probe: JarProbeConfig
+
+
+def _stub_meta(jar_id: str, label: str = "(unreadable jar)") -> CookieJarMeta:
+    """Minimal metadata for a jar whose file cannot be parsed — so a service-token kill-switch
+    (delete/invalidate) can still return a response and audit the action."""
+    now = now_utc()
+    return CookieJarMeta(
+        jar_id=jar_id,
+        label=label,
+        origins=[],
+        saved_by="agent",
+        created_session_id="",
+        conversation_id="",
+        created_at=now,
+        updated_at=now,
+        invalidated_at=now,
+    )
 
 
 class JarStore:
@@ -622,7 +677,18 @@ class JarStore:
         path = self._path(jar_id)
         if not path.exists():
             raise JarNotFoundError(jar_id)
-        return json.loads(path.read_text())
+        try:
+            record = json.loads(path.read_text())
+        except ValueError as exc:
+            # Unparseable file (corrupted/tampered): a controlled corruption error, not a 500.
+            raise JarDecryptError("jar file is not valid JSON (corrupted)", kind="corruption") from exc
+        # The path id must equal the embedded (AEAD-authenticated) meta.jar_id: otherwise a valid
+        # file for jar_B copied/restored as jar_A.json would authenticate as jar_B while the
+        # tombstone lookup uses jar_A, seeding a revoked login under a fresh id. jar_id is
+        # AAD-bound, so an attacker cannot rewrite it to match the path without breaking decrypt.
+        if not isinstance(record, dict) or record.get("meta", {}).get("jar_id") != jar_id:
+            raise JarValidationError("jar file id does not match its path")
+        return record
 
     def _write_record(self, meta: CookieJarMeta, storage_state: dict[str, Any], probe: JarProbeConfig) -> None:
         payload = {"storage_state": storage_state, "probe": probe.model_dump()}
@@ -662,13 +728,24 @@ class JarStore:
             return metas
         for path in sorted(self.jar_dir.glob("jar_*.json")):
             try:
-                meta = self._meta_from_record(json.loads(path.read_text()))
+                record = json.loads(path.read_text())
+                meta = self._meta_from_record(record)
             except Exception:
+                continue
+            # A file whose name does not match its authenticated id (a copy/restore under a new
+            # name) is not a real jar for this id.
+            if path.stem != meta.jar_id:
                 continue
             # A restored/rolled-back jar file whose id was deleted (terminal tombstone) must not
             # reappear in listings, even though its blob is back on disk.
             if self._tombstones.is_deleted(meta.jar_id):
                 continue
+            # Authenticate the label (AAD-bound): a file edited without the key gets a safe
+            # placeholder rather than returning attacker-chosen text to the FA list surface.
+            try:
+                self._decrypt(meta, record)
+            except JarError:
+                meta.label = "(unverified)"
             # A file rolled back behind an invalidation tombstone would otherwise show as usable
             # (often with no cleartext invalidated_at); surface it as needing re-login so a
             # user/agent does not pick a jar that can never load.
@@ -938,6 +1015,16 @@ class JarStore:
         probe = JarProbeConfig.model_validate(payload.get("probe", {"url": ""}))
         return LoadedJar(meta=meta, storage_state=payload.get("storage_state", {}), probe=probe)
 
+    def is_revoked_generation(self, jar_id: str, generation: int | None) -> bool:
+        """Whether a SPECIFIC (authenticated) generation of a jar is revoked. Used for live-session
+        kill-switch checks against the generation actually seeded into the running context, so a
+        later higher-generation re-login cannot mask that the running context's generation was
+        tombstoned. Consults only the authenticated tombstone (no cleartext file trust)."""
+        if self._tombstones.is_deleted(jar_id):
+            return True
+        gen = generation if generation is not None else 0
+        return self._tombstones.blocked_reason(jar_id, gen) is not None
+
     def recheck_loadable(self, jar_id: str) -> bool:
         """Whether a jar is currently loadable — used both for the post-registration load race
         and for live-session revocation rechecks. Verifies the AEAD envelope so a file edited
@@ -974,7 +1061,17 @@ class JarStore:
             return self._invalidate_locked(jar_id, actor)
 
     def _invalidate_locked(self, jar_id: str, actor: str) -> CookieJarMeta:
-        record = self._read_record(jar_id)
+        try:
+            record = self._read_record(jar_id)
+        except JarNotFoundError:
+            raise
+        except JarError:
+            # Corrupt/unparseable/id-mismatched file: honor the kill-switch anyway. The generation
+            # is unknowable, so block every version fail-closed (the file stays but is unloadable).
+            self._tombstones.record(jar_id, _MAX_GENERATION, "invalidated")
+            stub = _stub_meta(jar_id)
+            self._audit("jar_invalidated", stub, actor)
+            return stub
         meta = self._meta_from_record(record)
         # Authenticate the generation BEFORE recording the tombstone: `generation` is AAD-bound,
         # so a successful decrypt proves the cleartext generation is genuine. Tombstoning a
@@ -1012,8 +1109,18 @@ class JarStore:
         self._require_enabled()
         validate_jar_id(jar_id)
         with self._ops_lock():
-            record = self._read_record(jar_id)
-            meta = self._meta_from_record(record)
+            try:
+                meta = self._meta_from_record(self._read_record(jar_id))
+            except JarNotFoundError:
+                raise
+            except JarError:
+                # Corrupt/unparseable/id-mismatched file: still honor the kill-switch. A delete is
+                # terminal regardless of generation, so tombstone at the max generation and unlink.
+                self._tombstones.record(jar_id, _MAX_GENERATION, "deleted")
+                self._path(jar_id).unlink(missing_ok=True)
+                stub = _stub_meta(jar_id)
+                self._audit("jar_deleted", stub, actor)
+                return stub
             # A delete is terminal: tombstone by reason before destroying the blob so the id can
             # never be recreated, even by a caller that still holds it.
             self._tombstones.record(jar_id, meta.generation, "deleted")
@@ -1030,13 +1137,17 @@ class JarStore:
         return next_allowed if next_allowed > now_utc() else None
 
     def record_probe(self, jar_id: str, result: ProbeResultName) -> CookieJarMeta:
-        record = self._read_record(jar_id)
-        meta = self._meta_from_record(record)
-        meta.last_probe_at = now_utc()
-        meta.last_probe_result = result
-        payload = self._decrypt(meta, record)
-        self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
-        return meta
+        with self._ops_lock():
+            record = self._read_record(jar_id)
+            meta = self._meta_from_record(record)
+            meta.last_probe_at = now_utc()
+            meta.last_probe_result = result
+            # last_probe_* are not AAD-bound, so patch the cleartext meta and keep the existing
+            # sealed blob. Re-reading under the ops lock means a probe that finished after a
+            # concurrent refresh cannot write a stale-generation payload over the refreshed jar.
+            record["meta"] = meta.model_dump(mode="json")
+            _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
+            return meta
 
     # -- audit --------------------------------------------------------------
     def _audit(self, op: str, meta: CookieJarMeta, actor: str) -> None:

@@ -199,6 +199,10 @@ class BrowserSession(BaseModel):
     # produced_jar_ids tracks jars this session *saved* (a source session holds the full,
     # unfiltered login state and is deliberately NOT tagged with the jar's narrow scope).
     jar_id: str | None = None
+    # The authenticated generation seeded into a jar-loaded session, captured at load. Live-session
+    # kill-switch checks compare THIS immutable generation to the tombstone, so a later re-login
+    # publishing a higher generation cannot keep an old, revoked context running.
+    jar_generation: int | None = None
     jar_origins: list[str] | None = None
     jar_nav_allowlist: list[str] | None = None
     jar_registrable_domains: list[str] | None = None
@@ -207,6 +211,9 @@ class BrowserSession(BaseModel):
     allow_exec: bool = False
     confine_navigation: bool = False
     produced_jar_ids: set[str] = Field(default_factory=set)
+    # jar_id -> authenticated generation this session produced, for the same generation-scoped
+    # kill-switch check on a producing (source) session as on a jar-loaded one.
+    produced_jar_generations: dict[str, int] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     idle_expires_at: datetime
