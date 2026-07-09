@@ -91,7 +91,15 @@ export BROWSER_JAR_DIR="/var/lib/browser-handoff/jars"   # optional; default sho
 export BROWSER_JAR_MAX_BYTES="5242880"                    # optional; per-jar export cap
 export BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION="0"         # optional; gate human saves behind FA
 export BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN="<secret>"    # required only when the gate above is on
+export BROWSER_JAR_SESSION_TTL_HOURS="12"                 # optional; bounded retention for session-cookie jars
 ```
+
+A jar that captured any browser-**session** cookie (`expires == -1`) is loadable only within
+`BROWSER_JAR_SESSION_TTL_HOURS` of its last save (default 12h). A session cookie is meant to die on
+browser close, so a jar holding one must not become an indefinitely replayable credential; the cap
+keys on "contains any session cookie" (not "all cookies are session-only"), since the server cannot
+tell which cookie is auth-bearing. Persistent-cookie jars have no TTL — their staleness surfaces via
+probing and the human can delete them.
 
 When `BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION` is enabled, a human save must present
 `BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN`. This is a **dedicated** secret, deliberately separate from

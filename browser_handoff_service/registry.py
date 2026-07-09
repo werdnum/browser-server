@@ -537,6 +537,16 @@ class SessionRegistry:
                 # caller's (possibly empty) list through and let JarStore keep the stored scope.
                 origins = list(req.origins) if req.origins else []
                 scope_origins = origins or list(existing.origins)
+            elif actor == "agent":
+                # Agent-supplied origins are untrusted: a prompt-injected page could name an IdP or
+                # off-site origin whose cookies are in the live context from a prior human SSO, and
+                # persist that credential outside the current site's scope. Capture only the live
+                # page's origin, resolved server-side. (Refresh, above, can only narrow stored scope.)
+                current = await self._worker_current_origin(session)
+                if not current:
+                    raise ConflictError("could not resolve save origin from the live page")
+                origins = [current]
+                scope_origins = origins
             else:
                 origins = list(req.origins) if req.origins else None
                 if not origins:
@@ -591,9 +601,15 @@ class SessionRegistry:
                 jar_id=req.jar_id,
                 label=req.label,
                 origins=origins,
-                # Pass None (omitted) vs [] (explicit) through so a refresh can distinguish
-                # "keep the stored allowlist" from "narrow it to no extra origins".
-                nav_allowlist=list(req.nav_allowlist) if req.nav_allowlist is not None else None,
+                # Agent-supplied nav_allowlist is untrusted: it widens the confinement boundary, so
+                # a prompt-injected page could add an attacker sibling origin and later exfiltrate
+                # domain-scoped (Domain=.example.com) cookies to it. For an agent, drop it entirely
+                # (None => a refresh preserves the trusted stored allowlist; a new jar gets none).
+                # For a human/FA save, pass None (omitted) vs [] (explicit) through so a refresh can
+                # distinguish "keep the stored allowlist" from "narrow it to no extra origins".
+                nav_allowlist=(
+                    None if actor == "agent" else (list(req.nav_allowlist) if req.nav_allowlist is not None else None)
+                ),
                 storage_mode=req.storage,
                 raw_storage_state=raw,
                 probe_spec_url=probe_url,

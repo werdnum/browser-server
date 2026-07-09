@@ -254,10 +254,10 @@ class JarProbeConfig(BaseModel):
     the selector can carry user-/page-influenced text and the urls are sensitive."""
 
     # scheme+host+port+path only (query/fragment/userinfo stripped on save).
-    url: str
+    url: str = Field(max_length=2048)
     # A signal-less probe (both None) is allowed and always resolves to "uncertain".
-    logged_in_selector: str | None = None
-    logged_out_url_prefix: str | None = None
+    logged_in_selector: str | None = Field(default=None, max_length=2048)
+    logged_out_url_prefix: str | None = Field(default=None, max_length=2048)
 
 
 class CookieJarMeta(BaseModel):
@@ -297,9 +297,10 @@ class ProbeSpec(BaseModel):
     """Caller-supplied probe on a save request. ``url`` is optional: for an agent save the
     server derives a stable landing page (the agent may only supply the selector)."""
 
-    url: str | None = None
-    logged_in_selector: str | None = None
-    logged_out_url_prefix: str | None = None
+    # Bounded so a control-token save cannot inflate the sealed jar payload past the byte cap.
+    url: str | None = Field(default=None, max_length=2048)
+    logged_in_selector: str | None = Field(default=None, max_length=2048)
+    logged_out_url_prefix: str | None = Field(default=None, max_length=2048)
 
 
 class SaveJarRequest(BaseModel):

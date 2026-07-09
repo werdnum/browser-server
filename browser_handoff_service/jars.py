@@ -43,7 +43,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -76,10 +76,19 @@ JAR_KEY_ENV = "BROWSER_JAR_KEY"
 JAR_DIR_ENV = "BROWSER_JAR_DIR"
 JAR_MAX_BYTES_ENV = "BROWSER_JAR_MAX_BYTES"
 JAR_SAVE_AUTH_REQUIRED_ENV = "BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION"
+JAR_SESSION_TTL_HOURS_ENV = "BROWSER_JAR_SESSION_TTL_HOURS"
 
 DEFAULT_DATA_DIR = "/var/lib/browser-handoff"
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 PROBE_MIN_INTERVAL = timedelta(minutes=15)
+# Bounded retention for a jar that captured any browser-session-lifetime cookie (expires == -1):
+# a session cookie is meant to die on browser close, so a jar holding one must not stay loadable as
+# a replayable credential indefinitely. Keys on contains_session_cookies (not session_cookies_only),
+# since the server cannot tell which cookie is auth-bearing. See cookie-jar-design.md ("Retention").
+DEFAULT_SESSION_TTL = timedelta(hours=12)
+# Probe strings live inside the sealed payload, which is not covered by the raw_storage_state cap,
+# so bound them at the edge as well to keep a save from writing an oversized jar file.
+PROBE_FIELD_MAX_LEN = 2048
 LABEL_MAX_LEN = 80
 # Tombstone generation used when a jar's real generation cannot be authenticated (tampered
 # metadata): block *every* version of the id fail-closed. Comfortably above any real counter.
@@ -531,8 +540,16 @@ def _fsync_dir(directory: Path) -> None:
             os.close(dir_fd)
 
 
-def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    """Write ``data`` to ``path`` atomically (temp file + fsync + rename + dir fsync), mode 0600."""
+def _atomic_write(
+    path: Path, data: bytes, mode: int = 0o600, *, before_rename: Callable[[], None] | None = None
+) -> None:
+    """Write ``data`` to ``path`` atomically (temp file + fsync + rename + dir fsync), mode 0600.
+
+    ``before_rename`` runs after the temp file is durably written but BEFORE it is published over
+    ``path``. If it raises, the temp file is discarded and ``path`` is left untouched — used by a
+    refresh to durably tombstone the superseded generation between staging and publishing the new
+    one, so neither a staging failure nor a tombstone failure can leave the jar bricked or the old
+    generation un-revoked."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_")
     try:
@@ -541,6 +558,8 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, mode)
+        if before_rename is not None:
+            before_rename()
         os.replace(tmp, path)
         # fsync the directory so the rename (the new/updated entry) is itself durable — else a
         # crash can lose an acknowledged save/refresh even though the temp file was fsync'd.
@@ -626,11 +645,13 @@ class JarStore:
         keys: list[tuple[str, bytes]] | None = None,
         max_bytes: int = DEFAULT_MAX_BYTES,
         require_save_authorization: bool = False,
+        session_ttl: timedelta = DEFAULT_SESSION_TTL,
     ) -> None:
         self.jar_dir = Path(jar_dir)
         self._keys = keys if keys is not None else load_jar_keys()
         self.max_bytes = max_bytes
         self.require_save_authorization = require_save_authorization
+        self.session_ttl = session_ttl
         anchor_dir = self.jar_dir.parent
         # A tombstone HMAC key per configured data key (needs no separate secret; an attacker
         # without any key cannot forge a consistent chain). Passing *all* keys means the log stays
@@ -737,11 +758,18 @@ class JarStore:
             raise JarValidationError("jar file id does not match its path")
         return record
 
-    def _write_record(self, meta: CookieJarMeta, storage_state: dict[str, Any], probe: JarProbeConfig) -> None:
+    def _write_record(
+        self,
+        meta: CookieJarMeta,
+        storage_state: dict[str, Any],
+        probe: JarProbeConfig,
+        *,
+        before_rename: Callable[[], None] | None = None,
+    ) -> None:
         payload = {"storage_state": storage_state, "probe": probe.model_dump()}
         sealed = self._encrypt(meta, payload)
         record = {"meta": meta.model_dump(mode="json"), **sealed}
-        _atomic_write(self._path(meta.jar_id), json.dumps(record).encode("utf-8"))
+        _atomic_write(self._path(meta.jar_id), json.dumps(record).encode("utf-8"), before_rename=before_rename)
 
     def _meta_from_record(self, record: dict[str, Any]) -> CookieJarMeta:
         try:
@@ -822,7 +850,9 @@ class JarStore:
         restored behind a refresh/invalidation tombstone) but its cleartext ``invalidated_at`` is
         still null, surface it as needing re-login. Shared by ``list_meta`` and the single-jar
         detail read so both agree with what ``load()``/``probe()`` will actually accept."""
-        if meta.invalidated_at is None and self._tombstones.blocked_reason(meta.jar_id, meta.generation):
+        if meta.invalidated_at is None and (
+            self._tombstones.blocked_reason(meta.jar_id, meta.generation) or self._session_ttl_expired(meta)
+        ):
             meta.invalidated_at = meta.updated_at
         return meta
 
@@ -986,6 +1016,13 @@ class JarStore:
 
         filtered, stats = filter_storage_state(raw_storage_state, resolved_origins, resolved_storage_mode)
 
+        # The size cap counts the STORED payload (filtered storage + probe), not just the raw export:
+        # probe strings live inside the sealed blob and are bounded at the model edge too, but a
+        # combined check keeps a large selector/prefix from writing a jar past the configured cap.
+        payload_bytes = len(json.dumps({"storage_state": filtered, "probe": probe.model_dump()}).encode("utf-8"))
+        if payload_bytes > self.max_bytes:
+            raise JarValidationError(f"sealed jar payload exceeds the {self.max_bytes}-byte limit")
+
         now = now_utc()
         new_id = jar_id or f"jar_{os.urandom(16).hex()}"
         reg_domains = sorted({d for o in resolved_origins if (d := registrable_domain(o))})
@@ -1027,13 +1064,22 @@ class JarStore:
             last_probe_result=None,
             invalidated_at=None,
         )
-        # Publish the new (higher) generation FIRST, then tombstone the superseded one. If the
-        # write fails (full volume, permissions), nothing is tombstoned and the prior jar stays
-        # loadable rather than being bricked. Once the write has succeeded the tombstone makes a
-        # later restore of the prior jar_*.json fail closed (blocked_reason(old_gen)).
-        self._write_record(meta, filtered, probe)
         if existing is not None:
-            self._tombstones.record(meta.jar_id, existing.generation, "invalidated")
+            # Stage the replacement, durably tombstone the superseded generation, THEN publish (the
+            # tombstone runs in _atomic_write's before_rename hook, between the fsync'd temp write
+            # and the rename). This handles both partial-failure directions: a staging failure
+            # tombstones nothing (prior jar intact), and a tombstone failure discards the staged
+            # file (prior jar intact, no rollback bypass). Only once the old generation is durably
+            # revoked does the new generation become reachable.
+            old_generation = existing.generation
+            self._write_record(
+                meta,
+                filtered,
+                probe,
+                before_rename=lambda: self._tombstones.record(meta.jar_id, old_generation, "invalidated"),
+            )
+        else:
+            self._write_record(meta, filtered, probe)
         self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by)
         return meta
 
@@ -1101,6 +1147,8 @@ class JarStore:
         blocked = self._tombstones.blocked_reason(jar_id, meta.generation)
         if blocked is not None:
             raise JarRevokedError(f"jar is revoked ({blocked})")
+        if self._session_ttl_expired(meta):
+            raise JarRevokedError("jar with a session cookie exceeded its bounded retention; re-login required")
         payload = self._decrypt(meta, record)
         probe = JarProbeConfig.model_validate(payload.get("probe", {"url": ""}))
         return LoadedJar(meta=meta, storage_state=payload.get("storage_state", {}), probe=probe)
@@ -1126,7 +1174,17 @@ class JarStore:
             return False  # missing/tampered/rotated/corrupt => treat as revoked, fail closed
         if meta.invalidated_at is not None:
             return False
+        if self._session_ttl_expired(meta):
+            return False
         return self._tombstones.blocked_reason(jar_id, meta.generation) is None
+
+    def _session_ttl_expired(self, meta: CookieJarMeta) -> bool:
+        """A jar that captured a browser-session cookie is loadable only within a bounded window of
+        its last save (updated_at); after that a browser-close login must not remain replayable.
+        Persistent-cookie-only jars have no such cap (their staleness surfaces via probing)."""
+        if not meta.contains_session_cookies:
+            return False
+        return now_utc() - meta.updated_at > self.session_ttl
 
     def touch_loaded(self, jar_id: str) -> None:
         with self._ops_lock():
@@ -1204,16 +1262,23 @@ class JarStore:
                 # Corrupt/unparseable/id-mismatched file: still honor the kill-switch. A delete is
                 # terminal regardless of generation, so tombstone at the max generation and unlink.
                 self._tombstones.record(jar_id, _MAX_GENERATION, "deleted")
-                self._path(jar_id).unlink(missing_ok=True)
+                self._unlink_durably(jar_id)
                 stub = _stub_meta(jar_id)
                 self._audit("jar_deleted", stub, actor)
                 return stub
             # A delete is terminal: tombstone by reason before destroying the blob so the id can
             # never be recreated, even by a caller that still holds it.
             self._tombstones.record(jar_id, meta.generation, "deleted")
-            self._path(jar_id).unlink(missing_ok=True)
+            self._unlink_durably(jar_id)
             self._audit("jar_deleted", meta, actor)
             return meta
+
+    def _unlink_durably(self, jar_id: str) -> None:
+        """Remove the jar blob and fsync the directory so the removal survives a crash — otherwise
+        the encrypted credential file can reappear on disk after a DELETE the API already acked."""
+        path = self._path(jar_id)
+        path.unlink(missing_ok=True)
+        _fsync_dir(path.parent)
 
     # -- probe --------------------------------------------------------------
     def probe_allowed_at(self, meta: CookieJarMeta) -> datetime | None:
@@ -1282,7 +1347,12 @@ def jar_store_from_env() -> JarStore:
     except ValueError:
         max_bytes = DEFAULT_MAX_BYTES
     require_auth = os.environ.get(JAR_SAVE_AUTH_REQUIRED_ENV, "").lower() in ("1", "true", "yes")
-    return JarStore(jar_dir, max_bytes=max_bytes, require_save_authorization=require_auth)
+    try:
+        ttl_hours = float(os.environ.get(JAR_SESSION_TTL_HOURS_ENV, "") or "")
+        session_ttl = timedelta(hours=ttl_hours) if ttl_hours > 0 else DEFAULT_SESSION_TTL
+    except ValueError:
+        session_ttl = DEFAULT_SESSION_TTL
+    return JarStore(jar_dir, max_bytes=max_bytes, require_save_authorization=require_auth, session_ttl=session_ttl)
 
 
 __all__ = [

@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -1480,6 +1481,120 @@ async def test_save_authorization_uses_dedicated_secret_not_service_token(tmp_pa
         actor="human",
     )
     assert meta.owner_subject == "user123"
+
+
+# --- regression tests for Codex review round 10 ---------------------------
+
+
+def _age_updated_at(tmp_path, jar_id, *, days):
+    # updated_at is not AAD-bound, so editing the cleartext file does not break decrypt — it lets a
+    # test simulate an old jar without waiting.
+    path = tmp_path / "jars" / f"{jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["updated_at"] = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    path.write_text(json.dumps(record))
+
+
+def test_session_cookie_jar_expires_after_ttl(tmp_path):
+    store = make_store(tmp_path)  # default 12h session TTL
+    meta = save_login(store)  # LOGIN_STATE's "sid" is a session cookie (expires -1)
+    assert meta.contains_session_cookies is True
+    _age_updated_at(tmp_path, meta.jar_id, days=2)
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+    # And it surfaces as needing re-login in listings, not as usable.
+    listed = next(m for m in store.list_meta() if m.jar_id == meta.jar_id)
+    assert listed.invalidated_at is not None
+
+
+def test_persistent_cookie_jar_not_expired_by_ttl(tmp_path):
+    store = make_store(tmp_path)
+    persistent = {
+        "cookies": [
+            {
+                "name": "sid",
+                "value": "x",
+                "domain": "shop.example.com",
+                "path": "/",
+                "expires": 4102444800,
+                "secure": True,
+            }
+        ],
+        "origins": [],
+    }
+    meta = save_login(store, raw_storage_state=persistent)
+    assert meta.contains_session_cookies is False
+    _age_updated_at(tmp_path, meta.jar_id, days=2)
+    assert store.load(meta.jar_id).meta.jar_id == meta.jar_id  # persistent-cookie jars have no TTL
+
+
+def test_probe_spec_field_length_bounded():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ProbeSpec(logged_in_selector="a" * 3000)
+
+
+def test_oversized_probe_rejected_by_payload_cap(tmp_path):
+    # A selector under the per-field cap can still push the sealed payload past a small byte cap.
+    store = make_store(tmp_path, max_bytes=500)
+    with pytest.raises(JarValidationError):
+        save_login(
+            store,
+            probe_selector="a" * 400,
+            probe_spec_url="https://shop.example.com/",
+            raw_storage_state={"cookies": [], "origins": []},
+        )
+
+
+def test_refresh_tombstone_failure_leaves_prior_jar_loadable(tmp_path, monkeypatch):
+    # Staged refresh: if tombstoning the old generation fails, the staged replacement is discarded
+    # and the prior jar stays loadable — no brick, and no un-revoked rollback window either.
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+
+    def boom(*args, **kwargs):
+        raise OSError("tombstone log volume full")
+
+    monkeypatch.setattr(store._tombstones, "record", boom)
+    with pytest.raises(OSError):
+        save_login(store, jar_id=meta.jar_id)  # refresh: staged write ok, tombstone fails
+    monkeypatch.undo()
+
+    loaded = store.load(meta.jar_id)  # old generation intact and never tombstoned
+    assert loaded.meta.generation == meta.generation
+
+
+@pytest.mark.asyncio
+async def test_agent_save_drops_nav_allowlist(tmp_path):
+    # Agent-supplied nav_allowlist is untrusted (it widens the confinement boundary), so it is
+    # dropped on an agent save.
+    reg = registry_with_store(tmp_path)
+    session, ctl = await _human_login_session(reg, subject="user123")
+    _, ho = await reg.handover(session.session_id, ctl, "take over")
+    await reg.agent_claim(session.session_id, ho)
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(label="Shop", nav_allowlist=["https://evil.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert meta.nav_allowlist == []
+
+
+@pytest.mark.asyncio
+async def test_agent_save_origins_derived_from_live_page(tmp_path):
+    # Agent-supplied origins are untrusted (a prompt-injected page could name an off-site origin
+    # whose cookies are in the live context); the capture origin is derived server-side.
+    reg = registry_with_store(tmp_path)
+    session, ctl = await _human_login_session(reg, subject="user123")  # worker.url = shop.example.com/account
+    _, ho = await reg.handover(session.session_id, ctl, "take over")
+    await reg.agent_claim(session.session_id, ho)
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(label="Shop", origins=["https://evil.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert meta.origins == ["https://shop.example.com"]
 
 
 # --- regression tests for Codex review round 9 ----------------------------
