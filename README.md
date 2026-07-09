@@ -22,6 +22,8 @@ Implemented:
 - Minimal human UI at `/sessions/{session_id}`.
 - SSE lifecycle event stream.
 - Agent-side smoke client in `scripts/agent_client_smoke.py`.
+- Cookie jars: opt-in, encrypted, scope-filtered persistence of authenticated browser state
+  (see "Cookie jars" below).
 - Python and Playwright e2e tests.
 
 ## Session flows
@@ -50,6 +52,86 @@ The service supports handing control of a single browser session in either direc
   The agent — using its existing service credentials — takes over with
   `POST /v1/sessions/{id}/agent-claim` and the `handover_token`, which transitions the session
   to `agent_active` and lets the agent resume with agent commands. Unclaimed handovers expire.
+
+## Cookie jars (persistent authenticated browser state)
+
+A **cookie jar** is a named, durable, encrypted blob of Playwright `storage_state` (cookies +
+localStorage + IndexedDB), scope-filtered to a declared set of origins, captured from a session
+after a human logs in, and loadable into a fresh session's browser context at creation time. The
+canonical flow: a human logs into a site, clicks "Save this login", and the agent picks the
+session up later in a fresh session with no one re-entering credentials. This is the single,
+opt-in exception to the "never store cookies" rule; jars never persist typed credentials, only
+the session artifacts a site grants after login. Full design in `cookie-jar-design.md`.
+
+browser-server provides *mechanism*; policy (confirmation gating, profile placement, taint) lives
+in the Family Assistant client. Mechanism enforced here:
+
+- Jar contents (cookie/storage names and values) are never returned by any endpoint, event, or
+  log — metadata only.
+- Jars are encrypted at rest with AES-256-GCM under an operator key; security-critical metadata is
+  bound as AAD, and revocation is rollback-proof via a generation-versioned tombstone.
+- Loads happen only at `create_session` and only via the service token, so a session's
+  authenticated scope (`jar_origins`/`jar_nav_allowlist`) is immutable and truthfully reported.
+- `exec` is denied by default in jar-loaded sessions (opt in with `allow_exec: true`), and
+  navigation is confined to the jar's exact origins (`confine_navigation`, default on).
+- Save-time scope filtering (default: the session's current origin) keeps IdP/SSO cookies out.
+
+Endpoints: `POST /v1/sessions/{id}/save-jar`, `GET /v1/jars`, `GET`/`DELETE /v1/jars/{id}`,
+`POST /v1/jars/{id}/invalidate`, `POST /v1/jars/{id}/probe`, and `jar_id`/`allow_exec`/
+`confine_navigation` on `create_session`. A minimal OIDC `/jars` page lets a household audit and
+forget saved logins.
+
+The feature fails closed: with no key configured every jar endpoint returns 503 and
+`create_session` rejects `jar_id`. Configure it with:
+
+```bash
+# 32-byte urlsafe-base64 AES-256 key (comma-separated list rotates: new key first for writes).
+export BROWSER_JAR_KEY="$(python -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+export BROWSER_JAR_DIR="/var/lib/browser-handoff/jars"   # optional; default shown
+export BROWSER_JAR_MAX_BYTES="5242880"                    # optional; per-jar export cap
+export BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION="0"         # optional; gate human saves behind FA
+export BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN="<secret>"    # required only when the gate above is on
+export BROWSER_JAR_SESSION_TTL_HOURS="12"                 # optional; bounded retention for session-cookie jars
+```
+
+A jar that captured any browser-**session** cookie (`expires == -1`) is loadable only within
+`BROWSER_JAR_SESSION_TTL_HOURS` of its last save (default 12h). A session cookie is meant to die on
+browser close, so a jar holding one must not become an indefinitely replayable credential; the cap
+keys on "contains any session cookie" (not "all cookies are session-only"), since the server cannot
+tell which cookie is auth-bearing. Persistent-cookie jars have no TTL — their staleness surfaces via
+probing and the human can delete them.
+
+When `BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION` is enabled, a human save must present
+`BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN`. This is a **dedicated** secret, deliberately separate from
+`BROWSER_HANDOFF_SERVICE_TOKEN`: the party that relays it to the browser to authorize a save must
+not thereby gain the full agent/service API (which can list, load, and delete every jar). If the
+gate is on but this token is unset, saves fail closed.
+
+### Durability and multi-process deployment
+
+The jar store is the service's only durable state, and it is deliberately built on plain
+filesystem semantics so it works on a **shared directory** — a single RWO volume today, or a
+replicated RWX volume (e.g. a Longhorn volume) shared by several pods next. There is no database:
+
+- Each jar is one file, written atomically (temp file + `fsync` + rename).
+- The revocation state (tombstone log, signed anchor, audit log, and the cross-process lock) lives
+  **inside `BROWSER_JAR_DIR`** alongside the jars — mounting that one directory carries both the
+  encrypted logins and their kill-switch, so a revoke cannot be stranded off the shared volume.
+- Revocation is an append-only, HMAC-authenticated tombstone log, `fsync`'d on write and re-read
+  fresh on every check (NFS close-to-open consistency), so one pod's kill-switch is visible to
+  the others without a restart.
+- Tombstone-mutating operations serialize across processes with a POSIX file lock (`fcntl.lockf`,
+  chosen for NFS reliability); within a process they are already serialized by synchronous
+  execution.
+- Live sessions recheck the shared tombstone before every agent command and every noVNC/human
+  authorization, so a revoke tears down running contexts, not just future loads.
+
+Honest residual: the **session registry itself is still in-memory and process-lifetime** (a
+session created on one pod is not visible to another). Persisting it onto the same shared jar
+directory is a natural, self-contained follow-up; nothing in the jar design assumes a single
+process. The one bound to know about today is a whole-filesystem rollback that also truncates the
+tombstone log — set an external monotonic anchor (`jar-anchor.json`, or a KMS/DB/WORM export) to
+close it.
 
 ## Setup
 

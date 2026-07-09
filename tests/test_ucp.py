@@ -298,6 +298,56 @@ async def test_playwright_probe_rejects_oversized_body(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_click_off_scope_abort_returns_controlled_block():
+    # A click that triggers an off-scope document navigation is aborted by the route guard, which
+    # surfaces as a PlaywrightError out of a non-navigate command. The command wrapper must turn
+    # that into a controlled {"blocked": True} (not re-raise a 500) when the off-scope flag is set.
+    from rebrowser_playwright.async_api import Error as PlaywrightError
+
+    worker = PlaywrightBrowserWorker("worker_click_block", confine_origins=["https://shop.example.com"])
+
+    class _StubLocator:
+        async def click(self):
+            # Simulate the route guard aborting an off-scope nav triggered by this click.
+            worker._nav_off_scope_block = "https://idp.example.com"
+            raise PlaywrightError("net::ERR_ABORTED")
+
+    class _StubPage:
+        url = "https://shop.example.com/account"
+
+        def locator(self, _selector):
+            return _StubLocator()
+
+    worker._page = _StubPage()  # ty: ignore[invalid-assignment]
+    result = await worker.command(AgentCommandRequest(type="click", args={"selector": "a#logout"}))
+    assert result["blocked"] is True
+    assert result["target_origin"] == "https://idp.example.com"
+
+
+@pytest.mark.asyncio
+async def test_click_error_without_off_scope_flag_reraises():
+    # A PlaywrightError from a click with NO off-scope abort (an ordinary broken selector/timeout)
+    # must NOT be masked as a block — it re-raises so a genuine failure is not swallowed.
+    from rebrowser_playwright.async_api import Error as PlaywrightError
+
+    worker = PlaywrightBrowserWorker("worker_click_err", confine_origins=["https://shop.example.com"])
+
+    class _StubLocator:
+        async def click(self):
+            raise PlaywrightError("locator resolve timeout")
+
+    class _StubPage:
+        url = "https://shop.example.com/account"
+
+        def locator(self, _selector):
+            return _StubLocator()
+
+    worker._page = _StubPage()  # ty: ignore[invalid-assignment]
+    with pytest.raises(PlaywrightError):
+        await worker.command(AgentCommandRequest(type="click", args={"selector": "a#logout"}))
+
+
+@pytest.mark.asyncio
 async def test_detector_probes_once_and_hints_only_on_origin_change():
     calls: list[str] = []
 

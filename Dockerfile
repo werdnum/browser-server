@@ -51,9 +51,14 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
   && python -m pip install --no-cache-dir . \
   && python -m rebrowser_playwright install chromium \
   && useradd --create-home --shell /usr/sbin/nologin appuser \
-  && chown -R appuser:appuser /app /ms-playwright
+  && mkdir -p /var/lib/browser-handoff/jars \
+  && chown -R appuser:appuser /app /ms-playwright /var/lib/browser-handoff
 
 USER appuser
+
+# Cookie-jar durable state (opt-in via BROWSER_JAR_KEY). Created and owned by appuser so the
+# default BROWSER_JAR_DIR is writable out of the box; mount a volume here in a real deployment.
+VOLUME ["/var/lib/browser-handoff"]
 
 EXPOSE 8000
 

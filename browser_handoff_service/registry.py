@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+from .jars import (
+    JarRevokedError,
+    JarStore,
+    jar_store_from_env,
+    normalize_origin,
+    validate_jar_id,
+)
 from .models import (
     AGENT_COMMAND_STATES,
     OBSERVATION_COMMANDS,
@@ -13,18 +21,25 @@ from .models import (
     AgentCommandRequest,
     AgentCommandResponse,
     BrowserSession,
+    CookieJarMeta,
     CreateSessionRequest,
     HandoffRequest,
+    JarProbeConfig,
     LeaseOwner,
+    ProbeResult,
+    ProbeResultName,
+    SaveJarRequest,
     SessionEvent,
     SessionState,
     form_factor_profile,
     new_session,
     now_utc,
 )
-from .runtime import BrowserRuntime, RuntimeUnavailable, make_worker
+from .runtime import BrowserRuntime, RuntimeUnavailable, StorageTooLarge, make_worker
 from .security import hash_token, mint_token, redact_url
 from .transitions import transition
+
+logger = logging.getLogger(__name__)
 
 
 class NotFoundError(KeyError):
@@ -82,18 +97,70 @@ class TokenRecord:
 
 
 class SessionRegistry:
-    def __init__(self) -> None:
+    def __init__(self, jar_store: JarStore | None = None) -> None:
         self.sessions: dict[str, BrowserSession] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self.events: dict[str, list[SessionEvent]] = {}
         self.tokens: dict[str, TokenRecord] = {}
         self.workers: dict[str, BrowserRuntime] = {}
+        # Durable, encrypted cookie-jar store (browser-server's only durable state). Built from
+        # env by default; injectable for tests. Keyless => the whole feature is fail-closed.
+        self.jar_store: JarStore = jar_store if jar_store is not None else jar_store_from_env()
+        # Per-jar locks serialize load against invalidate/delete so a load cannot race a
+        # concurrent revocation (see create_session's post-registration recheck).
+        self.jar_locks: dict[str, asyncio.Lock] = {}
 
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
 
-    async def create_session(self, req: CreateSessionRequest) -> tuple[BrowserSession, str | None]:
+    def _jar_lock(self, jar_id: str) -> asyncio.Lock:
+        return self.jar_locks.setdefault(jar_id, asyncio.Lock())
+
+    async def create_session(
+        self, req: CreateSessionRequest, *, owner_subject: str | None = None
+    ) -> tuple[BrowserSession, str | None]:
+        return await self._create_session_locked(req, owner_subject=owner_subject)
+
+    async def _create_session_locked(
+        self, req: CreateSessionRequest, *, owner_subject: str | None
+    ) -> tuple[BrowserSession, str | None]:
         session = new_session(req)
+        # Record the owning OIDC subject for a human-owned session so a later control-token
+        # save-jar (which carries no OIDC bearer) can stamp a non-null owner_subject.
+        if session.lease_owner == LeaseOwner.HUMAN:
+            session.owner_subject = owner_subject
+
+        storage_state: dict | None = None
+        confine_origins: list[str] | None = None
+        loaded = None
+        if req.jar_id is not None:
+            # Validate the id BEFORE allocating a per-jar lock, so a caller passing malformed/random
+            # ids cannot leave permanent self.jar_locks entries per failed create (as the save path
+            # already guards).
+            validate_jar_id(req.jar_id)
+            # Take the jar lock only for the load (serialize it against a concurrent invalidate/
+            # delete), then release it before the slow worker.start() below so a same-process
+            # revocation is not queued behind browser startup. The post-start recheck re-verifies
+            # the seeded generation against the tombstone, and a racing invalidate's
+            # _close_sessions_for_jar also tears down this (already-registered) session.
+            async with self._jar_lock(req.jar_id):
+                loaded = self.jar_store.load(req.jar_id)  # raises JarError on disabled/missing/revoked
+            storage_state = loaded.storage_state
+            # A jar load defaults to the producing session's form factor/UA unless the create
+            # call explicitly overrode it (storage_state does not carry the device profile).
+            if req.form_factor == "auto" and req.client_viewport is None:
+                session.form_factor = loaded.meta.form_factor
+            confine = req.confine_navigation if req.confine_navigation is not None else True
+            if confine:
+                confine_origins = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
+            session.jar_id = loaded.meta.jar_id
+            session.jar_generation = loaded.meta.generation
+            session.jar_origins = list(loaded.meta.origins)
+            session.jar_nav_allowlist = list(loaded.meta.nav_allowlist)
+            session.jar_registrable_domains = list(loaded.meta.registrable_domains)
+            session.allow_exec = req.allow_exec
+            session.confine_navigation = confine
+
         self.sessions[session.session_id] = session
         self.locks[session.session_id] = asyncio.Lock()
         self.events[session.session_id] = []
@@ -103,6 +170,8 @@ class SessionRegistry:
             width=profile.width,
             height=profile.height,
             user_agent=profile.user_agent,
+            storage_state=storage_state,
+            confine_origins=confine_origins,
         )
         self.workers[session.worker_id or ""] = worker
         try:
@@ -113,6 +182,41 @@ class SessionRegistry:
             session.closed_at = now_utc()
             self._event(session, "worker_failed", "service", metadata={"reason": str(exc)[:500]})
             return session, None
+        if loaded is not None:
+            # Close the load/revocation race: after registering the session, re-read the jar and
+            # tear the just-created context down if it was revoked in the window. Check the SEEDED
+            # generation (the one materialized into this context), not just "is the current file
+            # loadable": on a shared volume another pod may have refreshed the jar while
+            # worker.start() awaited, tombstoning the seeded generation while the file advanced to a
+            # newer loadable one — recheck_loadable alone would pass against that newer generation.
+            if not self.jar_store.recheck_loadable(req.jar_id or "") or self.jar_store.is_revoked_generation(
+                req.jar_id or "", loaded.meta.generation
+            ):
+                session.state = SessionState.CANCELLED
+                session.lease_owner = LeaseOwner.NONE
+                await self._cleanup_locked(session)
+                self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked"})
+                raise JarRevokedError("jar was revoked during load")
+            # Best-effort: last_loaded_at is a non-critical metadata touch. If its write fails (full
+            # volume, permissions) it must NOT bubble up here — the session and its seeded worker
+            # are already registered, so propagating would leave a live authenticated context alive
+            # until expiry while returning an error to the caller.
+            try:
+                self.jar_store.touch_loaded(req.jar_id or "")
+            except Exception:
+                logger.warning("touch_loaded failed for jar %s; continuing", req.jar_id, exc_info=True)
+            # Confinement gates only agent-driven navigation. If the jar is loaded straight into a
+            # human-owned session (service token + initial_owner="human"), the human drives via
+            # noVNC and the handoff toggle never runs, so disable confinement now — otherwise the
+            # route guard would block the human's off-scope SSO/re-login navigation.
+            if session.lease_owner == LeaseOwner.HUMAN:
+                worker.set_confinement_active(False)
+            self._event(
+                session,
+                "jar_loaded",
+                "service",
+                metadata={"jar_id": loaded.meta.jar_id, "origins": loaded.meta.origins},
+            )
         if session.lease_owner == LeaseOwner.HUMAN:
             control_token = mint_token()
             self.tokens[hash_token(control_token)] = TokenRecord(
@@ -138,6 +242,13 @@ class SessionRegistry:
             self._raise_if_expired(session)
             if req.reason in {"payment", "credentials", "otp", "legal_consent"} and req.allowed_resume != "never":
                 raise ConflictError("sensitive handoffs cannot resume on the same browser page")
+            # A jar-loaded session must never be resumed as the same context after human control:
+            # the human can visit off-scope login/payment/SSO origins and accumulate credentials
+            # broader than the jar's immutable jar_origins. Force allowed_resume=never so
+            # human_complete tears the worker down; the agent resumes only via a fresh,
+            # re-filtered jar-loaded session.
+            if session.jar_id is not None and req.allowed_resume != "never":
+                raise ConflictError("a jar-loaded session cannot request a resumable handoff")
             if req.expected_origin is not None:
                 expected_origin = _normalize_origin(req.expected_origin)
                 if expected_origin is None:
@@ -149,6 +260,14 @@ class SessionRegistry:
             session.handoff_reason = req.reason
             session.allowed_resume = req.allowed_resume
             session.handoff_note = req.handoff_note
+            # Navigation confinement gates only agent-driven navigation; once a jar-loaded
+            # session is handed to a human, drop confinement so the human is not trapped (e.g. an
+            # off-scope SSO/IdP bounce during re-login). The context is torn down at completion
+            # and never resumed by the agent (handover and resumable handoff are both refused).
+            if session.jar_id is not None:
+                worker = self.workers.get(session.worker_id or "")
+                if worker is not None:
+                    worker.set_confinement_active(False)
             session.idle_expires_at = min(now_utc() + timedelta(minutes=10), session.expires_at)
             session.updated_at = now_utc()
             token = mint_token()
@@ -161,11 +280,18 @@ class SessionRegistry:
             self._event(session, "handoff_requested", "agent", metadata={"reason": req.reason})
             return session, f"{base_url.rstrip('/')}/sessions/{session_id}?token={token}"
 
-    async def claim(self, session_id: str, token: str) -> tuple[BrowserSession, str]:
+    async def claim(
+        self, session_id: str, token: str, *, owner_subject: str | None = None
+    ) -> tuple[BrowserSession, str]:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
             handoff_token = self._authorize_token_locked(session, token, token_type="handoff")
+            # Record the claiming human's OIDC subject so a save during their control (or after a
+            # hand-back for an agent save) lands a non-null owner_subject rather than an
+            # ownerless jar invisible in the subject-scoped /jars UI.
+            if owner_subject is not None:
+                session.owner_subject = owner_subject
             session.lease_owner = transition(session.state, session.lease_owner, SessionState.HUMAN_ACTIVE)
             session.state = SessionState.HUMAN_ACTIVE
             session.idle_expires_at = min(now_utc() + timedelta(minutes=10), session.expires_at)
@@ -226,6 +352,15 @@ class SessionRegistry:
             self._authorize_token_locked(session, token, token_type="control")
             if session.state != SessionState.HUMAN_ACTIVE:
                 raise ConflictError("only an active human session can be handed over to an agent")
+            # A jar-loaded session that passed to human control must not be resumed by the agent
+            # as the same context: during human control the human can visit off-scope
+            # login/payment/SSO origins and accumulate credentials broader than the jar's
+            # immutable jar_origins. The agent resumes authenticated browsing only by starting a
+            # fresh, re-filtered jar-loaded session — never by inheriting the human-widened one.
+            if session.jar_id is not None:
+                raise ConflictError(
+                    "a jar-loaded session cannot be handed to an agent; start a fresh jar-loaded session"
+                )
             session.lease_owner = transition(session.state, session.lease_owner, SessionState.HANDOVER_REQUESTED)
             session.state = SessionState.HANDOVER_REQUESTED
             session.handoff_reason = None
@@ -288,6 +423,9 @@ class SessionRegistry:
         async with self.locks[session_id]:
             self._raise_if_expired(session)
             self._authorize_human_token_locked(session, token)
+            # A jar-loaded session handed to a human keeps a live authenticated context behind
+            # noVNC; recheck the shared tombstone so a cross-process revoke tears it down here too.
+            await self._enforce_jar_not_revoked_locked(session)
             return session
 
     async def authorize_handoff_page(self, session_id: str, token: str) -> BrowserSession:
@@ -300,6 +438,7 @@ class SessionRegistry:
                 # allow_pending lets the page reload while a handover is pending: the human
                 # still holds their control token and can see state / cancel from the UI.
                 self._authorize_human_token_locked(session, token, allow_pending=True)
+            await self._enforce_jar_not_revoked_locked(session)
             return session
 
     async def agent_command(self, session_id: str, req: AgentCommandRequest) -> AgentCommandResponse:
@@ -312,6 +451,17 @@ class SessionRegistry:
                 raise AuthorizationError("agent commands are denied unless the agent owns the lease")
             if session.state not in AGENT_COMMAND_STATES and req.type in OBSERVATION_COMMANDS:
                 raise AuthorizationError("observation denied outside agent-owned states")
+            # exec can read document.cookie / origin storage, handing non-HttpOnly session tokens
+            # to the model — the one agent-reachable path from "use the login" to "read the
+            # credential". Default-deny it in a jar-loaded session unless the creator opted in.
+            if req.type == "exec" and session.jar_id is not None and not session.allow_exec:
+                raise AuthorizationError("exec is denied in a jar-loaded session unless allow_exec was set")
+            # Per-command revocation recheck. In a multi-process deployment sharing the jar
+            # directory, a revoke in another process cannot reach into this registry's in-memory
+            # session set, so a jar-loaded (or jar-producing) session would keep serving an
+            # authenticated context until it noticed. Consulting the shared, durable tombstone
+            # before each command turns the kill-switch into a near-real-time, cross-process one.
+            await self._enforce_jar_not_revoked_locked(session)
             worker = self.workers.get(session.worker_id or "")
             if worker is None or worker.closed:
                 session.lease_owner = LeaseOwner.NONE
@@ -348,6 +498,498 @@ class SessionRegistry:
             session.updated_at = now_utc()
             self._event(session, "session_closed", "service")
             return session
+
+    # -- cookie jars --------------------------------------------------------
+    def _require_jars_enabled(self) -> None:
+        if not self.jar_store.enabled:
+            # Surfaced by the HTTP layer as 503; jars fail closed without a key.
+            from .jars import JarDisabledError
+
+            raise JarDisabledError("cookie jars are disabled: no BROWSER_JAR_KEY configured")
+
+    async def save_jar(self, session_id: str, req: SaveJarRequest, *, actor: str) -> CookieJarMeta:
+        """Capture the live session's storage_state into a new or refreshed jar.
+
+        ``actor`` is "human" (control-token save) or "agent" (service-auth save); the caller
+        (main) establishes it from the auth path. Authorization mirrors agent commands and is
+        fail-closed."""
+        self._require_jars_enabled()
+        # Validate the id, confirm the session exists, and AUTHORIZE before allocating a per-jar
+        # lock: _jar_lock caches an asyncio.Lock keyed by jar_id forever, so a caller POSTing
+        # malformed/random ids (or ids against a bogus session, or with a bad control token) must not
+        # be able to leave permanent entries in self.jar_locks. A malformed id is a 400, an unknown
+        # session a 404, and a bad token a 403 — all lock-free. (req.token only *selects* the human
+        # path; agent saves are already service-authenticated at the HTTP layer.)
+        session = self.get(session_id)
+        if req.jar_id is not None:
+            validate_jar_id(req.jar_id)
+        if actor == "human":
+            self._authorize_human_token_locked(session, req.token or "")
+        # A refresh mutates an existing durable jar, so it must serialize against
+        # invalidate/delete on the same jar (jar lock BEFORE the session lock, matching the
+        # jar->session order used by create/revocation) — otherwise an in-flight refresh could
+        # write a higher generation over a just-tombstoned one and resurrect a revoked jar.
+        if req.jar_id is not None:
+            async with self._jar_lock(req.jar_id):
+                return await self._save_jar_locked(session_id, req, actor)
+        return await self._save_jar_locked(session_id, req, actor)
+
+    async def _save_jar_locked(self, session_id: str, req: SaveJarRequest, actor: str) -> CookieJarMeta:
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            # If a jar backing this live session was revoked (possibly by another process), close
+            # the session and reject: otherwise the agent could refresh its own jar_id and publish
+            # a higher generation with invalidated_at cleared, undoing the kill-switch. A fresh
+            # re-login (a jarless session that has not yet produced this jar) is unaffected.
+            await self._enforce_jar_not_revoked_locked(session)
+            owner_subject, saved_by = self._authorize_save_locked(session, req, actor)
+
+            # Cloning guard: a new-jar save from a jar-loaded session would snapshot the
+            # credentials into a second, unlinked blob that revocation of the original never
+            # reaches. A jar-loaded session may only refresh its own jar_id.
+            if session.jar_id is not None and (req.jar_id is None or req.jar_id != session.jar_id):
+                raise ConflictError("a jar-loaded session may only refresh its own jar")
+
+            existing: CookieJarMeta | None = None
+            if req.jar_id is not None:
+                existing = self.jar_store.get_meta_verified(req.jar_id)
+                self._authorize_jar_refresh(session, existing, actor, owner_subject)
+
+            if existing is not None:
+                # Refresh: re-filter against the STORED scope. An omitted `origins` must NOT
+                # collapse a multi-origin jar to the live page's single origin — pass the
+                # caller's (possibly empty) list through and let JarStore keep the stored scope.
+                origins = list(req.origins) if req.origins else []
+                # Validate the requested scope against the stored jar NOW, before any browser work:
+                # otherwise a prompt-injected refresh from an agent-loaded session could point the
+                # baseline probe at an arbitrary origin and export the live context, only to have
+                # JarStore reject the widening afterward. resolved_origins is the authoritative
+                # (subset) scope used for probe derivation.
+                effective_nav = (
+                    None if actor == "agent" else (list(req.nav_allowlist) if req.nav_allowlist is not None else None)
+                )
+                scope_origins, _, _ = self.jar_store.resolve_refresh_scope(
+                    existing, origins, effective_nav, req.storage
+                )
+            elif actor == "agent":
+                # Agent-supplied origins are untrusted: a prompt-injected page could name an IdP or
+                # off-site origin whose cookies are in the live context from a prior human SSO, and
+                # persist that credential outside the current site's scope. Capture only the live
+                # page's origin, resolved server-side. (Refresh, above, can only narrow stored scope.)
+                current = await self._worker_current_origin(session)
+                if not current:
+                    raise ConflictError("could not resolve save origin from the live page")
+                origins = [current]
+                scope_origins = origins
+            else:
+                origins = list(req.origins) if req.origins else None
+                if not origins:
+                    current = await self._worker_current_origin(session)
+                    if not current:
+                        raise ConflictError("could not resolve save origin; specify origins explicitly")
+                    origins = [current]
+                scope_origins = origins
+
+            # An agent may supply the freshness *selector* but not point the replayed probe
+            # navigation at an arbitrary path (e.g. /logout). Derive a stable landing page. A
+            # human save may supply an explicit stable url; if it omits one we also default to
+            # the origin's landing page rather than persist a one-time/side-effecting URL.
+            landing_origin = normalize_origin(scope_origins[0]) or scope_origins[0]
+            derived_landing = landing_origin + "/"
+            if actor == "agent":
+                probe_url: str | None = derived_landing
+            else:
+                probe_url = req.probe.url or derived_landing
+
+            # An agent-supplied freshness selector is not trusted as authenticated-only: an
+            # injected page could pick a selector present on the login wall too, so later probes
+            # keep reading "fresh" after expiry. Validate it against a logged-out baseline; if it
+            # does not discriminate, drop it (the jar then reads "uncertain", never a fake fresh).
+            probe_selector = req.probe.logged_in_selector
+            if actor == "agent" and probe_selector:
+                if not await self._selector_discriminates(
+                    scope_origins, session.form_factor, derived_landing, probe_selector
+                ):
+                    probe_selector = None
+
+            worker = self.workers.get(session.worker_id or "")
+            if worker is None or worker.closed:
+                raise ConflictError("worker is not available")
+            # Export cookies only whenever the STORED result is cookies_only — requested now, or the
+            # mode of the jar being refreshed (a cookies_only jar can never widen to "all", so its
+            # export is always cookies-only). This also avoids materializing localStorage/IndexedDB
+            # for an invalid cookies_only->all widening that JarStore will reject anyway.
+            cookies_only_export = req.storage == "cookies_only" or (
+                existing is not None and existing.storage_mode == "cookies_only"
+            )
+            try:
+                raw = await worker.export_storage_state(self.jar_store.max_bytes, cookies_only=cookies_only_export)
+            except StorageTooLarge as exc:
+                raise ConflictError(str(exc)) from exc
+
+            # Re-check revocation AFTER the export await: another process could have revoked the
+            # backing jar while the (browser/IndexedDB) export was in flight, and publishing a
+            # refreshed higher generation now would undo that kill-switch.
+            await self._enforce_jar_not_revoked_locked(session)
+
+            # The generation this live session was seeded from / produced for req.jar_id. Passed as a
+            # revoke precondition so JarStore, under its ops lock, rejects the refresh if that
+            # generation was revoked in the window between the recheck above and the store's lock —
+            # closing the multi-pod refresh-vs-revoke race with stale browser state. A jarless
+            # re-login (no captured generation) leaves it None and may legitimately re-enable a jar.
+            revoke_precondition: int | None = None
+            if req.jar_id is not None:
+                if session.jar_id == req.jar_id:
+                    revoke_precondition = session.jar_generation
+                elif req.jar_id in session.produced_jar_generations:
+                    revoke_precondition = session.produced_jar_generations[req.jar_id]
+
+            meta = self.jar_store.save(
+                jar_id=req.jar_id,
+                label=req.label,
+                origins=origins,
+                # Agent-supplied nav_allowlist is untrusted: it widens the confinement boundary, so
+                # a prompt-injected page could add an attacker sibling origin and later exfiltrate
+                # domain-scoped (Domain=.example.com) cookies to it. For an agent, drop it entirely
+                # (None => a refresh preserves the trusted stored allowlist; a new jar gets none).
+                # For a human/FA save, pass None (omitted) vs [] (explicit) through so a refresh can
+                # distinguish "keep the stored allowlist" from "narrow it to no extra origins".
+                nav_allowlist=(
+                    None if actor == "agent" else (list(req.nav_allowlist) if req.nav_allowlist is not None else None)
+                ),
+                storage_mode=req.storage,
+                raw_storage_state=raw,
+                probe_spec_url=probe_url,
+                probe_selector=probe_selector,
+                # Agent-supplied logged_out_url_prefix is untrusted like the probe url/selector: a
+                # prompt-injected page could set it to the landing origin so every future probe reads
+                # "stale" before the selector check. Drop it for an agent; only human/FA saves set it.
+                probe_logged_out_prefix=(None if actor == "agent" else req.probe.logged_out_url_prefix),
+                saved_by=saved_by,
+                # New jar => attribute to the authorized owner. Refresh => pass None so JarStore
+                # preserves the *target jar's* stored owner; an agent (whose refresh auth is
+                # unconditional) must not be able to reassign another human's jar to this session's
+                # owner just by refreshing it.
+                owner_subject=owner_subject if existing is None else None,
+                form_factor=session.form_factor,
+                created_session_id=session.session_id,
+                conversation_id=session.conversation_id,
+                agent_supplied_probe=False,
+                revoke_precondition=revoke_precondition,
+            )
+            # Provenance only: a set, because one session can produce several jars, and the
+            # producing context holds the *unfiltered* login state (never tagged with jar_id).
+            session.produced_jar_ids.add(meta.jar_id)
+            session.produced_jar_generations[meta.jar_id] = meta.generation
+            # A jar-loaded session that just refreshed ITS OWN jar has published a new generation
+            # and tombstoned the one it was seeded from. Advance the loaded generation (and scope)
+            # to the new one, or the very next kill-switch check would see the now-superseded
+            # loaded generation as revoked and cancel the session right after a successful refresh.
+            if session.jar_id == meta.jar_id:
+                session.jar_generation = meta.generation
+                session.jar_origins = list(meta.origins)
+                session.jar_nav_allowlist = list(meta.nav_allowlist)
+                session.jar_registrable_domains = list(meta.registrable_domains)
+                # Apply the (possibly NARROWED) scope to the live worker's route guard too, so the
+                # running context stops trusting origins the refreshed jar dropped — otherwise the
+                # worker would still allow the wider create-time scope while policy readers see the
+                # narrowed one. Only for a confined session (a human-driven one runs unconfined).
+                if session.confine_navigation and worker is not None and not worker.closed:
+                    worker.set_confine_origins([*meta.origins, *meta.nav_allowlist])
+                    # The route guard only gates future navigations, so also evict the CURRENT page
+                    # if the narrowing dropped its origin — otherwise snapshot/extract/click could
+                    # still read the off-scope document that policy readers now consider out of scope.
+                    await worker.evict_off_scope_page()
+            session.updated_at = now_utc()
+            self._event(
+                session,
+                "jar_saved",
+                actor,
+                metadata={"jar_id": meta.jar_id, "origins": meta.origins, "refresh": req.jar_id is not None},
+            )
+            return meta
+
+    async def _selector_discriminates(self, origins: list[str], form_factor: str, url: str, selector: str) -> bool:
+        """True iff ``selector`` is ABSENT on the target when logged out (so its presence is a
+        real authenticated-only signal). Loads the landing page in a throwaway context with NO
+        jar seeded; if the selector is already present logged-out (or the baseline cannot be
+        established) it does not discriminate and must not be trusted as proof of freshness."""
+        profile = form_factor_profile(form_factor)
+        worker = make_worker(
+            "baseline_probe",
+            width=profile.width,
+            height=profile.height,
+            user_agent=profile.user_agent,
+            confine_origins=[o for o in (normalize_origin(x) for x in origins) if o],
+        )
+        try:
+            await worker.start()
+        except RuntimeUnavailable:
+            return False
+        try:
+            nav = await worker.command(AgentCommandRequest(type="navigate", args={"url": url}))
+            if nav.get("blocked") or nav.get("error"):
+                # No baseline could be established (off-scope block, or an in-scope DNS/TLS/outage
+                # error): the selector must NOT be trusted as authenticated-only, or a prompt-injected
+                # selector that is absent on a blank/failed page would later read a stale login "fresh".
+                return False
+            present_when_logged_out = await worker.selector_present(selector)
+            if present_when_logged_out is None:
+                # The selector could not be evaluated (malformed / transient): not a trustworthy
+                # logged-out baseline, so it does not discriminate and must be dropped.
+                return False
+            return not present_when_logged_out
+        except Exception:
+            return False
+        finally:
+            await worker.close()
+
+    def _authorize_save_locked(
+        self, session: BrowserSession, req: SaveJarRequest, actor: str
+    ) -> tuple[str | None, str]:
+        if actor == "human":
+            # Allowed in human_active AND human_sensitive: a careful user who marked the session
+            # sensitive before typing credentials must still be able to click "Save this login".
+            self._authorize_human_token_locked(session, req.token or "")
+            if session.owner_subject is None:
+                raise AuthorizationError("human save requires an authenticated owner subject")
+            if self.jar_store.require_save_authorization and not self._valid_save_authorization(req.save_authorization):
+                raise AuthorizationError("an FA save authorization is required for this deployment")
+            return session.owner_subject, "human"
+        # Agent save falls out of the existing agent-command authorization. Attribute a NEW jar to
+        # the session's owner when one exists (a human-created session handed to the agent), so the
+        # human can still see and forget a login captured from their own session. The subject is
+        # the authenticated one captured at session create/claim — an agent cannot forge it. (On a
+        # *refresh* the caller preserves the target jar's stored owner instead; see save().)
+        if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+            raise AuthorizationError("agent save is denied unless the agent owns the lease")
+        return session.owner_subject, "agent"
+
+    def _authorize_jar_refresh(
+        self, session: BrowserSession, existing: CookieJarMeta, actor: str, owner_subject: str | None
+    ) -> None:
+        """Refreshing overwrites durable credentials, so it needs ownership of the *target* jar,
+        not just control of the live source session. A human may refresh only a jar whose
+        owner_subject non-null-equals theirs (None == None is not ownership — ownerless jars are
+        service/FA-only). An agent may refresh ONLY the jar currently loaded into its own session:
+        a jarless (or differently-loaded) agent session refreshing an arbitrary jar_id is a
+        prompt-injection vector — it would filter the live browser state into the victim's jar scope
+        and tombstone their generation, emptying or replacing their saved login."""
+        if actor == "agent":
+            if session.jar_id is None or session.jar_id != existing.jar_id:
+                raise AuthorizationError("an agent may only refresh the jar loaded into its own session")
+            return
+        if existing.owner_subject is None or owner_subject is None or existing.owner_subject != owner_subject:
+            raise AuthorizationError("refresh requires ownership of the target jar")
+
+    def _valid_save_authorization(self, token: str | None) -> bool:
+        import os
+
+        # A DEDICATED save-authorization secret, deliberately NOT the service bearer: whoever must
+        # present this to authorize a human save (e.g. the FA relaying it to the browser) should
+        # not thereby gain the full agent/service API (list/load/delete jars). When the gate is
+        # enabled but this secret is unset, fail closed rather than fall back to the service token.
+        expected = os.environ.get("BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN")
+        return bool(token) and bool(expected) and token == expected
+
+    async def _worker_current_origin(self, session: BrowserSession) -> str | None:
+        """Resolve the live page's origin server-side (never returned to the agent).
+
+        For a human save the registry only updates current_origin from *agent* command results,
+        which never run while the human browses, so read it from the live page instead."""
+        worker = self.workers.get(session.worker_id or "")
+        if worker is None or worker.closed:
+            return session.current_origin
+        try:
+            result = await worker.command(AgentCommandRequest(type="current_page"))
+        except Exception:
+            return session.current_origin
+        url = result.get("url")
+        return redact_url(url)[1] if isinstance(url, str) else session.current_origin
+
+    def list_jars(self) -> list[CookieJarMeta]:
+        self._require_jars_enabled()
+        return self.jar_store.list_meta()
+
+    def get_jar(self, jar_id: str) -> CookieJarMeta:
+        self._require_jars_enabled()
+        return self.jar_store.get_meta_verified(jar_id)
+
+    def get_jar_unverified(self, jar_id: str) -> CookieJarMeta:
+        """Cleartext metadata without decrypting the blob. Used by service-token management so a
+        jar under a rotated/removed key (which can no longer be decrypted) stays deletable."""
+        self._require_jars_enabled()
+        return self.jar_store.get_meta_unverified(jar_id)
+
+    async def invalidate_jar(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
+        self._require_jars_enabled()
+        async with self._jar_lock(jar_id):
+            meta = self.jar_store.invalidate(jar_id, actor=actor)
+            await self._close_sessions_for_jar(jar_id, reason="jar_invalidated")
+            return meta
+
+    async def delete_jar(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
+        self._require_jars_enabled()
+        async with self._jar_lock(jar_id):
+            meta = self.jar_store.delete(jar_id, actor=actor)
+            await self._close_sessions_for_jar(jar_id, reason="jar_deleted")
+            return meta
+
+    async def _enforce_jar_not_revoked_locked(self, session: BrowserSession) -> None:
+        """If a jar backing this session was revoked (possibly by another process), close the
+        session and its worker and raise. Called from every path that keeps an authenticated
+        context alive — agent commands AND noVNC/human-control authorization — so the kill-switch
+        also tears down a live human-driven browser, not just future loads."""
+        if session.state in TERMINAL_STATES:
+            return
+        revoked = self._revoked_jar_for(session)
+        if revoked is not None:
+            session.lease_owner = LeaseOwner.NONE
+            session.state = SessionState.CANCELLED
+            await self._cleanup_locked(session)
+            session.updated_at = now_utc()
+            self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked", "jar_id": revoked})
+            raise SessionInactiveError("the jar backing this session was revoked")
+
+    def session_jar_revoked(self, session_id: str) -> bool:
+        """Whether a jar backing this session has been revoked (possibly by another process).
+        Used to poll during a long-lived noVNC bridge, where no per-command recheck runs."""
+        session = self.sessions.get(session_id)
+        if session is None or session.state in TERMINAL_STATES:
+            return False
+        return self._revoked_jar_for(session) is not None
+
+    def _revoked_jar_for(self, session: BrowserSession) -> str | None:
+        """Return a jar id backing ``session`` whose *seeded* generation is now revoked
+        (invalidated/deleted), consulting the shared durable tombstone — or None. Compares the
+        authenticated generation captured at load/produce time, so a later higher-generation
+        re-login cannot mask that the running context's own generation was tombstoned. Covers both
+        a jar-loaded session and one that produced a jar (which holds the unfiltered login state)."""
+        if not self.jar_store.enabled:
+            return None
+        # Both a produced (source) jar and the loaded jar back a live authenticated context that the
+        # kill-switch must be able to tear down. Fail closed on a tombstone of the captured/seeded
+        # generation, and also when the current file no longer authenticates (removed, corrupted, or
+        # AAD-tampered without a tombstone) — a shared-volume writer must not keep either context
+        # alive past its kill-switch by mangling the file.
+        for jar_id, generation in session.produced_jar_generations.items():
+            if self.jar_store.is_revoked_generation(jar_id, generation) or not self.jar_store.jar_authenticates(jar_id):
+                return jar_id
+        if session.jar_id is not None:
+            if self.jar_store.is_revoked_generation(
+                session.jar_id, session.jar_generation
+            ) or not self.jar_store.jar_authenticates(session.jar_id):
+                return session.jar_id
+        return None
+
+    async def _close_sessions_for_jar(self, jar_id: str, *, reason: str) -> None:
+        """Revocation is the user's real-time kill-switch: close every live session seeded from
+        the jar (jar_id matches) AND any source session that produced it (jar_id in
+        produced_jar_ids), so no live authenticated context survives the revoke."""
+        for session_id, session in list(self.sessions.items()):
+            if session.state in TERMINAL_STATES:
+                continue
+            if session.jar_id != jar_id and jar_id not in session.produced_jar_ids:
+                continue
+            async with self.locks[session_id]:
+                if session.state in TERMINAL_STATES:
+                    continue
+                session.lease_owner = LeaseOwner.NONE
+                session.state = SessionState.CANCELLED
+                await self._cleanup_locked(session)
+                session.updated_at = now_utc()
+                self._event(session, "session_closed", "service", metadata={"reason": reason, "jar_id": jar_id})
+
+    async def probe_jar(self, jar_id: str) -> ProbeResult:
+        """Load the jar into a throwaway context using its recorded form factor, navigate to the
+        probe target under the same exact-origin guard as a jar-loaded session, apply the
+        success indicator, and tear the context down. Never returns page content. Rate-limited."""
+        self._require_jars_enabled()
+        # Hold the jar lock only for the load + DURABLE reservation, then release it before the
+        # network probe (browser startup + navigation) so a concurrent DELETE/invalidate — the
+        # real-time kill-switch — is not blocked behind a slow probe target. reserve_probe stamps
+        # last_probe_at under the cross-process ops lock BEFORE the probe runs, so another pod
+        # sharing the volume sees the rate-limit and will not run a duplicate authenticated probe.
+        async with self._jar_lock(jar_id):
+            loaded = self.jar_store.load(jar_id)  # raises if invalidated/revoked/disabled
+            if not self.jar_store.reserve_probe(jar_id, loaded.meta.generation):
+                raise ConflictError("probe is rate-limited or already in progress; try again later")
+        result, final_origin = await self._run_probe(loaded)
+        # If the jar was revoked/deleted while the probe ran, skip persisting a stale result. Pass
+        # the probed generation so record_probe drops the result if a refresh published a newer
+        # generation in the meantime (the old probe must not stamp the fresh login).
+        if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
+            self.jar_store.record_probe(jar_id, result, expected_generation=loaded.meta.generation)
+        return ProbeResult(result=result, final_origin=final_origin)
+
+    async def _run_probe(self, loaded) -> tuple[ProbeResultName, str | None]:
+        return await self._probe_candidate(
+            loaded.storage_state,
+            loaded.meta.form_factor,
+            [*loaded.meta.origins, *loaded.meta.nav_allowlist],
+            loaded.probe,
+            label=f"probe_{loaded.meta.jar_id}",
+        )
+
+    async def _probe_candidate(
+        self,
+        storage_state: dict[str, Any],
+        form_factor: str,
+        confine_origins: list[str],
+        probe: JarProbeConfig,
+        *,
+        label: str,
+    ) -> tuple[ProbeResultName, str | None]:
+        """Seed ``storage_state`` into a throwaway context under the jar's form factor and exact-origin
+        confinement, navigate to the probe target, and classify freshness. Shared by the jar freshness
+        probe and the save-time verification of a just-captured candidate. Never returns page content."""
+        profile = form_factor_profile(form_factor)
+        worker = make_worker(
+            label,
+            width=profile.width,
+            height=profile.height,
+            user_agent=profile.user_agent,
+            storage_state=storage_state,
+            confine_origins=confine_origins,
+        )
+        try:
+            await worker.start()
+        except RuntimeUnavailable:
+            return "error", None
+        try:
+            if not probe.url:
+                # A signal-less / target-less probe can never prove logged-in state.
+                return "uncertain", None
+            nav = await worker.command(AgentCommandRequest(type="navigate", args={"url": probe.url}))
+            if nav.get("error"):
+                # An in-scope network failure (DNS/TLS/connection outage of the saved site): not a
+                # login-state signal, so do not mark a possibly-valid jar stale.
+                return "error", None
+            if nav.get("blocked"):
+                # An off-scope redirect toward login/IdP was aborted pre-request: classify stale.
+                return "stale", nav.get("target_origin")
+            final_url = nav.get("url")
+            final_origin = redact_url(final_url)[1] if isinstance(final_url, str) else None
+            if (
+                probe.logged_out_url_prefix
+                and isinstance(final_url, str)
+                and final_url.startswith(probe.logged_out_url_prefix)
+            ):
+                return "stale", final_origin
+            if probe.logged_in_selector:
+                present = await worker.selector_present(probe.logged_in_selector)
+                if present is None:
+                    # Selector evaluation failed (malformed / transient after navigation): not a
+                    # login-state signal, so do not mark a possibly-valid login "stale".
+                    return "error", final_origin
+                return ("fresh" if present else "stale"), final_origin
+            # In scope, no authenticated-only signal: cannot prove logged-in — never "fresh".
+            return "uncertain", final_origin
+        except Exception:
+            return "error", None
+        finally:
+            await worker.close()
 
     async def reap_expired(self) -> list[str]:
         expired: list[str] = []
