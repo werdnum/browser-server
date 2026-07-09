@@ -92,6 +92,29 @@ export BROWSER_JAR_MAX_BYTES="5242880"                    # optional; per-jar ex
 export BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION="0"         # optional; gate human saves behind FA
 ```
 
+### Durability and multi-process deployment
+
+The jar store is the service's only durable state, and it is deliberately built on plain
+filesystem semantics so it works on a **shared directory** — a single RWO volume today, or a
+replicated RWX volume (e.g. a Longhorn volume) shared by several pods next. There is no database:
+
+- Each jar is one file, written atomically (temp file + `fsync` + rename).
+- Revocation is an append-only, HMAC-authenticated tombstone log, `fsync`'d on write and re-read
+  fresh on every check (NFS close-to-open consistency), so one pod's kill-switch is visible to
+  the others without a restart.
+- Tombstone-mutating operations serialize across processes with a POSIX file lock (`fcntl.lockf`,
+  chosen for NFS reliability); within a process they are already serialized by synchronous
+  execution.
+- Live sessions recheck the shared tombstone before every agent command and every noVNC/human
+  authorization, so a revoke tears down running contexts, not just future loads.
+
+Honest residual: the **session registry itself is still in-memory and process-lifetime** (a
+session created on one pod is not visible to another). Persisting it onto the same shared jar
+directory is a natural, self-contained follow-up; nothing in the jar design assumes a single
+process. The one bound to know about today is a whole-filesystem rollback that also truncates the
+tombstone log — set an external monotonic anchor (`jar-anchor.json`, or a KMS/DB/WORM export) to
+close it.
+
 ## Setup
 
 ```bash

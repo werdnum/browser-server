@@ -18,8 +18,16 @@ Security invariants enforced here:
   key_id, jar_id, generation, invalidated_at) is bound as AES-GCM AAD, so tampering with the
   file without the key fails decryption closed.
 - Revocation is rollback-proof via a monotonic ``generation`` counter and an append-only,
-  HMAC-chained tombstone whose high-water mark is anchored outside ``BROWSER_JAR_DIR``.
+  HMAC-authenticated tombstone log whose high-water mark is re-derived (verified) on each check.
 - Every ``jar_id`` is validated against ``jar_[0-9a-f]{32}`` before it touches the filesystem.
+
+Deployment note: this store is designed to be safe on a **shared filesystem directory** — a
+single RWO volume today, or a replicated RWX volume (e.g. Longhorn) shared by multiple pods
+tomorrow. Cross-process safety rests only on POSIX file semantics: atomic temp-file+rename
+writes, an fsync'd append-only HMAC log re-read fresh per check (close-to-open consistency), and
+POSIX advisory locks (``fcntl.lockf``) around tombstone-mutating operations. No database is
+introduced, so persisting the (currently in-memory, process-lifetime) session registry onto the
+same shared directory is a natural, self-contained follow-up.
 """
 
 from __future__ import annotations
@@ -69,6 +77,9 @@ DEFAULT_DATA_DIR = "/var/lib/browser-handoff"
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 PROBE_MIN_INTERVAL = timedelta(minutes=15)
 LABEL_MAX_LEN = 80
+# Tombstone generation used when a jar's real generation cannot be authenticated (tampered
+# metadata): block *every* version of the id fail-closed. Comfortably above any real counter.
+_MAX_GENERATION = 2**63 - 1
 
 # The strict generated form. A caller-supplied jar_id that does not match is rejected before
 # it is ever used to build a filesystem path, closing path traversal.
@@ -341,9 +352,6 @@ class TombstoneStore:
         # A list so verification survives BROWSER_JAR_KEY rotation: entries signed with an older
         # key still verify under that key's derived HMAC key. New entries sign with keys[0].
         self._hmac_keys = hmac_keys or [hashlib.sha256(b"jar-tombstone\x00").digest()]
-        self._cache: dict[str, dict[str, Any]] = {}
-        self._cache_mtime: float | None = None
-        self._cache_valid = False
 
     def _chain_hmac(self, prev: str, payload: str, key: bytes) -> str:
         return hmac.new(key, (prev + "\n" + payload).encode("utf-8"), hashlib.sha256).hexdigest()
@@ -393,15 +401,14 @@ class TombstoneStore:
         return anchor, prev
 
     def _current(self) -> dict[str, dict[str, Any]]:
-        try:
-            mtime = self._log_path.stat().st_mtime if self._log_path.exists() else None
-        except OSError:
-            mtime = None
-        if not self._cache_valid or mtime != self._cache_mtime:
-            self._cache, _ = self._replay()
-            self._cache_mtime = mtime
-            self._cache_valid = True
-        return self._cache
+        # Re-derive from the on-disk log on every revocation-critical check rather than caching:
+        # on a shared (NFS-backed, e.g. Longhorn RWX) volume, opening the log fresh gives
+        # close-to-open consistency with another pod's just-committed revocation, whereas an
+        # mtime/attr cache could keep serving a revoked login for the NFS attribute-cache window.
+        # The log is small (one line per revoke/refresh) so a full verified replay is cheap;
+        # compaction is a future optimization, not a correctness need.
+        anchor, _ = self._replay()
+        return anchor
 
     def record(self, jar_id: str, generation: int, reason: str) -> None:
         # Chain from the last *verified* entry, not the last physical line, so an injected line
@@ -415,9 +422,20 @@ class TombstoneStore:
             "hmac": self._chain_hmac(prev, payload, self._hmac_keys[0]),
         }
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        newly_created = not self._log_path.exists()
         with self._log_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
-        self._cache_valid = False  # force a re-derive from the authenticated log on next check
+            handle.flush()
+            os.fsync(handle.fileno())  # durable + visible to other pods before the ops lock drops
+        if newly_created:
+            # Persist the new directory entry too, so a crash right after acknowledging a
+            # revocation cannot lose the whole log file from the page cache.
+            with contextlib.suppress(OSError):
+                dir_fd = os.open(str(self._log_path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
 
     def blocked_reason(self, jar_id: str, generation: int) -> str | None:
         """Return why a jar file at ``generation`` is blocked, or None if loadable."""
@@ -433,6 +451,13 @@ class TombstoneStore:
     def is_deleted(self, jar_id: str) -> bool:
         entry = self._current().get(jar_id)
         return bool(entry and entry.get("reason") == "deleted")
+
+    def high_water(self, jar_id: str) -> int:
+        """The highest tombstoned generation for a jar (0 if none). A newly published generation
+        must exceed this to be loadable — used so a refresh from a rolled-back file still lands
+        above the tombstone rather than re-writing an already-revoked generation."""
+        entry = self._current().get(jar_id)
+        return int(entry.get("generation", 0)) if entry else 0
 
 
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -538,18 +563,24 @@ class JarStore:
     @contextlib.contextmanager
     def _ops_lock(self) -> Iterator[None]:
         """Serialize tombstone-mutating operations (save/invalidate/delete) *across processes*
-        sharing the jar directory, via an exclusive OS file lock. Without it two workers can
-        append tombstones chained from the same tail (one silently dropped as forged) or a
-        refresh can publish a higher generation over another worker's just-written invalidation.
-        Held briefly (encrypt + rename), so it does not meaningfully stall the event loop."""
+        sharing the jar directory. Without it two workers can append tombstones chained from the
+        same tail (one silently dropped as forged) or a refresh can publish a higher generation
+        over another worker's just-written invalidation.
+
+        Uses POSIX advisory byte-range locks (``fcntl.lockf``/F_SETLKW) rather than BSD ``flock``
+        because they are the reliable choice on NFS-backed shared volumes (e.g. a Longhorn RWX
+        volume), which is the intended durable-state deployment. *Intra*-process serialization is
+        already provided by synchronous execution — every jar_store mutation is a sync call with
+        no ``await`` inside, so the event loop cannot interleave two of them — and the lock is
+        held only briefly (encrypt + atomic rename)."""
         lock_path = self.jar_dir.parent / "jar-ops.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "w") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            fcntl.lockf(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.lockf(handle.fileno(), fcntl.LOCK_UN)
 
     # -- crypto -------------------------------------------------------------
     def _encrypt(self, meta: CookieJarMeta, payload: dict[str, Any]) -> dict[str, Any]:
@@ -638,6 +669,11 @@ class JarStore:
             # reappear in listings, even though its blob is back on disk.
             if self._tombstones.is_deleted(meta.jar_id):
                 continue
+            # A file rolled back behind an invalidation tombstone would otherwise show as usable
+            # (often with no cleartext invalidated_at); surface it as needing re-login so a
+            # user/agent does not pick a jar that can never load.
+            if meta.invalidated_at is None and self._tombstones.blocked_reason(meta.jar_id, meta.generation):
+                meta.invalidated_at = meta.updated_at
             metas.append(meta)
         return metas
 
@@ -676,6 +712,10 @@ class JarStore:
                 reachable.add(norm)
 
         url = redact_probe_url(spec_url) if spec_url else None
+        if spec_url and url is None:
+            # A caller-supplied probe url that fails to normalize (bad port/scheme) must be
+            # rejected, not silently downgraded to a target-less (always-"uncertain") probe.
+            raise JarValidationError("probe url is malformed")
         if url is not None:
             origin = normalize_origin(url)
             if origin not in reachable:
@@ -786,6 +826,11 @@ class JarStore:
         now = now_utc()
         new_id = jar_id or f"jar_{os.urandom(16).hex()}"
         reg_domains = sorted({d for o in resolved_origins if (d := registrable_domain(o))})
+        # A refresh must publish a generation ABOVE the tombstone high-water, not merely
+        # existing.generation + 1: if the on-disk file rolled back behind the log (gen1 restored
+        # after gen2 was invalidated), a naive +1 would re-write an already-tombstoned generation
+        # and the "successful" refresh would still be unloadable.
+        new_generation = (max(existing.generation, self._tombstones.high_water(new_id)) + 1) if existing else 1
         meta = CookieJarMeta(
             jar_id=new_id,
             label=normalize_label(label),
@@ -796,7 +841,7 @@ class JarStore:
             updated_at=now,
             last_loaded_at=existing.last_loaded_at if existing else None,
             version=(existing.version + 1) if existing else 1,
-            generation=(existing.generation + 1) if existing else 1,
+            generation=new_generation,
             saved_by="human" if saved_by == "human" else "agent",
             # Preserve the stored owner on refresh when the caller has no subject (an agent/service
             # refresh of a human-owned jar), so it does not silently become ownerless and vanish
@@ -841,6 +886,10 @@ class JarStore:
         stored_origins = set(existing.origins)
         if origins:
             requested = {o for o in (normalize_origin(x) for x in origins) if o}
+            if not requested:
+                # A non-empty request that all fails normalization (e.g. a typo'd port) must not
+                # silently wipe the jar's scope down to no origins.
+                raise JarValidationError("refresh origins contained no valid origin")
             if not requested <= stored_origins:
                 raise JarValidationError("refresh cannot widen jar origins; create a new jar")
             resolved_origins = sorted(requested)
@@ -890,26 +939,32 @@ class JarStore:
         return LoadedJar(meta=meta, storage_state=payload.get("storage_state", {}), probe=probe)
 
     def recheck_loadable(self, jar_id: str) -> bool:
-        """Post-registration recheck used to close load/revocation races: re-read the jar and
-        confirm it was not revoked in the window between the load and session registration."""
+        """Whether a jar is currently loadable — used both for the post-registration load race
+        and for live-session revocation rechecks. Verifies the AEAD envelope so a file edited
+        without the key (cleartext ``invalidated_at`` cleared or ``generation`` raised above the
+        tombstone) cannot keep a live authenticated session running past the kill-switch."""
         try:
-            meta = self.get_meta_unverified(jar_id)
+            meta = self.get_meta_verified(jar_id)  # authenticates generation + invalidated_at
         except JarError:
-            return False
+            return False  # missing/tampered/rotated/corrupt => treat as revoked, fail closed
         if meta.invalidated_at is not None:
             return False
         return self._tombstones.blocked_reason(jar_id, meta.generation) is None
 
     def touch_loaded(self, jar_id: str) -> None:
-        try:
-            record = self._read_record(jar_id)
-        except JarError:
-            return
-        meta = self._meta_from_record(record)
-        meta.last_loaded_at = now_utc()
-        payload = self._decrypt(meta, record)
-        self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
-        self._audit("jar_loaded", meta, "service")
+        with self._ops_lock():
+            try:
+                record = self._read_record(jar_id)
+            except JarError:
+                return
+            meta = self._meta_from_record(record)
+            meta.last_loaded_at = now_utc()
+            # last_loaded_at is not AAD-bound, so patch the cleartext meta and keep the existing
+            # sealed blob (no decrypt/re-encrypt). Re-reading under the ops lock means a concurrent
+            # refresh's higher-generation blob is never clobbered by a stale-generation rewrite.
+            record["meta"] = meta.model_dump(mode="json")
+            _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
+            self._audit("jar_loaded", meta, "service")
 
     # -- revocation ---------------------------------------------------------
     def invalidate(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
@@ -921,25 +976,32 @@ class JarStore:
     def _invalidate_locked(self, jar_id: str, actor: str) -> CookieJarMeta:
         record = self._read_record(jar_id)
         meta = self._meta_from_record(record)
-        # Tombstone FIRST (needs only the cleartext generation), so the kill-switch lands even
-        # for a jar whose blob can no longer be decrypted after a key rotation. The tombstone —
-        # not the cleartext invalidated_at — is the rollback-proof block on load/probe.
-        self._tombstones.record(jar_id, meta.generation, "invalidated")
-        # Decrypt with the ORIGINAL metadata first — invalidated_at is AAD-bound, so mutating it
-        # before decrypt would change the AAD and make the current-key decrypt fail spuriously.
+        # Authenticate the generation BEFORE recording the tombstone: `generation` is AAD-bound,
+        # so a successful decrypt proves the cleartext generation is genuine. Tombstoning a
+        # tampered (lowered) generation would let a restored original file with the real, higher
+        # generation slip past blocked_reason and load a supposedly-revoked login.
         try:
             payload = self._decrypt(meta, record)
-        except JarDecryptError:
-            # Rotated/corrupt key: cannot re-seal, but still persist the cleartext invalidated_at
-            # (so listings/UI show "needs re-login") without re-encrypting the undecryptable blob.
+        except JarDecryptError as exc:
+            if exc.kind == "rotation":
+                # key_id not configured: unloadable under all configured keys anyway, so the
+                # cleartext generation is a safe-enough tombstone (a restored file also cannot
+                # decrypt). Persist the cleartext invalidated_at (no blob to re-seal).
+                self._tombstones.record(jar_id, meta.generation, "invalidated")
+            else:
+                # Tampered/corrupt metadata under a configured key: the real generation is
+                # unknowable, so block EVERY version of the id fail-closed rather than trust a
+                # possibly-lowered cleartext generation.
+                self._tombstones.record(jar_id, _MAX_GENERATION, "invalidated")
             meta.invalidated_at = now_utc()
             meta.updated_at = meta.invalidated_at
             record["meta"] = meta.model_dump(mode="json")
             _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
             self._audit("jar_invalidated", meta, actor)
             return meta
-        # Now set invalidated_at and re-seal so it is bound as AAD (clearing it in cleartext then
-        # fails closed).
+        # Decryptable: the generation is authenticated. Tombstone it, then re-seal with
+        # invalidated_at bound as AAD (so clearing it in cleartext later fails closed).
+        self._tombstones.record(jar_id, meta.generation, "invalidated")
         meta.invalidated_at = now_utc()
         meta.updated_at = meta.invalidated_at
         self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))

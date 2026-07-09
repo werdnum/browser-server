@@ -502,6 +502,11 @@ class SessionRegistry:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
+            # If a jar backing this live session was revoked (possibly by another process), close
+            # the session and reject: otherwise the agent could refresh its own jar_id and publish
+            # a higher generation with invalidated_at cleared, undoing the kill-switch. A fresh
+            # re-login (a jarless session that has not yet produced this jar) is unaffected.
+            await self._enforce_jar_not_revoked_locked(session)
             owner_subject, saved_by = self._authorize_save_locked(session, req, actor)
 
             # Cloning guard: a new-jar save from a jar-loaded session would snapshot the

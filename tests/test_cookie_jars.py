@@ -1012,3 +1012,98 @@ async def test_novnc_authorization_rechecks_revocation_across_instances(tmp_path
     with pytest.raises(SessionInactiveError):
         await reg_a.authorize_remote(human_loaded.session_id, control)
     assert reg_a.sessions[human_loaded.session_id].state == SessionState.CANCELLED
+
+
+# --- regression tests for Codex review round 4 ----------------------------
+
+
+def test_invalidate_generation_tamper_blocks_all_versions(tmp_path):
+    # Lower the cleartext generation, then invalidate. The tampered file cannot decrypt (gen is
+    # AAD-bound), so invalidate must block EVERY version fail-closed rather than tombstone the
+    # lowered generation and let the restored original load.
+    store = make_store(tmp_path)
+    meta = save_login(store)  # generation 1
+    save_login(store, jar_id=meta.jar_id)  # generation 2 (authentic)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    authentic_gen2 = path.read_bytes()
+    record = json.loads(path.read_text())
+    record["meta"]["generation"] = 1  # attacker lowers it below the intended tombstone
+    path.write_text(json.dumps(record))
+    store.invalidate(meta.jar_id)
+    path.write_bytes(authentic_gen2)  # restore the real gen-2 file
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+def test_refresh_from_rolled_back_file_lands_above_tombstone(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+    gen1 = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+    save_login(store, jar_id=meta.jar_id)  # gen 2
+    store.invalidate(meta.jar_id)  # tombstone gen 2
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(gen1)  # roll back to gen 1
+    refreshed = save_login(store, jar_id=meta.jar_id)  # re-login
+    assert refreshed.generation > 2  # above the tombstone high-water, so it actually loads
+    assert store.load(meta.jar_id).meta.generation == refreshed.generation
+
+
+def test_recheck_loadable_fails_closed_on_cleartext_tamper(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.invalidate(meta.jar_id)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["invalidated_at"] = None  # try to clear the kill-switch in cleartext
+    record["meta"]["generation"] = 999  # and jump above the tombstone
+    path.write_text(json.dumps(record))
+    # The live-session recheck verifies the envelope, so the tamper fails closed (revoked).
+    assert store.recheck_loadable(meta.jar_id) is False
+
+
+def test_refresh_with_all_invalid_origins_rejected(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    with pytest.raises(JarValidationError):
+        save_login(store, jar_id=meta.jar_id, origins=["https://shop.example.com:bad"])
+
+
+def test_malformed_explicit_probe_url_rejected(tmp_path):
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com:bad/account")
+
+
+def test_listing_marks_rolled_back_invalidated_generation(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    gen1 = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+    save_login(store, jar_id=meta.jar_id)  # gen 2
+    store.invalidate(meta.jar_id)  # tombstone gen 2
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(gen1)  # restore gen-1 file (invalidated_at None)
+    listed = next(m for m in store.list_meta() if m.jar_id == meta.jar_id)
+    assert listed.invalidated_at is not None  # surfaced as needing re-login, not usable
+
+
+@pytest.mark.asyncio
+async def test_save_jar_rejected_after_cross_process_invalidation(tmp_path):
+    key = _key()
+    reg_a = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    producer, ctl = await _human_login_session(reg_a)
+    meta = await reg_a.save_jar(
+        producer.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg_a.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    fake_worker(reg_a, loaded.worker_id).storage_state = LOGIN_STATE
+
+    reg_b = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    await reg_b.invalidate_jar(meta.jar_id)  # kill-switch in another process
+
+    # The jar-loaded session can no longer refresh its own jar_id (which would undo the kill-switch).
+    with pytest.raises(SessionInactiveError):
+        await reg_a.save_jar(
+            loaded.session_id,
+            SaveJarRequest(label="Shop", jar_id=meta.jar_id, probe=ProbeSpec(logged_in_selector="[x]")),
+            actor="agent",
+        )
