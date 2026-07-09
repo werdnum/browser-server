@@ -2249,3 +2249,103 @@ def test_jar_file_deleted_mid_read_is_not_found_not_crash(tmp_path, monkeypatch)
     monkeypatch.setattr(jars_mod.Path, "read_text", vanishing_read_text)
     with pytest.raises(JarNotFoundError):
         store.load(meta.jar_id)
+
+
+# --- regression tests for Codex review round 19 ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_selector_dropped_when_baseline_selector_errors(tmp_path, monkeypatch):
+    # A selector that fails to EVALUATE on the logged-out baseline (malformed/transient) must not be
+    # read as "absent" and accepted as discriminating.
+    reg = registry_with_store(tmp_path)
+    sess, _ = await reg.create_session(CreateSessionRequest(conversation_id="c1"))
+    worker = fake_worker(reg, sess.worker_id)
+    worker.url = "https://shop.example.com/home"
+    worker.storage_state = LOGIN_STATE
+
+    from browser_handoff_service import registry as registry_module
+
+    real_make_worker = registry_module.make_worker
+
+    def mk(worker_id, **kwargs):
+        w = cast(FakeBrowserWorker, real_make_worker(worker_id, **kwargs))
+        if worker_id.startswith("baseline_probe"):
+            w.error_selectors.add("[data-testid=logout]")
+        return w
+
+    monkeypatch.setattr(registry_module, "make_worker", mk)
+    meta = await reg.save_jar(
+        sess.session_id,
+        SaveJarRequest(label="Shop", probe=ProbeSpec(logged_in_selector="[data-testid=logout]")),
+        actor="agent",
+    )
+    assert reg.jar_store.load(meta.jar_id).probe.logged_in_selector is None  # dropped, not trusted
+
+
+@pytest.mark.asyncio
+async def test_probe_selector_evaluation_error_is_error_not_stale(tmp_path, monkeypatch):
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(
+            label="Shop",
+            token=ctl,
+            probe=ProbeSpec(url="https://shop.example.com/account", logged_in_selector="[data-testid=logout]"),
+        ),
+        actor="human",
+    )
+    from browser_handoff_service import registry as registry_module
+
+    real_make_worker = registry_module.make_worker
+
+    def mk(worker_id, **kwargs):
+        w = cast(FakeBrowserWorker, real_make_worker(worker_id, **kwargs))
+        w.error_selectors.add("[data-testid=logout]")
+        return w
+
+    monkeypatch.setattr(registry_module, "make_worker", mk)
+    result = await reg.probe_jar(meta.jar_id)
+    assert result.result == "error"  # a selector eval failure is not "stale"
+
+
+@pytest.mark.asyncio
+async def test_refresh_widening_rejected_before_export(tmp_path, monkeypatch):
+    # An out-of-scope refresh must be rejected BEFORE any browser export (or baseline probe), so a
+    # prompt-injected agent refresh cannot force the live context to export.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    worker = fake_worker(reg, loaded.worker_id)
+
+    async def boom_export(*args, **kwargs):
+        raise AssertionError("export must not run for an invalid widening")
+
+    monkeypatch.setattr(worker, "export_storage_state", boom_export)
+    with pytest.raises(JarValidationError):
+        await reg.save_jar(
+            loaded.session_id,
+            SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://evil.example.com"], probe=ProbeSpec()),
+            actor="agent",
+        )
+
+
+@pytest.mark.asyncio
+async def test_bad_control_token_save_allocates_no_lock(tmp_path):
+    # A human save with a bad control token must be rejected before a per-jar lock is cached.
+    reg = registry_with_store(tmp_path)
+    human, _ = await _human_login_session(reg, subject="user123")
+    jar_id = "jar_" + "a" * 32
+    with pytest.raises(AuthorizationError):
+        await reg.save_jar(
+            human.session_id,
+            SaveJarRequest(label="x", jar_id=jar_id, token="garbage", probe=ProbeSpec()),
+            actor="human",
+        )
+    assert jar_id not in reg.jar_locks

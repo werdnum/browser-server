@@ -1149,6 +1149,18 @@ class JarStore:
         self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by)
         return meta
 
+    def resolve_refresh_scope(
+        self,
+        existing: CookieJarMeta,
+        origins: list[str],
+        nav_allowlist: list[str] | None,
+        storage_mode: StorageMode | None,
+    ) -> tuple[list[str], list[str], StorageMode]:
+        """Public: validate + resolve a refresh's requested scope against the stored jar (subset
+        only), raising JarValidationError on any widening. The registry calls this to fail fast
+        BEFORE browser work (probe navigation / export) rather than after."""
+        return self._resolve_refresh_scope(existing, origins, nav_allowlist, storage_mode)
+
     def _resolve_refresh_scope(
         self,
         existing: CookieJarMeta,

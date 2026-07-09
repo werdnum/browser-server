@@ -510,13 +510,17 @@ class SessionRegistry:
         (main) establishes it from the auth path. Authorization mirrors agent commands and is
         fail-closed."""
         self._require_jars_enabled()
-        # Validate the id and confirm the session exists BEFORE allocating a per-jar lock: _jar_lock
-        # caches an asyncio.Lock keyed by jar_id forever, so a caller POSTing malformed/random ids
-        # (or ids against a bogus session) must not be able to leave permanent entries in
-        # self.jar_locks. A malformed id is a 400 and an unknown session a 404, both lock-free.
-        self.get(session_id)
+        # Validate the id, confirm the session exists, and AUTHORIZE before allocating a per-jar
+        # lock: _jar_lock caches an asyncio.Lock keyed by jar_id forever, so a caller POSTing
+        # malformed/random ids (or ids against a bogus session, or with a bad control token) must not
+        # be able to leave permanent entries in self.jar_locks. A malformed id is a 400, an unknown
+        # session a 404, and a bad token a 403 — all lock-free. (req.token only *selects* the human
+        # path; agent saves are already service-authenticated at the HTTP layer.)
+        session = self.get(session_id)
         if req.jar_id is not None:
             validate_jar_id(req.jar_id)
+        if actor == "human":
+            self._authorize_human_token_locked(session, req.token or "")
         # A refresh mutates an existing durable jar, so it must serialize against
         # invalidate/delete on the same jar (jar lock BEFORE the session lock, matching the
         # jar->session order used by create/revocation) — otherwise an in-flight refresh could
@@ -553,7 +557,17 @@ class SessionRegistry:
                 # collapse a multi-origin jar to the live page's single origin — pass the
                 # caller's (possibly empty) list through and let JarStore keep the stored scope.
                 origins = list(req.origins) if req.origins else []
-                scope_origins = origins or list(existing.origins)
+                # Validate the requested scope against the stored jar NOW, before any browser work:
+                # otherwise a prompt-injected refresh from an agent-loaded session could point the
+                # baseline probe at an arbitrary origin and export the live context, only to have
+                # JarStore reject the widening afterward. resolved_origins is the authoritative
+                # (subset) scope used for probe derivation.
+                effective_nav = (
+                    None if actor == "agent" else (list(req.nav_allowlist) if req.nav_allowlist is not None else None)
+                )
+                scope_origins, _, _ = self.jar_store.resolve_refresh_scope(
+                    existing, origins, effective_nav, req.storage
+                )
             elif actor == "agent":
                 # Agent-supplied origins are untrusted: a prompt-injected page could name an IdP or
                 # off-site origin whose cookies are in the live context from a prior human SSO, and
@@ -700,6 +714,10 @@ class SessionRegistry:
                 # selector that is absent on a blank/failed page would later read a stale login "fresh".
                 return False
             present_when_logged_out = await worker.selector_present(selector)
+            if present_when_logged_out is None:
+                # The selector could not be evaluated (malformed / transient): not a trustworthy
+                # logged-out baseline, so it does not discriminate and must be dropped.
+                return False
             return not present_when_logged_out
         except Exception:
             return False
@@ -940,6 +958,10 @@ class SessionRegistry:
                 return "stale", final_origin
             if probe.logged_in_selector:
                 present = await worker.selector_present(probe.logged_in_selector)
+                if present is None:
+                    # Selector evaluation failed (malformed / transient after navigation): not a
+                    # login-state signal, so do not mark a possibly-valid login "stale".
+                    return "error", final_origin
                 return ("fresh" if present else "stale"), final_origin
             # In scope, no authenticated-only signal: cannot prove logged-in — never "fresh".
             return "uncertain", final_origin

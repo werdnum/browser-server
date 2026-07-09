@@ -199,7 +199,7 @@ class BrowserRuntime(Protocol):
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]: ...
     async def close(self) -> None: ...
     async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]: ...
-    async def selector_present(self, selector: str) -> bool: ...
+    async def selector_present(self, selector: str) -> bool | None: ...
     def set_confinement_active(self, enabled: bool) -> None: ...
     def set_confine_origins(self, origins: list[str]) -> None: ...
 
@@ -233,6 +233,8 @@ class FakeBrowserWorker:
         self.confine_origins = [o for o in (confine_origins or [])]
         self._confinement_active = True
         self.present_selectors: set[str] = set()
+        # Selectors whose evaluation "fails" (malformed/transient) -> selector_present returns None.
+        self.error_selectors: set[str] = set()
         self.redirect_map: dict[str, str] = {}
         # URLs that simulate an in-scope network failure (DNS/TLS/connection outage) on navigate.
         self.nav_error_urls: set[str] = set()
@@ -252,7 +254,9 @@ class FakeBrowserWorker:
             raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
         return state
 
-    async def selector_present(self, selector: str) -> bool:
+    async def selector_present(self, selector: str) -> bool | None:
+        if selector in self.error_selectors:
+            return None
         return selector in self.present_selectors
 
     def set_confinement_active(self, enabled: bool) -> None:
@@ -728,13 +732,17 @@ class PlaywrightBrowserWorker:
             raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
         return dict(state)
 
-    async def selector_present(self, selector: str) -> bool:
+    async def selector_present(self, selector: str) -> bool | None:
+        """True/False if the selector is present/absent; None if it could not be evaluated (a
+        malformed selector or a transient error after navigation). None must NOT be read as a real
+        absence — that would let a malformed selector be accepted as a discriminating signal and then
+        mark a valid login stale on every probe."""
         if self._page is None:
             raise RuntimeError("worker is closed")
         try:
             return await self._page.evaluate("(sel) => document.querySelector(sel) !== null", selector)
         except Exception:
-            return False
+            return None
 
     async def _current_page_result(self, result: dict[str, Any]) -> dict[str, Any]:
         if self._page is None:
