@@ -575,6 +575,25 @@ class PlaywrightBrowserWorker:
         if self.closed or self._page is None:
             raise RuntimeError("worker is closed")
         page = self._page
+        from rebrowser_playwright.async_api import Error as PlaywrightError
+
+        # Any action (a click on a link, Enter submitting a form, go_back to an off-scope page) can
+        # trigger a navigation the route guard aborts. Reset the flag and, if such an abort escapes
+        # a non-navigate action as a Playwright error, return a controlled block instead of a 500.
+        self._nav_off_scope_block = None
+        try:
+            return await self._dispatch_command(request, page)
+        except PlaywrightError:
+            if self.confine_origins and self._nav_off_scope_block is not None:
+                return {
+                    "blocked": True,
+                    "reason": "off-scope navigation blocked",
+                    "url": redact_url(page.url)[0],
+                    "target_origin": self._nav_off_scope_block,
+                }
+            raise
+
+    async def _dispatch_command(self, request: AgentCommandRequest, page: Any) -> dict[str, Any]:
         if request.type == "navigate":
             from rebrowser_playwright.async_api import Error as PlaywrightError
 

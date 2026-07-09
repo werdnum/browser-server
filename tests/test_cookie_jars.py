@@ -1373,21 +1373,68 @@ def test_verify_owner_survives_rolled_back_display_mutation(tmp_path):
 
 
 def test_refresh_write_failure_leaves_prior_jar_loadable(tmp_path, monkeypatch):
-    # If the refresh write fails after the old generation would have been tombstoned, the prior jar
-    # must not be bricked. Write-before-tombstone means nothing is revoked when the write throws.
+    # If the refresh staging write fails (before the before_rename tombstone runs), the prior jar
+    # must not be bricked — nothing is revoked when the staged write throws.
+    import browser_handoff_service.jars as jars_mod
+
     store = make_store(tmp_path)
     meta = save_login(store)  # gen 1, loadable
-    original = store._write_record
+    real_atomic = jars_mod._atomic_write
 
-    def boom(*args, **kwargs):
-        raise OSError("disk full")
+    def boom(path, data, mode=0o600, *, before_rename=None):
+        if path.name == f"{meta.jar_id}.json":  # the jar publish; leave tombstone/anchor writes alone
+            raise OSError("disk full")
+        return real_atomic(path, data, mode, before_rename=before_rename)
 
-    monkeypatch.setattr(store, "_write_record", boom)
+    monkeypatch.setattr(jars_mod, "_atomic_write", boom)
     with pytest.raises(OSError):
-        save_login(store, jar_id=meta.jar_id)  # refresh write fails
-    monkeypatch.setattr(store, "_write_record", original)
+        save_login(store, jar_id=meta.jar_id)  # refresh staging write fails
+    monkeypatch.undo()
 
     loaded = store.load(meta.jar_id)  # old generation never tombstoned -> still loads
+    assert loaded.meta.generation == meta.generation
+
+
+def test_atomic_write_retries_transient_rename_failure(tmp_path, monkeypatch):
+    # A transient os.replace failure (a momentary shared-volume IO error) is retried rather than
+    # bricking a refresh whose superseded generation has already been tombstoned in before_rename.
+    import browser_handoff_service.jars as jars_mod
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient shared-volume IO error")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(jars_mod.os, "replace", flaky_replace)
+    target = tmp_path / "atomic.bin"
+    jars_mod._atomic_write(target, b"payload")
+    monkeypatch.undo()
+
+    assert calls["n"] == 2  # failed once, retried, succeeded
+    assert target.read_bytes() == b"payload"
+
+
+def test_refresh_not_published_when_strict_audit_fails(tmp_path, monkeypatch):
+    # The strict save/refresh audit is written BEFORE the credential is published. If the audit
+    # append fails, nothing is published and the superseded generation is not tombstoned, so the
+    # prior jar stays loadable at its original generation (no orphaned/un-audited credential).
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1, loadable
+
+    def boom_audit(op, m, actor, *, strict=False):
+        if strict:
+            raise JarError("audit disk full")
+
+    monkeypatch.setattr(store, "_audit", boom_audit)
+    with pytest.raises(JarError):
+        save_login(store, jar_id=meta.jar_id)  # refresh aborts at the strict audit
+    monkeypatch.undo()
+
+    loaded = store.load(meta.jar_id)  # never tombstoned, never republished -> original still loads
     assert loaded.meta.generation == meta.generation
 
 

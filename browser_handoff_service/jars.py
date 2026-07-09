@@ -43,6 +43,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -90,6 +91,10 @@ DEFAULT_SESSION_TTL = timedelta(hours=12)
 # so bound them at the edge as well to keep a save from writing an oversized jar file.
 PROBE_FIELD_MAX_LEN = 2048
 LABEL_MAX_LEN = 80
+# Retries for the atomic-publish rename, so a transient shared-volume IO error after a refresh has
+# committed the old generation's tombstone does not leave the jar bricked.
+_ATOMIC_RENAME_ATTEMPTS = 3
+_ATOMIC_RENAME_BACKOFF_S = 0.05
 # Tombstone generation used when a jar's real generation cannot be authenticated (tampered
 # metadata): block *every* version of the id fail-closed. Comfortably above any real counter.
 _MAX_GENERATION = 2**63 - 1
@@ -634,7 +639,18 @@ def _atomic_write(
         os.chmod(tmp, mode)
         if before_rename is not None:
             before_rename()
-        os.replace(tmp, path)
+        # Retry the publish a few times: on a refresh, before_rename has already committed the old
+        # generation's tombstone, so a transient os.replace failure here (a momentary shared-volume
+        # IO error) would otherwise leave the prior jar on disk but tombstoned — a recoverable brick.
+        # An immediate re-rename clears the common transient case; a persistent error still raises.
+        for attempt in range(_ATOMIC_RENAME_ATTEMPTS):
+            try:
+                os.replace(tmp, path)
+                break
+            except OSError:
+                if attempt == _ATOMIC_RENAME_ATTEMPTS - 1:
+                    raise
+                time.sleep(_ATOMIC_RENAME_BACKOFF_S)
         # fsync the directory so the rename (the new/updated entry) is itself durable — else a
         # crash can lose an acknowledged save/refresh even though the temp file was fsync'd.
         _fsync_dir(path.parent)
@@ -861,6 +877,14 @@ class JarStore:
             raise JarValidationError("jar file id does not match its path")
         return record
 
+    def _seal_record(self, meta: CookieJarMeta, storage_state: dict[str, Any], probe: JarProbeConfig) -> bytes:
+        """Serialize the full jar file: cleartext metadata + AES-GCM sealed {storage_state, probe}.
+        A fresh nonce per call, so measuring one sealing and writing another is size-consistent."""
+        payload = {"storage_state": storage_state, "probe": probe.model_dump()}
+        sealed = self._encrypt(meta, payload)
+        record = {"meta": meta.model_dump(mode="json"), **sealed}
+        return json.dumps(record).encode("utf-8")
+
     def _write_record(
         self,
         meta: CookieJarMeta,
@@ -868,20 +892,10 @@ class JarStore:
         probe: JarProbeConfig,
         *,
         before_rename: Callable[[], None] | None = None,
-        enforce_max: bool = False,
     ) -> None:
-        payload = {"storage_state": storage_state, "probe": probe.model_dump()}
-        sealed = self._encrypt(meta, payload)
-        record = {"meta": meta.model_dump(mode="json"), **sealed}
-        data = json.dumps(record).encode("utf-8")
-        # On a save/refresh, cap the ACTUAL serialized file — full cleartext metadata plus the
-        # base64 (~+33%) ciphertext — not a plaintext estimate, so what lands on the volume is what
-        # was bounded. Checked before the rename so an over-cap record never publishes (and, on a
-        # refresh, never tombstones the old generation). Re-seals (record_probe/invalidate) skip it:
-        # the jar was already bounded at save and only gains a few freshness bytes.
-        if enforce_max and len(data) > self.max_bytes:
-            raise JarValidationError(f"sealed jar record exceeds the {self.max_bytes}-byte limit")
-        _atomic_write(self._path(meta.jar_id), data, before_rename=before_rename)
+        _atomic_write(
+            self._path(meta.jar_id), self._seal_record(meta, storage_state, probe), before_rename=before_rename
+        )
 
     def _meta_from_record(self, record: dict[str, Any]) -> CookieJarMeta:
         try:
@@ -1192,25 +1206,26 @@ class JarStore:
             last_probe_result=None,
             invalidated_at=None,
         )
+        # Seal once, then in order: (1) cap the ACTUAL serialized file (metadata + base64 ciphertext,
+        # ~+33%) — an over-cap record must never publish or tombstone; (2) write the strict audit
+        # BEFORE publishing, so a durable credential is never published (nor the old generation
+        # tombstoned) without a durable audit entry; (3) publish. On a refresh the tombstone of the
+        # superseded generation runs in _atomic_write's before_rename hook, between the fsync'd temp
+        # write and the rename, so a staging failure tombstones nothing and a tombstone failure
+        # discards the staged file (prior jar intact either way).
+        data = self._seal_record(meta, filtered, probe)
+        if len(data) > self.max_bytes:
+            raise JarValidationError(f"sealed jar record exceeds the {self.max_bytes}-byte limit")
+        self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by, strict=True)
         if existing is not None:
-            # Stage the replacement, durably tombstone the superseded generation, THEN publish (the
-            # tombstone runs in _atomic_write's before_rename hook, between the fsync'd temp write
-            # and the rename). This handles both partial-failure directions: a staging failure
-            # tombstones nothing (prior jar intact), and a tombstone failure discards the staged
-            # file (prior jar intact, no rollback bypass). Only once the old generation is durably
-            # revoked does the new generation become reachable.
             old_generation = existing.generation
-            self._write_record(
-                meta,
-                filtered,
-                probe,
+            _atomic_write(
+                self._path(meta.jar_id),
+                data,
                 before_rename=lambda: self._tombstones.record(meta.jar_id, old_generation, "invalidated"),
-                enforce_max=True,
             )
         else:
-            self._write_record(meta, filtered, probe, enforce_max=True)
-        # Strict: a durable credential must not be acknowledged without a durable audit record.
-        self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by, strict=True)
+            _atomic_write(self._path(meta.jar_id), data)
         return meta
 
     def resolve_refresh_scope(
