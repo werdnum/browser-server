@@ -629,6 +629,18 @@ class SessionRegistry:
             # refreshed higher generation now would undo that kill-switch.
             await self._enforce_jar_not_revoked_locked(session)
 
+            # The generation this live session was seeded from / produced for req.jar_id. Passed as a
+            # revoke precondition so JarStore, under its ops lock, rejects the refresh if that
+            # generation was revoked in the window between the recheck above and the store's lock —
+            # closing the multi-pod refresh-vs-revoke race with stale browser state. A jarless
+            # re-login (no captured generation) leaves it None and may legitimately re-enable a jar.
+            revoke_precondition: int | None = None
+            if req.jar_id is not None:
+                if session.jar_id == req.jar_id:
+                    revoke_precondition = session.jar_generation
+                elif req.jar_id in session.produced_jar_generations:
+                    revoke_precondition = session.produced_jar_generations[req.jar_id]
+
             meta = self.jar_store.save(
                 jar_id=req.jar_id,
                 label=req.label,
@@ -660,6 +672,7 @@ class SessionRegistry:
                 created_session_id=session.session_id,
                 conversation_id=session.conversation_id,
                 agent_supplied_probe=False,
+                revoke_precondition=revoke_precondition,
             )
             # Provenance only: a set, because one session can produce several jars, and the
             # producing context holds the *unfiltered* login state (never tagged with jar_id).
@@ -680,6 +693,10 @@ class SessionRegistry:
                 # narrowed one. Only for a confined session (a human-driven one runs unconfined).
                 if session.confine_navigation and worker is not None and not worker.closed:
                     worker.set_confine_origins([*meta.origins, *meta.nav_allowlist])
+                    # The route guard only gates future navigations, so also evict the CURRENT page
+                    # if the narrowing dropped its origin — otherwise snapshot/extract/click could
+                    # still read the off-scope document that policy readers now consider out of scope.
+                    await worker.evict_off_scope_page()
             session.updated_at = now_utc()
             self._event(
                 session,

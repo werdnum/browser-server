@@ -202,6 +202,7 @@ class BrowserRuntime(Protocol):
     async def selector_present(self, selector: str) -> bool | None: ...
     def set_confinement_active(self, enabled: bool) -> None: ...
     def set_confine_origins(self, origins: list[str]) -> None: ...
+    async def evict_off_scope_page(self) -> None: ...
 
 
 class FakeBrowserWorker:
@@ -264,6 +265,11 @@ class FakeBrowserWorker:
 
     def set_confine_origins(self, origins: list[str]) -> None:
         self.confine_origins = [o for o in origins]
+
+    async def evict_off_scope_page(self) -> None:
+        if self._off_scope(self.url or ""):
+            self.url = "about:blank"
+            self.title = "Blank"
 
     def _off_scope(self, url: str) -> bool:
         if not self.confine_origins or not self._confinement_active:
@@ -546,6 +552,18 @@ class PlaywrightBrowserWorker:
         # The installed route handler reads self.confine_origins per request, so updating it here
         # tightens (or updates) the live confinement without re-installing the route.
         self.confine_origins = [o for o in origins]
+
+    async def evict_off_scope_page(self) -> None:
+        """After a confinement narrowing, if the current top-level page is now off-scope, navigate it
+        to about:blank — the route guard only gates future *navigations*, so a non-navigation command
+        (snapshot/extract/click) could otherwise still observe and act on the dropped-scope document."""
+        if not self._confinement_active or self._page is None or not self.confine_origins:
+            return
+        if origin_of(self._page.url) not in set(self.confine_origins):
+            try:
+                await self._page.goto("about:blank")
+            except Exception:
+                pass
 
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed or self._page is None:

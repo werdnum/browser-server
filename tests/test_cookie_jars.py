@@ -99,6 +99,7 @@ def save_login(
     saved_by: str = "human",
     owner_subject: str | None = "user123",
     form_factor: str = "desktop",
+    revoke_precondition: int | None = None,
 ) -> CookieJarMeta:
     return store.save(
         jar_id=jar_id,
@@ -116,6 +117,7 @@ def save_login(
         created_session_id="bs_1",
         conversation_id="conv_1",
         agent_supplied_probe=False,
+        revoke_precondition=revoke_precondition,
     )
 
 
@@ -2349,3 +2351,110 @@ async def test_bad_control_token_save_allocates_no_lock(tmp_path):
             actor="human",
         )
     assert jar_id not in reg.jar_locks
+
+
+# --- regression tests for Codex review round 20 ---------------------------
+
+
+def test_unreadable_jar_file_is_jar_error_not_crash(tmp_path, monkeypatch):
+    # A read-time OSError (EACCES/chmod/ACL, dir-at-path) must be a controlled JarError, so the
+    # service-token kill-switch and live-session checks don't 500.
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    backup = path.read_bytes()
+    real_read_text = jars_mod.Path.read_text
+
+    def eacces_read_text(self, *args, **kwargs):
+        if self.name == f"{meta.jar_id}.json":
+            raise PermissionError("EACCES")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(jars_mod.Path, "read_text", eacces_read_text)
+    with pytest.raises(JarError):
+        store.load(meta.jar_id)
+    # And delete still records a terminal tombstone despite the unreadable blob.
+    store.delete(meta.jar_id)
+    monkeypatch.undo()
+    path.write_bytes(backup)  # a restored backup must stay blocked by the terminal tombstone
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+def test_refresh_rejected_after_terminal_invalidation(tmp_path):
+    # A terminal (_MAX_GENERATION) invalidation must not be undone by a same-id refresh publishing
+    # 2**63; require a fresh jar id.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    backup = path.read_bytes()
+    record = json.loads(path.read_text())
+    record["blob"] = base64.b64encode(b"tampered").decode()  # break decrypt -> un-authenticatable
+    path.write_text(json.dumps(record))
+    store.invalidate(meta.jar_id)  # records the _MAX_GENERATION terminal tombstone
+    path.write_bytes(backup)  # restore the authentic file
+    with pytest.raises(JarRevokedError):
+        save_login(store, jar_id=meta.jar_id)
+
+
+def test_delete_succeeds_when_unlink_fails_after_tombstone(tmp_path, monkeypatch):
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    real_unlink = jars_mod.Path.unlink
+
+    def boom_unlink(self, *args, **kwargs):
+        if self.name == f"{meta.jar_id}.json":
+            raise OSError("unlink failed")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(jars_mod.Path, "unlink", boom_unlink)
+    result = store.delete(meta.jar_id)  # must not raise; tombstone is the commit
+    assert result.jar_id == meta.jar_id
+    monkeypatch.undo()
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+def test_save_rejects_refresh_when_precondition_generation_revoked(tmp_path):
+    # The refresh-vs-revoke precondition: a refresh from a session whose captured generation was
+    # revoked must be rejected under the ops lock, not resurrect the jar from stale state.
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+    store.invalidate(meta.jar_id)  # revoke gen 1
+    with pytest.raises(JarRevokedError):
+        save_login(store, jar_id=meta.jar_id, revoke_precondition=meta.generation)
+    # A jarless re-login (no precondition) may still re-enable it.
+    reenabled = save_login(store, jar_id=meta.jar_id)
+    assert reenabled.generation > meta.generation
+
+
+@pytest.mark.asyncio
+async def test_self_refresh_narrowing_evicts_off_scope_page(tmp_path):
+    # A narrowing self-refresh must evict the CURRENT page if the refresh dropped its origin, not
+    # just tighten the route guard for future navigations.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(
+            label="Shop",
+            origins=["https://shop.example.com", "https://api.example.com"],
+            token=ctl,
+            probe=ProbeSpec(logged_in_selector="[x]"),
+        ),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    worker = fake_worker(reg, loaded.worker_id)
+    worker.url = "https://api.example.com/page"  # current page on the origin about to be dropped
+    worker.storage_state = LOGIN_STATE
+    await reg.save_jar(
+        loaded.session_id,
+        SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://shop.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert worker.url == "about:blank"  # off-scope current page evicted

@@ -809,6 +809,11 @@ class JarStore:
             # Raced another pod's DELETE on the shared volume between exists() and open(): the jar is
             # gone, so surface a controlled missing/revoked response, not an opaque 500.
             raise JarNotFoundError(jar_id) from exc
+        except OSError as exc:
+            # Any other read failure (EACCES/chmod regression, a directory at the path, a shared-
+            # volume IO error) is a controlled corruption failure — so the service-token stub paths
+            # still tombstone and live-session rechecks still fail closed instead of 500-ing.
+            raise JarDecryptError("jar file is unreadable (corrupted or permission error)", kind="corruption") from exc
         except ValueError as exc:
             # Unparseable file (corrupted/tampered): a controlled corruption error, not a 500.
             raise JarDecryptError("jar file is not valid JSON (corrupted)", kind="corruption") from exc
@@ -1015,6 +1020,7 @@ class JarStore:
         created_session_id: str,
         conversation_id: str,
         agent_supplied_probe: bool,
+        revoke_precondition: int | None = None,
     ) -> CookieJarMeta:
         self._require_enabled()
         # Hold the cross-process ops lock across the whole read-existing -> tombstone-old ->
@@ -1036,6 +1042,7 @@ class JarStore:
                 created_session_id=created_session_id,
                 conversation_id=conversation_id,
                 agent_supplied_probe=agent_supplied_probe,
+                revoke_precondition=revoke_precondition,
             )
 
     def _save_locked(
@@ -1056,6 +1063,7 @@ class JarStore:
         created_session_id: str,
         conversation_id: str,
         agent_supplied_probe: bool,
+        revoke_precondition: int | None = None,
     ) -> CookieJarMeta:
         self._enforce_size(raw_storage_state)
 
@@ -1064,6 +1072,18 @@ class JarStore:
             validate_jar_id(jar_id)
             if self._tombstones.is_deleted(jar_id):
                 raise JarRevokedError("this jar_id was deleted and is terminal; create a new jar")
+            # A terminal max-generation tombstone (a delete, or an un-authenticatable invalidate that
+            # blocked every version fail-closed) means the id is dead: high_water+1 would otherwise
+            # publish 2**63 and resurrect it. Require a fresh jar id instead.
+            if self._tombstones.high_water(jar_id) >= _MAX_GENERATION:
+                raise JarRevokedError("this jar_id is terminally revoked; create a new jar")
+            # Close the refresh-vs-revoke TOCTOU under THIS ops lock: if the specific generation the
+            # caller's live session was seeded from / produced was revoked (possibly by another pod
+            # after the registry's pre-check but before this lock), reject rather than publish a
+            # higher generation with cleared invalidated_at that would undo the remote kill-switch
+            # from stale browser state. A fresh re-login (no precondition) may still re-enable.
+            if revoke_precondition is not None and self._tombstones.blocked_reason(jar_id, revoke_precondition):
+                raise JarRevokedError("the generation this session holds was revoked; re-login to refresh")
             existing = self.get_meta_verified(jar_id)  # verifies envelope; raises if missing/tampered
 
         if existing is not None:
@@ -1376,10 +1396,18 @@ class JarStore:
 
     def _unlink_durably(self, jar_id: str) -> None:
         """Remove the jar blob and fsync the directory so the removal survives a crash — otherwise
-        the encrypted credential file can reappear on disk after a DELETE the API already acked."""
+        the encrypted credential file can reappear on disk after a DELETE the API already acked.
+
+        Best-effort: called only AFTER the terminal tombstone is committed, so a transient unlink
+        failure (permissions / IO error) must not abort delete() — the tombstone already blocks
+        loads and the caller (registry.delete_jar) still closes live sessions on return. The blob
+        stays but is permanently unloadable."""
         path = self._path(jar_id)
-        path.unlink(missing_ok=True)
-        _fsync_dir(path.parent)
+        try:
+            path.unlink(missing_ok=True)
+            _fsync_dir(path.parent)
+        except OSError:
+            logger.warning("jar %s unlink after delete failed; tombstone remains authoritative", jar_id)
 
     # -- probe --------------------------------------------------------------
     def probe_allowed_at(self, meta: CookieJarMeta) -> datetime | None:
