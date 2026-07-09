@@ -15,8 +15,9 @@ Security invariants enforced here:
 - Jar contents (cookie/storage names and values) are never returned or logged — only metadata.
 - Jars are encrypted with AES-256-GCM under an operator key; keyless => feature disabled, 503.
 - Security-critical cleartext metadata (origins, nav_allowlist, owner_subject, storage_mode,
-  key_id, jar_id, generation, invalidated_at) is bound as AES-GCM AAD, so tampering with the
-  file without the key fails decryption closed.
+  key_id, jar_id, generation, invalidated_at, and the freshness fields last_probe_at/
+  last_probe_result) is bound as AES-GCM AAD, so tampering with the file without the key fails
+  decryption closed.
 - Revocation is rollback-proof via a monotonic ``generation`` counter and an append-only,
   HMAC-authenticated tombstone log whose high-water mark is re-derived (verified) on each check.
 - Every ``jar_id`` is validated against ``jar_[0-9a-f]{32}`` before it touches the filesystem.
@@ -193,19 +194,46 @@ _HEX_SEG_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 # 4-digit segments (years, etc.) are left alone.
 _LONG_DIGIT_RE = re.compile(r"^\d{5,}$")
 
+# State-changing endpoints a replayed freshness GET (with the saved login) must never hit — a
+# routine probe of /logout would sign the user out; /delete, /revoke, etc. are worse. Matched as
+# an exact decoded path segment (so /account/logout-history, a real page, is left alone).
+_ACTION_SEGMENTS = frozenset(
+    {
+        "logout",
+        "log-out",
+        "signout",
+        "sign-out",
+        "logoff",
+        "log-off",
+        "delete",
+        "remove",
+        "revoke",
+        "disconnect",
+        "deactivate",
+        "unsubscribe",
+        "close-account",
+        "delete-account",
+    }
+)
 
-def _path_looks_sensitive(path: str) -> bool:
+
+def _split_path_segments(path: str) -> list[str]:
     from urllib.parse import unquote
 
-    for segment in path.split("/"):
-        if not segment:
-            continue
-        # Percent-decode first, so a secret/account-id encoded as %64%65… cannot slip past the
-        # hex/long-digit/over-length guards that a plain scan would miss.
-        decoded = unquote(segment)
-        if _HEX_SEG_RE.match(decoded) or _LONG_DIGIT_RE.match(decoded) or len(decoded) > 64:
+    # Decode BEFORE splitting so an encoded slash (%2F) cannot bury a sensitive/action subsegment
+    # inside one raw segment (e.g. /reset%2Fdeadbeef… must split into "reset" and the token).
+    return [seg for seg in unquote(path).split("/") if seg]
+
+
+def _path_looks_sensitive(path: str) -> bool:
+    for segment in _split_path_segments(path):
+        if _HEX_SEG_RE.match(segment) or _LONG_DIGIT_RE.match(segment) or len(segment) > 64:
             return True
     return False
+
+
+def _path_looks_action_like(path: str) -> bool:
+    return any(seg.lower() in _ACTION_SEGMENTS for seg in _split_path_segments(path))
 
 
 def _cookie_matches_origin(cookie: dict[str, Any], origin_host: str, origin_secure: bool) -> bool:
@@ -534,6 +562,11 @@ _AAD_FIELDS = (
     "storage_mode",
     "generation",
     "invalidated_at",
+    # Freshness fields are AAD-bound too: on a shared volume a filesystem writer without the key
+    # must not be able to forge a "fresh" result or push last_probe_at into the future to suppress
+    # real probes. record_probe re-seals so these stay authenticated.
+    "last_probe_at",
+    "last_probe_result",
 )
 
 
@@ -547,6 +580,8 @@ def _aad_for(meta: CookieJarMeta, key_id: str) -> bytes:
         "storage_mode": meta.storage_mode,
         "generation": meta.generation,
         "invalidated_at": meta.invalidated_at.isoformat() if meta.invalidated_at else None,
+        "last_probe_at": meta.last_probe_at.isoformat() if meta.last_probe_at else None,
+        "last_probe_result": meta.last_probe_result,
         "key_id": key_id,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -785,12 +820,18 @@ class JarStore:
         return metas
 
     def verify_owner(self, meta: CookieJarMeta, jar_id: str) -> bool:
-        """True iff the jar's AEAD envelope authenticates (so ``owner_subject`` is trustworthy)."""
+        """True iff the jar's AEAD envelope authenticates and its *authenticated* owner_subject
+        matches the passed meta's. Re-derives meta from disk before decrypting, so a display-only
+        field that ``list_meta`` mutates on the returned object (e.g. ``invalidated_at`` on a
+        rolled-back generation, which is AAD-bound) cannot make verification fail and hide the jar
+        from its rightful owner."""
         try:
-            self._decrypt(meta, self._read_record(jar_id))
-            return True
+            record = self._read_record(jar_id)
+            disk_meta = self._meta_from_record(record)
+            self._decrypt(disk_meta, record)
         except JarError:
             return False
+        return disk_meta.owner_subject == meta.owner_subject
 
     # -- probe validation ---------------------------------------------------
     def build_probe(
@@ -829,8 +870,11 @@ class JarStore:
                 raise JarValidationError("probe url must be within the jar origins + nav_allowlist")
             from urllib.parse import urlsplit
 
-            if _path_looks_sensitive(urlsplit(url).path):
+            probe_path = urlsplit(url).path
+            if _path_looks_sensitive(probe_path):
                 raise JarValidationError("probe url path contains a high-entropy or sensitive segment")
+            if _path_looks_action_like(probe_path):
+                raise JarValidationError("probe url path looks like a state-changing action (e.g. logout)")
             if agent_supplied:
                 raise JarValidationError("agent saves may not supply an explicit probe url")
 
@@ -971,13 +1015,13 @@ class JarStore:
             last_probe_result=None,
             invalidated_at=None,
         )
-        if existing is not None:
-            # Tombstone the superseded generation before publishing the new one, so restoring the
-            # prior jar_*.json after a scope-narrowing/credential-rotating refresh cannot load the
-            # older, wider file (blocked_reason(old_gen) then fails closed; the new, higher
-            # generation stays loadable).
-            self._tombstones.record(meta.jar_id, existing.generation, "invalidated")
+        # Publish the new (higher) generation FIRST, then tombstone the superseded one. If the
+        # write fails (full volume, permissions), nothing is tombstoned and the prior jar stays
+        # loadable rather than being bricked. Once the write has succeeded the tombstone makes a
+        # later restore of the prior jar_*.json fail closed (blocked_reason(old_gen)).
         self._write_record(meta, filtered, probe)
+        if existing is not None:
+            self._tombstones.record(meta.jar_id, existing.generation, "invalidated")
         self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by)
         return meta
 
@@ -1010,6 +1054,10 @@ class JarStore:
         else:
             # Explicit (including []) => narrow to exactly this subset (an empty list clears it).
             requested_allow = {o for o in (normalize_origin(x) for x in nav_allowlist) if o}
+            if nav_allowlist and not requested_allow:
+                # A non-empty request that all fails normalization (e.g. a typo'd port) must not
+                # be read as an intentional clear that silently drops the stored allowlist.
+                raise JarValidationError("refresh nav_allowlist contained no valid origin")
             if not requested_allow <= stored_allowlist:
                 raise JarValidationError("refresh cannot widen nav_allowlist; create a new jar")
             resolved_allowlist = sorted(requested_allow)
@@ -1167,13 +1215,24 @@ class JarStore:
         with self._ops_lock():
             record = self._read_record(jar_id)
             meta = self._meta_from_record(record)
+            try:
+                payload = self._decrypt(meta, record)
+            except JarError:
+                # The jar no longer authenticates (rotated key / tampered file): do not touch the
+                # freshness fields — there is nothing safe to re-seal them against.
+                return meta
             meta.last_probe_at = now_utc()
             meta.last_probe_result = result
-            # last_probe_* are not AAD-bound, so patch the cleartext meta and keep the existing
-            # sealed blob. Re-reading under the ops lock means a probe that finished after a
-            # concurrent refresh cannot write a stale-generation payload over the refreshed jar.
-            record["meta"] = meta.model_dump(mode="json")
-            _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
+            # last_probe_* are AAD-bound, so re-seal the whole record (fresh nonce) rather than
+            # patch cleartext: a filesystem writer without the key then cannot forge a "fresh"
+            # result or a future last_probe_at. Re-reading + re-decrypting under the ops lock means
+            # a probe that finished after a concurrent refresh re-seals the refreshed payload, not
+            # a stale one.
+            self._write_record(
+                meta,
+                payload.get("storage_state", {}),
+                JarProbeConfig.model_validate(payload.get("probe", {"url": ""})),
+            )
             return meta
 
     # -- audit --------------------------------------------------------------

@@ -90,7 +90,14 @@ export BROWSER_JAR_KEY="$(python -c 'import base64,os;print(base64.urlsafe_b64en
 export BROWSER_JAR_DIR="/var/lib/browser-handoff/jars"   # optional; default shown
 export BROWSER_JAR_MAX_BYTES="5242880"                    # optional; per-jar export cap
 export BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION="0"         # optional; gate human saves behind FA
+export BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN="<secret>"    # required only when the gate above is on
 ```
+
+When `BROWSER_JAR_REQUIRE_SAVE_AUTHORIZATION` is enabled, a human save must present
+`BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN`. This is a **dedicated** secret, deliberately separate from
+`BROWSER_HANDOFF_SERVICE_TOKEN`: the party that relays it to the browser to authorize a save must
+not thereby gain the full agent/service API (which can list, load, and delete every jar). If the
+gate is on but this token is unset, saves fail closed.
 
 ### Durability and multi-process deployment
 

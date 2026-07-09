@@ -1318,3 +1318,165 @@ def test_unverified_metadata_returns_stub_not_tampered_scope(tmp_path):
     assert listed.label == "(unverified)"
     assert listed.origins == []
     assert listed.invalidated_at is not None
+
+
+# --- regression tests for Codex review round 8 ----------------------------
+
+
+def test_encoded_slash_hides_no_sensitive_probe_segment(tmp_path):
+    # /reset%2Fdeadbeefdeadbeef00 -> decode-before-split yields ["reset", "deadbeefdeadbeef00"];
+    # the 18-hex token must be caught, not buried inside one raw segment containing an encoded slash.
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/reset%2Fdeadbeefdeadbeef00")
+
+
+def test_action_like_probe_path_rejected(tmp_path):
+    # A replayed freshness GET to /logout would sign the saved login out.
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/logout")
+    # Encoded, and as a non-final segment, are both caught (decode-before-split + any-segment scan).
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/%6cogout")
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/signout/confirm")
+
+
+def test_non_action_probe_path_allowed(tmp_path):
+    # A page that merely contains an action word as a substring is not an action endpoint.
+    store = make_store(tmp_path)
+    meta = save_login(store, probe_spec_url="https://shop.example.com/account/logout-history")
+    assert meta.jar_id
+
+
+def test_verify_owner_survives_rolled_back_display_mutation(tmp_path):
+    # list_meta marks a rolled-back generation invalidated for display by mutating the AAD-bound
+    # invalidated_at on the returned object. verify_owner must re-derive meta from disk so that
+    # mutation cannot make the decrypt fail and hide the jar from its rightful owner.
+    store = make_store(tmp_path)
+    meta = save_login(store, owner_subject="user123")  # gen 1
+    gen1 = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+    save_login(store, jar_id=meta.jar_id, owner_subject="user123")  # gen 2
+    store.invalidate(meta.jar_id)  # tombstone gen 2
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(gen1)  # restore gen-1 file (invalidated_at None)
+
+    listed = next(m for m in store.list_meta() if m.jar_id == meta.jar_id)
+    assert listed.invalidated_at is not None  # display-mutated to needs-relogin
+    assert store.verify_owner(listed, meta.jar_id) is True  # ownership still verifies
+
+
+def test_refresh_write_failure_leaves_prior_jar_loadable(tmp_path, monkeypatch):
+    # If the refresh write fails after the old generation would have been tombstoned, the prior jar
+    # must not be bricked. Write-before-tombstone means nothing is revoked when the write throws.
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1, loadable
+    original = store._write_record
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_record", boom)
+    with pytest.raises(OSError):
+        save_login(store, jar_id=meta.jar_id)  # refresh write fails
+    monkeypatch.setattr(store, "_write_record", original)
+
+    loaded = store.load(meta.jar_id)  # old generation never tombstoned -> still loads
+    assert loaded.meta.generation == meta.generation
+
+
+def test_refresh_rejects_all_malformed_nav_allowlist(tmp_path):
+    # A non-empty nav_allowlist that all fails normalization (typo'd port) must be a validation
+    # error, not a silent clear of the stored allowlist.
+    store = make_store(tmp_path)
+    meta = save_login(store, nav_allowlist=["https://idp.example.com"])
+    with pytest.raises(JarValidationError):
+        save_login(store, jar_id=meta.jar_id, nav_allowlist=["https://idp.example.com:bad"])
+    # An explicit empty list is still a legitimate clear.
+    refreshed = save_login(store, jar_id=meta.jar_id, nav_allowlist=[])
+    assert refreshed.nav_allowlist == []
+
+
+def test_probe_freshness_is_authenticated(tmp_path):
+    # last_probe_* are AAD-bound: a filesystem writer without the key cannot forge a "fresh".
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.record_probe(meta.jar_id, "fresh")
+    loaded = store.load(meta.jar_id)  # re-seal preserves the payload and round-trips
+    assert loaded.meta.last_probe_result == "fresh"
+    assert {c["name"] for c in loaded.storage_state["cookies"]} == {"sid", "pref", "wide"}
+
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["last_probe_result"] = "stale"  # tamper the cleartext freshness field
+    path.write_text(json.dumps(record))
+    with pytest.raises(JarError):
+        store.load(meta.jar_id)  # AAD mismatch now fails closed
+
+
+@pytest.mark.asyncio
+async def test_agent_save_from_human_session_keeps_human_owner(tmp_path):
+    # A NEW jar saved by the agent from a human-created session (handed over to the agent) is
+    # attributed to that human so they can see and forget it in their subject-scoped /jars view.
+    reg = registry_with_store(tmp_path)
+    session, ctl = await _human_login_session(reg, subject="user123")
+    _, handover_token = await reg.handover(session.session_id, ctl, "take over")
+    await reg.agent_claim(session.session_id, handover_token)  # agent now owns the lease; owner retained
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(label="Shop", origins=["https://shop.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert meta.owner_subject == "user123"
+
+
+@pytest.mark.asyncio
+async def test_agent_refresh_does_not_reassign_owner(tmp_path):
+    # An agent's refresh authority is unconditional, so it must NOT be able to reassign another
+    # human's jar to the current session's owner just by refreshing it.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    # A different human's session, handed over to the agent, refreshes the jar.
+    other, ctl2 = await _human_login_session(reg, subject="user456")
+    _, ho = await reg.handover(other.session_id, ctl2, "take over")
+    await reg.agent_claim(other.session_id, ho)
+    refreshed = await reg.save_jar(
+        other.session_id,
+        SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://shop.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert refreshed.owner_subject == "user123"  # not reassigned to user456
+
+
+@pytest.mark.asyncio
+async def test_save_authorization_uses_dedicated_secret_not_service_token(tmp_path, monkeypatch):
+    # When the save-authorization gate is on, the full-API service bearer must NOT satisfy it — a
+    # dedicated secret does — so relaying the save token to the browser cannot grant API access.
+    store = make_store(tmp_path)
+    store.require_save_authorization = True
+    reg = SessionRegistry(jar_store=store)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", "svc-token")
+    monkeypatch.setenv("BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN", "save-token")
+
+    with pytest.raises(AuthorizationError):
+        await reg.save_jar(
+            human.session_id,
+            SaveJarRequest(
+                label="Shop", token=ctl, save_authorization="svc-token", probe=ProbeSpec(logged_in_selector="[x]")
+            ),
+            actor="human",
+        )
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(
+            label="Shop", token=ctl, save_authorization="save-token", probe=ProbeSpec(logged_in_selector="[x]")
+        ),
+        actor="human",
+    )
+    assert meta.owner_subject == "user123"

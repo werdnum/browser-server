@@ -584,7 +584,11 @@ class SessionRegistry:
                 probe_selector=probe_selector,
                 probe_logged_out_prefix=req.probe.logged_out_url_prefix,
                 saved_by=saved_by,
-                owner_subject=owner_subject,
+                # New jar => attribute to the authorized owner. Refresh => pass None so JarStore
+                # preserves the *target jar's* stored owner; an agent (whose refresh auth is
+                # unconditional) must not be able to reassign another human's jar to this session's
+                # owner just by refreshing it.
+                owner_subject=owner_subject if existing is None else None,
                 form_factor=session.form_factor,
                 created_session_id=session.session_id,
                 conversation_id=session.conversation_id,
@@ -643,10 +647,14 @@ class SessionRegistry:
             if self.jar_store.require_save_authorization and not self._valid_save_authorization(req.save_authorization):
                 raise AuthorizationError("an FA save authorization is required for this deployment")
             return session.owner_subject, "human"
-        # Agent save falls out of the existing agent-command authorization.
+        # Agent save falls out of the existing agent-command authorization. Attribute a NEW jar to
+        # the session's owner when one exists (a human-created session handed to the agent), so the
+        # human can still see and forget a login captured from their own session. The subject is
+        # the authenticated one captured at session create/claim — an agent cannot forge it. (On a
+        # *refresh* the caller preserves the target jar's stored owner instead; see save().)
         if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
             raise AuthorizationError("agent save is denied unless the agent owns the lease")
-        return None, "agent"
+        return session.owner_subject, "agent"
 
     def _authorize_jar_refresh(self, existing: CookieJarMeta, actor: str, owner_subject: str | None) -> None:
         """Refreshing overwrites durable credentials, so it needs ownership of the *target* jar,
@@ -661,7 +669,11 @@ class SessionRegistry:
     def _valid_save_authorization(self, token: str | None) -> bool:
         import os
 
-        expected = os.environ.get("BROWSER_HANDOFF_SERVICE_TOKEN")
+        # A DEDICATED save-authorization secret, deliberately NOT the service bearer: whoever must
+        # present this to authorize a human save (e.g. the FA relaying it to the browser) should
+        # not thereby gain the full agent/service API (list/load/delete jars). When the gate is
+        # enabled but this secret is unset, fail closed rather than fall back to the service token.
+        expected = os.environ.get("BROWSER_JAR_SAVE_AUTHORIZATION_TOKEN")
         return bool(token) and bool(expected) and token == expected
 
     async def _worker_current_origin(self, session: BrowserSession) -> str | None:
