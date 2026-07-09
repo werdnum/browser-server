@@ -202,6 +202,28 @@ _HEX_SEG_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 # 5+ all-digit segments read as account ids (the design's own example is /users/12345/account);
 # 4-digit segments (years, etc.) are left alone.
 _LONG_DIGIT_RE = re.compile(r"^\d{5,}$")
+# base64url charset — the shape of a magic-link / invite / reset token in a path.
+_B64URL_SEG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_high_entropy_token(segment: str) -> bool:
+    """A random-looking base64url token (magic link / invite / reset id) that a replayed probe GET
+    must not carry, beyond the all-hex/all-digit cases. Discriminates tokens from readable slugs by
+    character-class mix: URLs are conventionally lowercase, so mixed case (or a long letters+digits
+    run) is the token tell. Kept conservative — a false positive only makes a human pick a simpler
+    probe page."""
+    if not _B64URL_SEG_RE.match(segment):
+        return False
+    has_lower = any(c.islower() for c in segment)
+    has_upper = any(c.isupper() for c in segment)
+    has_digit = any(c.isdigit() for c in segment)
+    # A mixed-case alnum run of real length is almost never a hand-written path segment.
+    if len(segment) >= 16 and has_lower and has_upper:
+        return True
+    # A long single-case letters+digits run (e.g. an all-lowercase base64url token) — require more
+    # length so version-suffixed slugs like "dashboard-v2" are left alone.
+    return len(segment) >= 24 and (has_lower or has_upper) and has_digit
+
 
 # State-changing endpoints a replayed freshness GET (with the saved login) must never hit — a
 # routine probe of /logout would sign the user out; /delete, /revoke, etc. are worse. Matched as
@@ -236,7 +258,12 @@ def _split_path_segments(path: str) -> list[str]:
 
 def _path_looks_sensitive(path: str) -> bool:
     for segment in _split_path_segments(path):
-        if _HEX_SEG_RE.match(segment) or _LONG_DIGIT_RE.match(segment) or len(segment) > 64:
+        if (
+            _HEX_SEG_RE.match(segment)
+            or _LONG_DIGIT_RE.match(segment)
+            or len(segment) > 64
+            or _is_high_entropy_token(segment)
+        ):
             return True
     return False
 
@@ -505,11 +532,21 @@ class TombstoneStore:
             # revocation cannot lose the whole log file from the page cache.
             _fsync_dir(self._log_path.parent)
         # Update the signed high-water anchor (a second authenticated copy of the mark) so a later
-        # tamper of the log alone cannot lower the effective high-water below this point.
+        # tamper of the log alone cannot lower the effective high-water below this point. BEST-EFFORT:
+        # the fsync'd log append above is the durable commit that blocked_reason reads; the anchor is
+        # only a secondary floor against log truncation, and the next successful record() re-folds the
+        # whole log into a fresh anchor. It must NOT raise after the commit — record() is a refresh's
+        # pre-publish hook, so a raise here would leave the old generation tombstoned while the staged
+        # replacement never publishes, bricking the jar.
         combined, _ = self._replay()
         self._fold(combined, jar_id, generation, reason)
         doc = {"jars": combined, "hmac": self._anchor_mac(combined)}
-        _atomic_write(self._external_anchor_path, json.dumps(doc).encode("utf-8"))
+        try:
+            _atomic_write(self._external_anchor_path, json.dumps(doc).encode("utf-8"))
+        except OSError:
+            logger.warning(
+                "jar tombstone anchor update failed for %s; the log remains authoritative", jar_id, exc_info=True
+            )
 
     def blocked_reason(self, jar_id: str, generation: int) -> str | None:
         """Return why a jar file at ``generation`` is blocked, or None if loadable."""
@@ -1033,16 +1070,18 @@ class JarStore:
 
         filtered, stats = filter_storage_state(raw_storage_state, resolved_origins, resolved_storage_mode)
 
-        # The size cap counts the STORED payload (filtered storage + probe), not just the raw export:
-        # probe strings live inside the sealed blob and are bounded at the model edge too, but a
-        # combined check keeps a large selector/prefix from writing a jar past the configured cap.
-        payload_bytes = len(json.dumps({"storage_state": filtered, "probe": probe.model_dump()}).encode("utf-8"))
-        if payload_bytes > self.max_bytes:
-            raise JarValidationError(f"sealed jar payload exceeds the {self.max_bytes}-byte limit")
-
         now = now_utc()
         new_id = jar_id or f"jar_{os.urandom(16).hex()}"
         reg_domains = sorted({d for o in resolved_origins if (d := registrable_domain(o))})
+
+        # The size cap covers the whole stored record, not just the raw export: the filtered storage
+        # + probe live in the sealed blob, and the cleartext metadata (origins/nav_allowlist/
+        # registrable_domains/label — all AAD-bound) is not otherwise bounded, so a caller could
+        # otherwise write an oversized jar file with empty storage but thousands of origins.
+        payload_bytes = len(json.dumps({"storage_state": filtered, "probe": probe.model_dump()}).encode("utf-8"))
+        meta_bytes = len(json.dumps([resolved_origins, resolved_allowlist, reg_domains, label]).encode("utf-8"))
+        if payload_bytes + meta_bytes > self.max_bytes:
+            raise JarValidationError(f"sealed jar record exceeds the {self.max_bytes}-byte limit")
         # A refresh must publish a generation ABOVE the tombstone high-water, not merely
         # existing.generation + 1: if the on-disk file rolled back behind the log (gen1 restored
         # after gen2 was invalidated), a naive +1 would re-write an already-tombstoned generation

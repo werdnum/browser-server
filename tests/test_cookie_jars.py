@@ -1939,3 +1939,69 @@ async def test_agent_selector_dropped_when_baseline_nav_errors(tmp_path, monkeyp
     )
     loaded = reg.jar_store.load(meta.jar_id)
     assert loaded.probe.logged_in_selector is None  # dropped: no real logged-out baseline
+
+
+# --- regression tests for Codex review round 14 ---------------------------
+
+
+def test_high_entropy_probe_token_rejected(tmp_path):
+    # A base64url magic-link/invite token in the probe path must be rejected, not just all-hex ids.
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/invite/AbCdEfGhIjKlMnOpQrStUv")
+
+
+def test_readable_probe_slug_allowed(tmp_path):
+    # A lowercase human-readable slug is not a token and stays allowed.
+    store = make_store(tmp_path)
+    assert save_login(store, probe_spec_url="https://shop.example.com/account-settings").jar_id
+
+
+def test_save_request_bounds_origin_count_and_length():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        SaveJarRequest(label="x", probe=ProbeSpec(), origins=[f"https://s{i}.example.com" for i in range(100)])
+    with pytest.raises(ValidationError):
+        SaveJarRequest(label="x", probe=ProbeSpec(), nav_allowlist=["https://" + "a" * 3000 + ".example.com"])
+
+
+def test_metadata_size_counts_toward_cap(tmp_path):
+    # A jar with empty storage but a huge origin list must still be rejected by the byte cap.
+    store = make_store(tmp_path, max_bytes=1500)
+    many = ["https://shop.example.com"] + [f"https://s{i}.example.com" for i in range(200)]
+    with pytest.raises(JarValidationError):
+        save_login(
+            store,
+            origins=many,
+            raw_storage_state={"cookies": [], "origins": []},
+            probe_spec_url="https://shop.example.com/",
+        )
+
+
+def test_refresh_survives_anchor_write_failure(tmp_path, monkeypatch):
+    # Once the tombstone log append (the durable commit) succeeds, a failure of the secondary signed
+    # anchor write must NOT abort the refresh: the new generation still publishes (no brick) and the
+    # old generation stays revoked via the authoritative log.
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+    gen1 = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+
+    real_atomic = jars_mod._atomic_write
+
+    def flaky_atomic(path, data, mode=0o600, *, before_rename=None):
+        if path.name == "jar-anchor.json":
+            raise OSError("anchor volume full")
+        return real_atomic(path, data, mode, before_rename=before_rename)
+
+    monkeypatch.setattr(jars_mod, "_atomic_write", flaky_atomic)
+    refreshed = save_login(store, jar_id=meta.jar_id)  # gen 2: log commits, anchor write fails
+    monkeypatch.undo()
+
+    assert refreshed.generation == meta.generation + 1
+    assert store.load(meta.jar_id).meta.generation == refreshed.generation  # new gen published, not bricked
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(gen1)  # restore the old file
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)  # old generation still revoked via the log

@@ -3,10 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, StringConstraints
+
+# A single origin/allowlist string, length-bounded so a save cannot inflate the cleartext jar
+# metadata (which is not covered by the storage/probe byte caps) with megabyte-long entries.
+BoundedOriginStr = Annotated[str, StringConstraints(max_length=2048)]
+# Max distinct origins / nav_allowlist entries a jar may declare — generous for real multi-origin
+# logins, but a hard bound so a caller cannot submit thousands and write an oversized jar file.
+MAX_ORIGINS = 64
 
 
 def now_utc() -> datetime:
@@ -307,8 +314,8 @@ class SaveJarRequest(BaseModel):
     label: str = Field(min_length=1, max_length=500)
     # None => create a new jar; a jar_id refreshes that jar in place (version/generation bump).
     jar_id: str | None = None
-    origins: list[str] | None = None
-    nav_allowlist: list[str] | None = None
+    origins: list[BoundedOriginStr] | None = Field(default=None, max_length=MAX_ORIGINS)
+    nav_allowlist: list[BoundedOriginStr] | None = Field(default=None, max_length=MAX_ORIGINS)
     storage: StorageMode | None = None
     # A probe is required on every save (create and refresh); the server can always derive a
     # default (selector on a stable page), so this is "server default is producible", not
