@@ -269,7 +269,14 @@ def _path_looks_sensitive(path: str) -> bool:
 
 
 def _path_looks_action_like(path: str) -> bool:
-    return any(seg.lower() in _ACTION_SEGMENTS for seg in _split_path_segments(path))
+    for seg in _split_path_segments(path):
+        low = seg.lower()
+        # Strip a single file extension so /logout.php, /signout.aspx, /delete.do also match — many
+        # sites expose the state-changing endpoint with a handler suffix.
+        stem = low.rsplit(".", 1)[0] if "." in low else low
+        if low in _ACTION_SEGMENTS or stem in _ACTION_SEGMENTS:
+            return True
+    return False
 
 
 def _cookie_matches_origin(cookie: dict[str, Any], origin_host: str, origin_secure: bool) -> bool:
@@ -399,6 +406,12 @@ def load_jar_keys() -> list[tuple[str, bytes]]:
     return keys
 
 
+class _TombstoneUnavailable(Exception):
+    """The tombstone log exists but cannot be read (EACCES/chmod, transient shared-volume IO). The
+    revocation-state readers fail CLOSED on it (block loads/refreshes, treat as revoked) and record
+    surfaces a controlled error — a jammed kill-switch must never read as 'nothing revoked'."""
+
+
 class TombstoneStore:
     """Rollback-proof revocation high-water, kept as TWO authenticated copies:
 
@@ -453,7 +466,13 @@ class TombstoneStore:
             # must not raise before the per-line skip runs — that would make every blocked_reason/
             # high_water/record fail and jam the kill-switch. A mangled line then just fails JSON
             # parse or HMAC verify and is skipped, and the signed anchor still floors the high-water.
-            for line in self._log_path.read_text(errors="replace").splitlines():
+            try:
+                raw = self._log_path.read_text(errors="replace")
+            except OSError as exc:
+                # The log EXISTS but cannot be read (EACCES/chmod, transient IO). Do not read this as
+                # "empty log / nothing revoked" — signal unavailability so the readers fail closed.
+                raise _TombstoneUnavailable(str(exc)) from exc
+            for line in raw.splitlines():
                 if not line.strip():
                     continue
                 try:
@@ -513,7 +532,12 @@ class TombstoneStore:
     def record(self, jar_id: str, generation: int, reason: str) -> None:
         # Chain from the last *verified* entry, not the last physical line, so an injected line
         # cannot poison the chain for subsequent real revocations.
-        _, prev = self._replay_log()
+        try:
+            _, prev = self._replay_log()
+        except _TombstoneUnavailable as exc:
+            # Cannot read the log to chain a new entry — appending anyway would mis-chain and silently
+            # lose the tombstone. Surface a controlled error so invalidate/delete report failure clearly.
+            raise JarDecryptError("tombstone log is unreadable; cannot record revocation", kind="corruption") from exc
         payload = self._payload(jar_id, generation, reason)
         record = {
             "jar_id": jar_id,
@@ -550,7 +574,10 @@ class TombstoneStore:
 
     def blocked_reason(self, jar_id: str, generation: int) -> str | None:
         """Return why a jar file at ``generation`` is blocked, or None if loadable."""
-        entry = self._current().get(jar_id)
+        try:
+            entry = self._current().get(jar_id)
+        except _TombstoneUnavailable:
+            return "revocation state unavailable"  # fail closed: block the load
         if entry is None:
             return None
         if entry.get("reason") == "deleted":
@@ -560,14 +587,20 @@ class TombstoneStore:
         return None
 
     def is_deleted(self, jar_id: str) -> bool:
-        entry = self._current().get(jar_id)
+        try:
+            entry = self._current().get(jar_id)
+        except _TombstoneUnavailable:
+            return True  # fail closed
         return bool(entry and entry.get("reason") == "deleted")
 
     def high_water(self, jar_id: str) -> int:
         """The highest tombstoned generation for a jar (0 if none). A newly published generation
         must exceed this to be loadable — used so a refresh from a rolled-back file still lands
         above the tombstone rather than re-writing an already-revoked generation."""
-        entry = self._current().get(jar_id)
+        try:
+            entry = self._current().get(jar_id)
+        except _TombstoneUnavailable:
+            return _MAX_GENERATION  # fail closed: no refresh can publish above the terminal marker
         return int(entry.get("generation", 0)) if entry else 0
 
 

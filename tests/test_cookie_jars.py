@@ -2458,3 +2458,69 @@ async def test_self_refresh_narrowing_evicts_off_scope_page(tmp_path):
         actor="agent",
     )
     assert worker.url == "about:blank"  # off-scope current page evicted
+
+
+# --- regression tests for Codex review round 21 ---------------------------
+
+
+def test_extension_suffixed_logout_probe_rejected(tmp_path):
+    # /logout.php (and .aspx/.do) must be rejected as action-like, not just the bare /logout.
+    store = make_store(tmp_path)
+    for path in ("/logout.php", "/account/signout.aspx", "/delete.do"):
+        with pytest.raises(JarValidationError):
+            save_login(store, probe_spec_url=f"https://shop.example.com{path}")
+    # A real page that merely contains the word is still allowed.
+    assert save_login(store, probe_spec_url="https://shop.example.com/logout-history").jar_id
+
+
+def test_unreadable_tombstone_log_fails_closed(tmp_path, monkeypatch):
+    # If the tombstone log EXISTS but cannot be read, revocation checks must fail closed (block the
+    # load) and record must surface a controlled error — never read as "nothing revoked".
+    import browser_handoff_service.jars as jars_mod
+
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.invalidate(meta.jar_id)  # create the log with a real tombstone
+    log = tmp_path / "jars" / "jar-tombstones.jsonl"
+    real_read_text = jars_mod.Path.read_text
+
+    def eacces_read_text(self, *args, **kwargs):
+        if self.name == log.name:
+            raise PermissionError("EACCES")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(jars_mod.Path, "read_text", eacces_read_text)
+    b = save_login(store)  # a *different*, un-tombstoned jar
+    with pytest.raises(JarError):
+        store.load(b.jar_id)  # fail closed: cannot verify revocation state
+    with pytest.raises(JarError):
+        store.invalidate(b.jar_id)  # record surfaces a controlled error, not a 500
+
+
+@pytest.mark.asyncio
+async def test_probe_in_scope_err_failed_is_error_not_stale(tmp_path, monkeypatch):
+    # A generic in-scope navigation failure (no off-scope abort) must classify as "error", not
+    # "stale" — the route guard's off-scope-abort flag, not the net:: code, decides "blocked".
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(
+            label="Shop",
+            token=ctl,
+            probe=ProbeSpec(url="https://shop.example.com/account", logged_in_selector="[data-testid=logout]"),
+        ),
+        actor="human",
+    )
+    from browser_handoff_service import registry as registry_module
+
+    real_make_worker = registry_module.make_worker
+
+    def mk(worker_id, **kwargs):
+        w = cast(FakeBrowserWorker, real_make_worker(worker_id, **kwargs))
+        w.nav_error_urls.add("https://shop.example.com/account")  # in-scope outage, not off-scope
+        return w
+
+    monkeypatch.setattr(registry_module, "make_worker", mk)
+    result = await reg.probe_jar(meta.jar_id)
+    assert result.result == "error"

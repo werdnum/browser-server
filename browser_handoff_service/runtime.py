@@ -393,6 +393,10 @@ class PlaywrightBrowserWorker:
         # Confinement gates only *agent-driven* navigation; it is disabled while a human holds
         # the control token (a human re-login may bounce through an off-scope IdP/SSO origin).
         self._confinement_active = True
+        # Set by the route guard to the off-scope origin it aborted during the current navigation, so
+        # a goto failure can tell an off-scope-redirect block from an in-scope network outage (both
+        # can surface as net::ERR_FAILED). Reset before each navigate.
+        self._nav_off_scope_block: str | None = None
         # Strong refs to fire-and-forget popup-close tasks so they are not GC'd mid-flight.
         self._popup_tasks: set[Any] = set()
         self._playwright = None
@@ -519,11 +523,13 @@ class PlaywrightBrowserWorker:
                 # Fail closed: if the request cannot be classified, block it when off-scope
                 # rather than let a possibly-credentialed document navigation through.
                 if off_scope:
+                    self._nav_off_scope_block = origin_of(request.url)
                     await route.abort()
                     return
                 await route.continue_()
                 return
             if is_document and is_nav and off_scope:
+                self._nav_off_scope_block = origin_of(request.url)
                 await route.abort()
                 return
             await route.continue_()
@@ -581,21 +587,23 @@ class PlaywrightBrowserWorker:
                     "url": redact_url(page.url)[0],
                     "target_origin": origin_of(url),
                 }
+            self._nav_off_scope_block = None
             try:
                 await page.goto(url, wait_until="domcontentloaded")
             except PlaywrightError as exc:
                 msg = str(exc).lower()
-                # The route guard aborts an off-scope redirect (an expired session bouncing to an
-                # IdP/login origin) with an abort-family error; report that structurally as a block.
-                aborted = "err_aborted" in msg or "err_blocked_by_client" in msg or "err_failed" in msg
-                if self.confine_origins and aborted:
+                # Classify by what the ROUTE GUARD actually did, not by the (generic) net:: code: an
+                # aborted off-scope redirect (an expired session bouncing to an IdP/login origin) sets
+                # _nav_off_scope_block, and only then is it a block. A bare net::ERR_FAILED to an
+                # in-scope target with no off-scope abort is an ordinary outage.
+                if self.confine_origins and self._nav_off_scope_block is not None:
                     return {
                         "blocked": True,
                         "reason": "off-scope navigation blocked",
                         "url": redact_url(page.url)[0],
-                        "target_origin": origin_of(page.url),
+                        "target_origin": self._nav_off_scope_block,
                     }
-                # A different net:: error to an in-scope target (DNS/TLS/connection/timeout) is an
+                # A net:: error to an in-scope target (DNS/TLS/connection/timeout/ERR_FAILED) is an
                 # ordinary outage, NOT an off-scope block or a login-state signal — surface it as a
                 # navigation error so a probe classifies it "error", not "stale".
                 if "net::err_" in msg:
