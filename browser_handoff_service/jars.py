@@ -195,10 +195,15 @@ _LONG_DIGIT_RE = re.compile(r"^\d{5,}$")
 
 
 def _path_looks_sensitive(path: str) -> bool:
+    from urllib.parse import unquote
+
     for segment in path.split("/"):
         if not segment:
             continue
-        if _HEX_SEG_RE.match(segment) or _LONG_DIGIT_RE.match(segment) or len(segment) > 64:
+        # Percent-decode first, so a secret/account-id encoded as %64%65… cannot slip past the
+        # hex/long-digit/over-length guards that a plain scan would miss.
+        decoded = unquote(segment)
+        if _HEX_SEG_RE.match(decoded) or _LONG_DIGIT_RE.match(decoded) or len(decoded) > 64:
             return True
     return False
 
@@ -661,7 +666,10 @@ class JarStore:
         try:
             nonce = _b64d(record["nonce"])
             ct = _b64d(record["blob"])
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            # KeyError (missing field), ValueError/binascii.Error (bad base64), TypeError/
+            # AttributeError (non-string field) all mean a malformed envelope — a controlled
+            # corruption error, not an uncaught 500.
             raise JarDecryptError("jar envelope is malformed (tampered or corrupted)", kind="corruption") from exc
         for kid, key in candidates:
             aad = _aad_for(meta, kid)
@@ -689,7 +697,8 @@ class JarStore:
         # file for jar_B copied/restored as jar_A.json would authenticate as jar_B while the
         # tombstone lookup uses jar_A, seeding a revoked login under a fresh id. jar_id is
         # AAD-bound, so an attacker cannot rewrite it to match the path without breaking decrypt.
-        if not isinstance(record, dict) or record.get("meta", {}).get("jar_id") != jar_id:
+        meta_obj = record.get("meta") if isinstance(record, dict) else None
+        if not isinstance(meta_obj, dict) or meta_obj.get("jar_id") != jar_id:
             raise JarValidationError("jar file id does not match its path")
         return record
 
@@ -725,17 +734,18 @@ class JarStore:
         return meta
 
     def get_meta_unverified(self, jar_id: str) -> CookieJarMeta:
-        """Metadata without requiring the blob to decrypt (so rotated/corrupt jars stay
-        manageable). The *label* is still authenticated — a jar whose envelope does not verify
-        gets a safe placeholder — so a filesystem writer cannot surface attacker-chosen prompt
-        text through the service-token detail/list paths."""
+        """Metadata for management that does not require the blob to decrypt (so rotated/corrupt
+        jars stay manageable). If the envelope does NOT verify, none of the cleartext fields can
+        be trusted — a filesystem writer could tamper an AAD-bound origin/status — so a safe
+        needs-relogin stub is returned rather than mixing authenticated and unauthenticated
+        fields. A verified jar's metadata is returned as-is (all AAD fields are authenticated)."""
         self._require_enabled()
         record = self._read_record(jar_id)
         meta = self._meta_from_record(record)
         try:
             self._decrypt(meta, record)
         except JarError:
-            meta.label = "(unverified)"
+            return _stub_meta(jar_id, label="(unverified)")
         return meta
 
     def list_meta(self) -> list[CookieJarMeta]:
@@ -758,12 +768,14 @@ class JarStore:
             # reappear in listings, even though its blob is back on disk.
             if self._tombstones.is_deleted(meta.jar_id):
                 continue
-            # Authenticate the label (AAD-bound): a file edited without the key gets a safe
-            # placeholder rather than returning attacker-chosen text to the FA list surface.
+            # Authenticate the envelope: if it does not verify, none of the cleartext fields
+            # (origins, invalidated_at, status, label) can be trusted, so return a safe
+            # needs-relogin stub rather than surfacing attacker-chosen scope/status/text.
             try:
                 self._decrypt(meta, record)
             except JarError:
-                meta.label = "(unverified)"
+                metas.append(_stub_meta(meta.jar_id, label="(unverified)"))
+                continue
             # A file rolled back behind an invalidation tombstone would otherwise show as usable
             # (often with no cleartext invalidated_at); surface it as needing re-login so a
             # user/agent does not pick a jar that can never load.

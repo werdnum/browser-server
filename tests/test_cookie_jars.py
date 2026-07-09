@@ -1257,3 +1257,64 @@ async def test_session_jar_revoked_helper_across_instances(tmp_path):
     reg_b = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
     await reg_b.delete_jar(meta.jar_id)
     assert reg_a.session_jar_revoked(loaded.session_id) is True
+
+
+# --- regression tests for Codex review round 7 ----------------------------
+
+
+def test_non_string_envelope_field_is_a_decrypt_error_not_a_crash(tmp_path):
+    # A file where nonce/blob is not a string (e.g. a JSON number) must decode to a controlled
+    # corruption error rather than an uncaught AttributeError bubbling up as a 500.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["nonce"] = 12345  # not a base64 string
+    path.write_text(json.dumps(record))
+    with pytest.raises(JarDecryptError):
+        store.load(meta.jar_id)
+
+
+def test_non_dict_meta_is_a_validation_error_not_a_crash(tmp_path):
+    # ``meta`` that is not an object (a bare string/list) must not crash the path-id check with an
+    # AttributeError; it is a controlled validation error so the file is treated as not-its-path.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"] = "not a dict"
+    path.write_text(json.dumps(record))
+    with pytest.raises(JarValidationError):
+        store.load(meta.jar_id)
+
+
+def test_percent_encoded_sensitive_probe_path_rejected(tmp_path):
+    # ``/%31%32%33%34%35%36`` decodes to ``/123456`` (an account-id-shaped segment). A raw scan
+    # would miss it because the encoded form has no all-digit run; percent-decoding first catches it.
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/%31%32%33%34%35%36")
+
+
+def test_unverified_metadata_returns_stub_not_tampered_scope(tmp_path):
+    # When the envelope does not verify, no cleartext field can be trusted. Both the detail and the
+    # list surfaces must return a safe needs-relogin stub (empty origins, invalidated) rather than
+    # echoing an attacker-tampered origin/status alongside the placeholder label.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    record = json.loads(path.read_text())
+    record["meta"]["label"] = "malicious instructions"  # breaks AAD -> envelope no longer verifies
+    record["meta"]["origins"] = ["https://attacker.example.com"]  # forged scope
+    record["meta"]["invalidated_at"] = None  # forged "still usable" status
+    path.write_text(json.dumps(record))
+
+    detail = store.get_meta_unverified(meta.jar_id)
+    assert detail.label == "(unverified)"
+    assert detail.origins == []  # forged scope not surfaced
+    assert detail.invalidated_at is not None  # surfaced as needing re-login
+
+    listed = next(m for m in store.list_meta() if m.jar_id == meta.jar_id)
+    assert listed.label == "(unverified)"
+    assert listed.origins == []
+    assert listed.invalidated_at is not None
