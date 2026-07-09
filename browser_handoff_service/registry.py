@@ -12,6 +12,7 @@ from .jars import (
     JarStore,
     jar_store_from_env,
     normalize_origin,
+    validate_jar_id,
 )
 from .models import (
     AGENT_COMMAND_STATES,
@@ -108,10 +109,6 @@ class SessionRegistry:
         # Per-jar locks serialize load against invalidate/delete so a load cannot race a
         # concurrent revocation (see create_session's post-registration recheck).
         self.jar_locks: dict[str, asyncio.Lock] = {}
-        # Jars with a probe currently running. Reserved under the jar lock together with the
-        # rate-limit check so a burst of concurrent probes for the same jar cannot all pass the
-        # "last_probe_at unset" check and replay several authenticated freshness navigations.
-        self._probes_in_flight: set[str] = set()
 
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
@@ -513,6 +510,13 @@ class SessionRegistry:
         (main) establishes it from the auth path. Authorization mirrors agent commands and is
         fail-closed."""
         self._require_jars_enabled()
+        # Validate the id and confirm the session exists BEFORE allocating a per-jar lock: _jar_lock
+        # caches an asyncio.Lock keyed by jar_id forever, so a caller POSTing malformed/random ids
+        # (or ids against a bogus session) must not be able to leave permanent entries in
+        # self.jar_locks. A malformed id is a 400 and an unknown session a 404, both lock-free.
+        self.get(session_id)
+        if req.jar_id is not None:
+            validate_jar_id(req.jar_id)
         # A refresh mutates an existing durable jar, so it must serialize against
         # invalidate/delete on the same jar (jar lock BEFORE the session lock, matching the
         # jar->session order used by create/revocation) — otherwise an in-flight refresh could
@@ -856,30 +860,21 @@ class SessionRegistry:
         probe target under the same exact-origin guard as a jar-loaded session, apply the
         success indicator, and tear the context down. Never returns page content. Rate-limited."""
         self._require_jars_enabled()
-        # Hold the jar lock only for the load + rate-check, then release it before the network
-        # probe (browser startup + navigation) so a concurrent DELETE/invalidate — the real-time
-        # kill-switch — is not blocked behind a slow probe target. record_probe re-takes the lock.
+        # Hold the jar lock only for the load + DURABLE reservation, then release it before the
+        # network probe (browser startup + navigation) so a concurrent DELETE/invalidate — the
+        # real-time kill-switch — is not blocked behind a slow probe target. reserve_probe stamps
+        # last_probe_at under the cross-process ops lock BEFORE the probe runs, so another pod
+        # sharing the volume sees the rate-limit and will not run a duplicate authenticated probe.
         async with self._jar_lock(jar_id):
             loaded = self.jar_store.load(jar_id)  # raises if invalidated/revoked/disabled
-            next_allowed = self.jar_store.probe_allowed_at(loaded.meta)
-            if next_allowed is not None:
-                raise ConflictError("probe is rate-limited; try again later")
-            # Reserve while still holding the lock so a concurrent probe for the same jar cannot
-            # also pass the rate-limit check and run a second authenticated navigation before the
-            # first records its result.
-            if jar_id in self._probes_in_flight:
-                raise ConflictError("a probe for this jar is already in progress")
-            self._probes_in_flight.add(jar_id)
-        try:
-            result, final_origin = await self._run_probe(loaded)
-            # If the jar was revoked/deleted while the probe ran, skip persisting a stale result.
-            # Pass the probed generation so record_probe can also drop the result if a refresh
-            # published a newer generation in the meantime (the old probe must not stamp the fresh
-            # login).
-            if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
-                self.jar_store.record_probe(jar_id, result, expected_generation=loaded.meta.generation)
-        finally:
-            self._probes_in_flight.discard(jar_id)
+            if not self.jar_store.reserve_probe(jar_id, loaded.meta.generation):
+                raise ConflictError("probe is rate-limited or already in progress; try again later")
+        result, final_origin = await self._run_probe(loaded)
+        # If the jar was revoked/deleted while the probe ran, skip persisting a stale result. Pass
+        # the probed generation so record_probe drops the result if a refresh published a newer
+        # generation in the meantime (the old probe must not stamp the fresh login).
+        if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
+            self.jar_store.record_probe(jar_id, result, expected_generation=loaded.meta.generation)
         return ProbeResult(result=result, final_origin=final_origin)
 
     async def _run_probe(self, loaded) -> tuple[ProbeResultName, str | None]:

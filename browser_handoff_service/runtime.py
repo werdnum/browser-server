@@ -669,10 +669,10 @@ class PlaywrightBrowserWorker:
         producing jars that reload logged-out for the growing set of sites that keep their
         auth token there.
 
-        ``cookies_only`` short-circuits to a cookies-only export: localStorage/IndexedDB are never
-        read and no origins are returned. Cookies are not counted by ``navigator.storage.estimate()``
-        and a cookies_only jar discards client storage anyway, so a site with a large IndexedDB but
-        small cookies must still be saveable — the estimate/full-materialization bound is skipped.
+        ``cookies_only`` short-circuits to ``context.cookies()``: localStorage/IndexedDB are never
+        read or materialized and no origins are returned. Cookies are not counted by
+        ``navigator.storage.estimate()`` and a cookies_only jar discards client storage anyway, so a
+        site with large client storage but small cookies must still be saveable without allocating it.
 
         Otherwise size is bounded twice: a **source-side** pre-check via ``navigator.storage.estimate()``
         rejects an origin whose client storage already exceeds the cap *before* the full state is
@@ -682,8 +682,11 @@ class PlaywrightBrowserWorker:
         if self._context is None:
             raise RuntimeError("worker is closed")
         if cookies_only:
-            state = await self._context.storage_state()  # bare: cookies + localStorage, no IndexedDB
-            state = {"cookies": state.get("cookies", []), "origins": []}  # drop localStorage too
+            # context.cookies() returns ONLY cookies — it never materializes localStorage/IndexedDB,
+            # so a page with huge client storage cannot force an unbounded allocation on a save whose
+            # result discards that storage anyway (storage_state() would read localStorage first).
+            cookies = await self._context.cookies()
+            state = {"cookies": list(cookies), "origins": []}
             if len(json.dumps(state).encode("utf-8")) > max_bytes:
                 raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
             return state

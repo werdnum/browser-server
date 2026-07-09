@@ -1285,12 +1285,10 @@ class JarStore:
         try:
             record = self._read_record(jar_id)
             meta = self._meta_from_record(record)
-        except JarNotFoundError:
-            raise
-        except JarError:
-            # Corrupt/unparseable/id-mismatched/invalid-metadata file: honor the kill-switch
-            # anyway. The generation is unknowable, so block every version fail-closed (the file
-            # stays but is unloadable).
+        except (JarNotFoundError, JarError):
+            # Missing OR corrupt/unparseable/id-mismatched/invalid-metadata file: honor the
+            # kill-switch anyway. The generation is unknowable, so block every version fail-closed
+            # (a restored backup cannot revive the login; a genuine re-login uses a fresh id).
             self._tombstones.record(jar_id, _MAX_GENERATION, "invalidated")
             stub = _stub_meta(jar_id)
             self._audit("jar_invalidated", stub, actor)
@@ -1329,11 +1327,10 @@ class JarStore:
         with self._ops_lock():
             try:
                 meta = self._meta_from_record(self._read_record(jar_id))
-            except JarNotFoundError:
-                raise
-            except JarError:
-                # Corrupt/unparseable/id-mismatched file: still honor the kill-switch. A delete is
-                # terminal regardless of generation, so tombstone at the max generation and unlink.
+            except (JarNotFoundError, JarError):
+                # Missing OR corrupt/unparseable/id-mismatched file: still honor the kill-switch. A
+                # delete is terminal, so record the terminal tombstone even when the blob is already
+                # gone — otherwise a restored backup of jar_id.json would revive the forgotten login.
                 self._tombstones.record(jar_id, _MAX_GENERATION, "deleted")
                 self._unlink_durably(jar_id)
                 stub = _stub_meta(jar_id)
@@ -1360,6 +1357,30 @@ class JarStore:
             return None
         next_allowed = meta.last_probe_at + PROBE_MIN_INTERVAL
         return next_allowed if next_allowed > now_utc() else None
+
+    def reserve_probe(self, jar_id: str, generation: int) -> bool:
+        """Atomically claim a probe slot across processes. Under the cross-process ops lock: if the
+        generation still matches and the jar is not rate-limited, durably stamp last_probe_at=now
+        (AAD-bound re-seal) and return True; else False. Because the reservation is written to the
+        shared file BEFORE the browser probe runs, a second pod (or process) reading the jar sees the
+        rate-limit and will not run a duplicate authenticated freshness navigation. Returns False if
+        the jar no longer authenticates (rotated/tampered)."""
+        with self._ops_lock():
+            record = self._read_record(jar_id)
+            meta = self._meta_from_record(record)
+            if meta.generation != generation or self.probe_allowed_at(meta) is not None:
+                return False
+            try:
+                payload = self._decrypt(meta, record)
+            except JarError:
+                return False
+            meta.last_probe_at = now_utc()
+            self._write_record(
+                meta,
+                payload.get("storage_state", {}),
+                JarProbeConfig.model_validate(payload.get("probe", {"url": ""})),
+            )
+            return True
 
     def record_probe(
         self, jar_id: str, result: ProbeResultName, *, expected_generation: int | None = None

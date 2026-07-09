@@ -2076,3 +2076,60 @@ async def test_agent_save_drops_logged_out_prefix(tmp_path):
         actor="agent",
     )
     assert reg.jar_store.load(meta.jar_id).probe.logged_out_url_prefix is None
+
+
+# --- regression tests for Codex review round 16 ---------------------------
+
+
+def test_reserve_probe_is_durable_across_instances(tmp_path):
+    # The probe reservation is written to the shared file, so another pod sharing BROWSER_JAR_DIR
+    # sees the rate-limit and will not run a duplicate authenticated probe.
+    key = _key()
+    a = make_store(tmp_path, keys=key)
+    meta = save_login(a)
+    assert a.reserve_probe(meta.jar_id, meta.generation) is True
+    b = make_store(tmp_path, keys=key)  # a second pod on the same volume
+    assert b.reserve_probe(meta.jar_id, meta.generation) is False
+    # A stale generation cannot reserve either.
+    assert a.reserve_probe(meta.jar_id, meta.generation + 5) is False
+
+
+def test_delete_of_missing_file_records_terminal_tombstone(tmp_path):
+    # Forgetting a jar whose file already vanished must still record the terminal tombstone, so a
+    # restored backup cannot revive the login.
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    backup = path.read_bytes()
+    path.unlink()  # file vanishes without a tombstone
+    store.delete(meta.jar_id)  # trusted forget of a now-missing jar
+    path.write_bytes(backup)  # attacker restores an old backup
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+def test_invalidate_of_missing_file_records_tombstone(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    backup = path.read_bytes()
+    path.unlink()
+    store.invalidate(meta.jar_id)
+    path.write_bytes(backup)
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+@pytest.mark.asyncio
+async def test_save_jar_malformed_id_allocates_no_lock(tmp_path):
+    # A malformed jar_id must be rejected before a per-jar lock is cached, so callers cannot leave
+    # permanent entries in self.jar_locks by POSTing random/oversized ids.
+    reg = registry_with_store(tmp_path)
+    sess, ctl = await _human_login_session(reg)
+    with pytest.raises(JarValidationError):
+        await reg.save_jar(
+            sess.session_id,
+            SaveJarRequest(label="x", jar_id="not-a-jar", token=ctl, probe=ProbeSpec()),
+            actor="human",
+        )
+    assert "not-a-jar" not in reg.jar_locks

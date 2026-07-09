@@ -303,6 +303,28 @@ async def test_malformed_jar_id_rejected_on_service_read(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_of_missing_file_tombstones_via_api(tmp_path, monkeypatch):
+    # A service-token DELETE of a jar whose file already vanished must record a terminal tombstone
+    # (not 404 at authorization), so a restored backup cannot revive the login.
+    enable_jars(tmp_path)
+    async with client() as ac:
+        meta = await _save_human_jar(ac, monkeypatch)
+        jar_id = meta["jar_id"]
+        path = tmp_path / "jars" / f"{jar_id}.json"
+        backup = path.read_bytes()
+        path.unlink()  # file vanishes without a tombstone
+
+        deleted = await ac.delete(f"/v1/jars/{jar_id}", headers=agent_headers())
+        assert deleted.status_code == 200, deleted.text
+
+        path.write_bytes(backup)  # attacker restores an old backup
+        create = await ac.post(
+            "/v1/sessions", json={"conversation_id": "c9", "jar_id": jar_id}, headers=agent_headers()
+        )
+        assert create.status_code == 409  # blocked by the terminal tombstone
+
+
+@pytest.mark.asyncio
 async def test_service_token_can_delete_jar_after_key_rotation(tmp_path, monkeypatch):
     # A jar under a rotated/removed key can no longer be decrypted, but the service-token
     # "forget" kill-switch must still work (management must not decrypt to authorize the service).

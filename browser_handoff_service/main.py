@@ -971,7 +971,7 @@ async def list_jars(auth: Annotated[AuthContext, Depends(require_service_auth)])
     ]
 
 
-def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
+def _authorize_jar_management(auth: AuthContext, jar_id: str, *, allow_missing: bool = False) -> CookieJarMeta:
     """Return the jar meta if the caller may manage it, else 403/404/503.
 
     The service token (FA) manages all jars and uses *cleartext* metadata without decrypting,
@@ -979,7 +979,11 @@ def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
     keep working across key rotation). An OIDC human may manage only their own jar, so ownership
     is checked against *authenticated* metadata: get_jar verifies the AEAD envelope, so editing
     cleartext owner_subject in a file without the key cannot transfer management rights. A
-    non-null subject is required — None == None is not ownership."""
+    non-null subject is required — None == None is not ownership.
+
+    ``allow_missing`` (service-token mutating paths only): a jar whose file has already vanished
+    still resolves to a stub so DELETE/invalidate reach the store and record a terminal tombstone —
+    otherwise a restored backup would revive the login. GET leaves it False and 404s."""
     if auth.actor_type == "agent":
         try:
             # A malformed jar_id (bad format) is a 400 here too, matching the mutating paths —
@@ -989,6 +993,10 @@ def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
             raise map_errors(exc) from exc
         try:
             return registry.get_jar_unverified(jar_id)
+        except JarNotFoundError:
+            if allow_missing:
+                return _stub_meta(jar_id)
+            raise map_errors(JarNotFoundError(jar_id)) from None
         except (JarValidationError, JarDecryptError):
             # A corrupt / id-mismatched file for a WELL-FORMED id must not block the service-token
             # kill-switch: return a stub so DELETE/invalidate still reach the store (tombstone by id).
@@ -1022,7 +1030,9 @@ def _audit_actor(auth: AuthContext) -> str:
 
 @app.delete("/v1/jars/{jar_id}", response_model=CookieJarMeta)
 async def delete_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
-    _authorize_jar_management(auth, jar_id)
+    # allow_missing: a service-token delete of an already-vanished jar must still record a terminal
+    # tombstone (block a restored backup), so resolve it to a stub rather than 404 at authorization.
+    _authorize_jar_management(auth, jar_id, allow_missing=auth.actor_type == "agent")
     try:
         return await registry.delete_jar(jar_id, actor=_audit_actor(auth))
     except Exception as exc:
@@ -1031,7 +1041,7 @@ async def delete_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_s
 
 @app.post("/v1/jars/{jar_id}/invalidate", response_model=CookieJarMeta)
 async def invalidate_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
-    _authorize_jar_management(auth, jar_id)
+    _authorize_jar_management(auth, jar_id, allow_missing=auth.actor_type == "agent")
     try:
         return await registry.invalidate_jar(jar_id, actor=_audit_actor(auth))
     except Exception as exc:
