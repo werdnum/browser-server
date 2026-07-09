@@ -233,6 +233,8 @@ class FakeBrowserWorker:
         self._confinement_active = True
         self.present_selectors: set[str] = set()
         self.redirect_map: dict[str, str] = {}
+        # URLs that simulate an in-scope network failure (DNS/TLS/connection outage) on navigate.
+        self.nav_error_urls: set[str] = set()
         self.last_blocked: dict[str, Any] | None = None
 
     async def _ucp_fetch(self, url: str) -> Any:
@@ -265,6 +267,13 @@ class FakeBrowserWorker:
             raise RuntimeError("worker is closed")
         if request.type == "navigate":
             url = str(request.args["url"])
+            if url in self.nav_error_urls:
+                # An in-scope network failure (transient outage), distinct from an off-scope block.
+                return {
+                    "error": True,
+                    "reason": "navigation failed",
+                    "url": redact_url(self.url)[0] if self.url else None,
+                }
             # A configured redirect models an expired session bouncing to login/IdP.
             target = self.redirect_map.get(url, url)
             if self._off_scope(target):
@@ -540,15 +549,22 @@ class PlaywrightBrowserWorker:
             try:
                 await page.goto(url, wait_until="domcontentloaded")
             except PlaywrightError as exc:
-                # A confined off-scope redirect is aborted pre-request, which surfaces as a
-                # navigation error; report it structurally rather than as an opaque 500.
-                if self.confine_origins and ("aborted" in str(exc).lower() or "net::err_" in str(exc).lower()):
+                msg = str(exc).lower()
+                # The route guard aborts an off-scope redirect (an expired session bouncing to an
+                # IdP/login origin) with an abort-family error; report that structurally as a block.
+                aborted = "err_aborted" in msg or "err_blocked_by_client" in msg or "err_failed" in msg
+                if self.confine_origins and aborted:
                     return {
                         "blocked": True,
                         "reason": "off-scope navigation blocked",
                         "url": redact_url(page.url)[0],
                         "target_origin": origin_of(page.url),
                     }
+                # A different net:: error to an in-scope target (DNS/TLS/connection/timeout) is an
+                # ordinary outage, NOT an off-scope block or a login-state signal — surface it as a
+                # navigation error so a probe classifies it "error", not "stale".
+                if "net::err_" in msg:
+                    return {"error": True, "reason": "navigation failed", "url": redact_url(page.url)[0]}
                 raise
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}

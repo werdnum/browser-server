@@ -1784,3 +1784,110 @@ async def test_create_cancels_when_seeded_generation_revoked_during_startup(tmp_
     monkeypatch.setattr(FakeBrowserWorker, "start", start_then_refresh)
     with pytest.raises(JarRevokedError):
         await reg_a.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+
+
+# --- regression tests for Codex review round 12 ---------------------------
+
+
+def test_tombstone_log_with_undecodable_byte_does_not_jam_killswitch(tmp_path):
+    # A corrupt/undecodable byte in the tombstone log must not make every revocation check raise;
+    # the malformed line is skipped and a fresh invalidate still lands.
+    store = make_store(tmp_path)
+    a = save_login(store)
+    store.invalidate(a.jar_id)
+    log = tmp_path / "jar-tombstones.jsonl"  # anchor/log live in the jar dir's parent
+    with open(log, "ab") as fh:
+        fh.write(b"\xff\xfe not valid utf-8 or json\n")
+    # blocked_reason/high_water still work: the earlier invalidation is still observed...
+    with pytest.raises(JarRevokedError):
+        store.load(a.jar_id)
+    # ...and a new invalidate can still be appended despite the garbage line.
+    b = save_login(store, origins=["https://api.example.com"], probe_spec_url="https://api.example.com/")
+    store.invalidate(b.jar_id)
+    with pytest.raises(JarRevokedError):
+        store.load(b.jar_id)
+
+
+@pytest.mark.asyncio
+async def test_probe_in_scope_network_failure_is_error_not_stale(tmp_path, monkeypatch):
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(
+            label="Shop",
+            token=ctl,
+            probe=ProbeSpec(url="https://shop.example.com/account", logged_in_selector="[data-testid=logout]"),
+        ),
+        actor="human",
+    )
+    # Make the (in-scope) probe target fail with a network error rather than redirect off-scope.
+    from browser_handoff_service import registry as registry_module
+
+    real_make_worker = registry_module.make_worker
+
+    def make_worker_with_outage(worker_id, **kwargs):
+        worker = cast(FakeBrowserWorker, real_make_worker(worker_id, **kwargs))
+        worker.nav_error_urls.add("https://shop.example.com/account")
+        return worker
+
+    monkeypatch.setattr(registry_module, "make_worker", make_worker_with_outage)
+    result = await reg.probe_jar(meta.jar_id)
+    assert result.result == "error"  # a transient outage, not "stale"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_probes_do_not_both_run(tmp_path):
+    import asyncio
+
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[data-testid=logout]")),
+        actor="human",
+    )
+    results = await asyncio.gather(reg.probe_jar(meta.jar_id), reg.probe_jar(meta.jar_id), return_exceptions=True)
+    conflicts = [r for r in results if isinstance(r, ConflictError)]
+    oks = [r for r in results if not isinstance(r, Exception)]
+    assert len(oks) == 1 and len(conflicts) == 1  # the second is rejected, not run in parallel
+
+
+@pytest.mark.asyncio
+async def test_create_releases_jar_lock_before_worker_start(tmp_path, monkeypatch):
+    # The jar lock must not be held across worker.start(): a same-process invalidate for the jar
+    # must be able to land while a create for it is still starting its worker.
+    import asyncio
+
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+
+    from browser_handoff_service import registry as registry_module
+
+    real_make_worker = registry_module.make_worker
+    invalidated: list[bool] = []
+
+    def make_worker_that_invalidates_on_start(worker_id, **kwargs):
+        worker = cast(FakeBrowserWorker, real_make_worker(worker_id, **kwargs))
+        orig_start = worker.start
+
+        async def start():
+            if not invalidated:
+                invalidated.append(True)
+                # If the jar lock were still held by create, this would time out; it returns,
+                # proving the lock was released before worker.start().
+                await asyncio.wait_for(reg.invalidate_jar(meta.jar_id), timeout=2)
+            await orig_start()
+
+        monkeypatch.setattr(worker, "start", start)
+        return worker
+
+    monkeypatch.setattr(registry_module, "make_worker", make_worker_that_invalidates_on_start)
+    with pytest.raises(JarRevokedError):
+        await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    assert invalidated == [True]

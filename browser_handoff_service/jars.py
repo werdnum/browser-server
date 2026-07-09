@@ -422,7 +422,11 @@ class TombstoneStore:
         anchor: dict[str, dict[str, Any]] = {}
         prev = ""
         if self._log_path.exists():
-            for line in self._log_path.read_text().splitlines():
+            # Decode tolerantly: an undecodable byte (disk corruption / an injected malformed line)
+            # must not raise before the per-line skip runs — that would make every blocked_reason/
+            # high_water/record fail and jam the kill-switch. A mangled line then just fails JSON
+            # parse or HMAC verify and is skipped, and the signed anchor still floors the high-water.
+            for line in self._log_path.read_text(errors="replace").splitlines():
                 if not line.strip():
                     continue
                 try:

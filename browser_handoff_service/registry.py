@@ -107,6 +107,10 @@ class SessionRegistry:
         # Per-jar locks serialize load against invalidate/delete so a load cannot race a
         # concurrent revocation (see create_session's post-registration recheck).
         self.jar_locks: dict[str, asyncio.Lock] = {}
+        # Jars with a probe currently running. Reserved under the jar lock together with the
+        # rate-limit check so a burst of concurrent probes for the same jar cannot all pass the
+        # "last_probe_at unset" check and replay several authenticated freshness navigations.
+        self._probes_in_flight: set[str] = set()
 
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
@@ -117,10 +121,6 @@ class SessionRegistry:
     async def create_session(
         self, req: CreateSessionRequest, *, owner_subject: str | None = None
     ) -> tuple[BrowserSession, str | None]:
-        if req.jar_id is not None:
-            # Serialize the whole jar-load create against revocation on the same jar.
-            async with self._jar_lock(req.jar_id):
-                return await self._create_session_locked(req, owner_subject=owner_subject)
         return await self._create_session_locked(req, owner_subject=owner_subject)
 
     async def _create_session_locked(
@@ -136,7 +136,13 @@ class SessionRegistry:
         confine_origins: list[str] | None = None
         loaded = None
         if req.jar_id is not None:
-            loaded = self.jar_store.load(req.jar_id)  # raises JarError on disabled/missing/revoked
+            # Take the jar lock only for the load (serialize it against a concurrent invalidate/
+            # delete), then release it before the slow worker.start() below so a same-process
+            # revocation is not queued behind browser startup. The post-start recheck re-verifies
+            # the seeded generation against the tombstone, and a racing invalidate's
+            # _close_sessions_for_jar also tears down this (already-registered) session.
+            async with self._jar_lock(req.jar_id):
+                loaded = self.jar_store.load(req.jar_id)  # raises JarError on disabled/missing/revoked
             storage_state = loaded.storage_state
             # A jar load defaults to the producing session's form factor/UA unless the create
             # call explicitly overrode it (storage_state does not carry the device profile).
@@ -850,12 +856,22 @@ class SessionRegistry:
             next_allowed = self.jar_store.probe_allowed_at(loaded.meta)
             if next_allowed is not None:
                 raise ConflictError("probe is rate-limited; try again later")
-        result, final_origin = await self._run_probe(loaded)
-        # If the jar was revoked/deleted while the probe ran, skip persisting a stale result. Pass
-        # the probed generation so record_probe can also drop the result if a refresh published a
-        # newer generation in the meantime (the old probe must not stamp the fresh login).
-        if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
-            self.jar_store.record_probe(jar_id, result, expected_generation=loaded.meta.generation)
+            # Reserve while still holding the lock so a concurrent probe for the same jar cannot
+            # also pass the rate-limit check and run a second authenticated navigation before the
+            # first records its result.
+            if jar_id in self._probes_in_flight:
+                raise ConflictError("a probe for this jar is already in progress")
+            self._probes_in_flight.add(jar_id)
+        try:
+            result, final_origin = await self._run_probe(loaded)
+            # If the jar was revoked/deleted while the probe ran, skip persisting a stale result.
+            # Pass the probed generation so record_probe can also drop the result if a refresh
+            # published a newer generation in the meantime (the old probe must not stamp the fresh
+            # login).
+            if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
+                self.jar_store.record_probe(jar_id, result, expected_generation=loaded.meta.generation)
+        finally:
+            self._probes_in_flight.discard(jar_id)
         return ProbeResult(result=result, final_origin=final_origin)
 
     async def _run_probe(self, loaded) -> tuple[ProbeResultName, str | None]:
@@ -879,6 +895,10 @@ class SessionRegistry:
                 # A signal-less / target-less probe can never prove logged-in state.
                 return "uncertain", None
             nav = await worker.command(AgentCommandRequest(type="navigate", args={"url": probe.url}))
+            if nav.get("error"):
+                # An in-scope network failure (DNS/TLS/connection outage of the saved site): not a
+                # login-state signal, so do not mark a possibly-valid jar stale.
+                return "error", None
             if nav.get("blocked"):
                 # An off-scope redirect toward login/IdP was aborted pre-request: classify stale.
                 return "stale", nav.get("target_origin")
