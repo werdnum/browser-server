@@ -814,10 +814,17 @@ class JarStore:
             # A file rolled back behind an invalidation tombstone would otherwise show as usable
             # (often with no cleartext invalidated_at); surface it as needing re-login so a
             # user/agent does not pick a jar that can never load.
-            if meta.invalidated_at is None and self._tombstones.blocked_reason(meta.jar_id, meta.generation):
-                meta.invalidated_at = meta.updated_at
-            metas.append(meta)
+            metas.append(self.annotate_revocation(meta))
         return metas
+
+    def annotate_revocation(self, meta: CookieJarMeta) -> CookieJarMeta:
+        """If a jar's generation is blocked by the tombstone high-water (e.g. an older file
+        restored behind a refresh/invalidation tombstone) but its cleartext ``invalidated_at`` is
+        still null, surface it as needing re-login. Shared by ``list_meta`` and the single-jar
+        detail read so both agree with what ``load()``/``probe()`` will actually accept."""
+        if meta.invalidated_at is None and self._tombstones.blocked_reason(meta.jar_id, meta.generation):
+            meta.invalidated_at = meta.updated_at
+        return meta
 
     def verify_owner(self, meta: CookieJarMeta, jar_id: str) -> bool:
         """True iff the jar's AEAD envelope authenticates and its *authenticated* owner_subject
@@ -879,6 +886,11 @@ class JarStore:
                 raise JarValidationError("agent saves may not supply an explicit probe url")
 
         prefix = redact_probe_url(logged_out_url_prefix) if logged_out_url_prefix else None
+        if logged_out_url_prefix and prefix is None:
+            # A non-empty prefix that fails to normalize (bad port/scheme) must be rejected, not
+            # silently dropped — that would disable the logged-out-redirect signal and let an
+            # otherwise-stale jar read "uncertain"/selector-only instead of failing the save.
+            raise JarValidationError("probe logged_out_url_prefix is malformed")
         selector = (logged_in_selector or "").strip() or None
         return JarProbeConfig(url=url or "", logged_in_selector=selector, logged_out_url_prefix=prefix)
 

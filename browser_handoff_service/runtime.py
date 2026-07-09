@@ -198,7 +198,7 @@ class BrowserRuntime(Protocol):
     async def start(self) -> None: ...
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]: ...
     async def close(self) -> None: ...
-    async def export_storage_state(self, max_bytes: int) -> dict[str, Any]: ...
+    async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]: ...
     async def selector_present(self, selector: str) -> bool: ...
     def set_confinement_active(self, enabled: bool) -> None: ...
 
@@ -241,10 +241,13 @@ class FakeBrowserWorker:
     async def start(self) -> None:
         return None
 
-    async def export_storage_state(self, max_bytes: int) -> dict[str, Any]:
-        if len(json.dumps(self.storage_state).encode("utf-8")) > max_bytes:
+    async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]:
+        state = (
+            {"cookies": self.storage_state.get("cookies", []), "origins": []} if cookies_only else self.storage_state
+        )
+        if len(json.dumps(state).encode("utf-8")) > max_bytes:
             raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
-        return self.storage_state
+        return state
 
     async def selector_present(self, selector: str) -> bool:
         return selector in self.present_selectors
@@ -643,20 +646,31 @@ class PlaywrightBrowserWorker:
             return {"closed": True, "url": None, "title": "Blank"}
         raise ValueError(f"unsupported command {request.type}")
 
-    async def export_storage_state(self, max_bytes: int) -> dict[str, Any]:
+    async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]:
         """Export the context's storage_state (cookies + localStorage + IndexedDB).
 
         ``indexed_db=True`` is required — a bare storage_state() drops IndexedDB, silently
         producing jars that reload logged-out for the growing set of sites that keep their
         auth token there.
 
-        Size is bounded twice: a **source-side** pre-check via ``navigator.storage.estimate()``
+        ``cookies_only`` short-circuits to a cookies-only export: localStorage/IndexedDB are never
+        read and no origins are returned. Cookies are not counted by ``navigator.storage.estimate()``
+        and a cookies_only jar discards client storage anyway, so a site with a large IndexedDB but
+        small cookies must still be saveable — the estimate/full-materialization bound is skipped.
+
+        Otherwise size is bounded twice: a **source-side** pre-check via ``navigator.storage.estimate()``
         rejects an origin whose client storage already exceeds the cap *before* the full state is
         materialized in the service (so a compromised in-scope page cannot force the oversized
         allocation), backed by a post-materialization check. A fully incremental export is the
         documented follow-up; the estimate covers the realistic IndexedDB-inflation DoS."""
         if self._context is None:
             raise RuntimeError("worker is closed")
+        if cookies_only:
+            state = await self._context.storage_state()  # bare: cookies + localStorage, no IndexedDB
+            state = {"cookies": state.get("cookies", []), "origins": []}  # drop localStorage too
+            if len(json.dumps(state).encode("utf-8")) > max_bytes:
+                raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
+            return state
         # Source-side bound: abort if the live page's origin already reports usage over the cap.
         if self._page is not None:
             try:

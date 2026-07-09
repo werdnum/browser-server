@@ -1480,3 +1480,107 @@ async def test_save_authorization_uses_dedicated_secret_not_service_token(tmp_pa
         actor="human",
     )
     assert meta.owner_subject == "user123"
+
+
+# --- regression tests for Codex review round 9 ----------------------------
+
+
+def test_malformed_logged_out_prefix_rejected(tmp_path):
+    # A non-empty logged_out_url_prefix that cannot normalize must fail the save, not silently
+    # disable the stale-login redirect signal.
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_logged_out_prefix="https://shop.example.com:bad/login")
+
+
+def test_detail_read_marks_rolled_back_generation(tmp_path):
+    # annotate_revocation (shared by list_meta and the single-jar detail read) surfaces a jar that
+    # was rolled back behind a tombstone as needing re-login, even though its cleartext file says
+    # invalidated_at is null.
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+    gen1 = (tmp_path / "jars" / f"{meta.jar_id}.json").read_bytes()
+    save_login(store, jar_id=meta.jar_id)  # gen 2
+    store.invalidate(meta.jar_id)  # tombstone gen 2
+    (tmp_path / "jars" / f"{meta.jar_id}.json").write_bytes(gen1)  # restore gen-1 (invalidated_at None)
+
+    raw = store.get_meta_unverified(meta.jar_id)
+    assert raw.invalidated_at is None  # cleartext still says usable
+    assert store.annotate_revocation(raw).invalidated_at is not None  # detail read surfaces it
+
+
+@pytest.mark.asyncio
+async def test_jar_loaded_session_survives_self_refresh(tmp_path):
+    # A jar-loaded session that refreshes ITS OWN jar publishes a new generation and tombstones the
+    # one it was seeded from. Its loaded generation must advance so the next command does not see
+    # the superseded generation as revoked and cancel the session.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    assert loaded.jar_generation == meta.generation
+    fake_worker(reg, loaded.worker_id).storage_state = LOGIN_STATE
+
+    refreshed = await reg.save_jar(
+        loaded.session_id,
+        SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://shop.example.com"], probe=ProbeSpec()),
+        actor="agent",
+    )
+    assert refreshed.generation == meta.generation + 1
+    # The next command must succeed (session not self-cancelled) and reflect the advanced generation.
+    result = await reg.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))
+    assert result.ok
+    assert reg.sessions[loaded.session_id].jar_generation == refreshed.generation
+
+
+@pytest.mark.asyncio
+async def test_touch_loaded_failure_does_not_break_session_create(tmp_path, monkeypatch):
+    # A failed last_loaded_at touch must not leave a live authenticated context registered while
+    # returning an error — the touch is best-effort.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg, subject="user123")
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+
+    def boom(_jar_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(reg.jar_store, "touch_loaded", boom)
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    assert loaded.jar_id == meta.jar_id
+    assert loaded.state == SessionState.AGENT_ACTIVE
+    result = await reg.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))
+    assert result.ok
+
+
+@pytest.mark.asyncio
+async def test_cookies_only_save_ignores_large_client_storage(tmp_path):
+    # A cookies_only save must not fail on a large IndexedDB/localStorage: the cap should apply to
+    # the cookies-only export, not the full client storage that is filtered out anyway.
+    reg = SessionRegistry(jar_store=make_store(tmp_path, max_bytes=4096))
+    human, ctl = await _human_login_session(reg, subject="user123")
+    big = {
+        "cookies": [
+            {"name": "sid", "value": "x", "domain": "shop.example.com", "path": "/", "expires": -1, "secure": True}
+        ],
+        "origins": [{"origin": "https://shop.example.com", "localStorage": [{"name": "big", "value": "A" * 10000}]}],
+    }
+    fake_worker(reg, human.worker_id).storage_state = big
+
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", storage="cookies_only", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    assert meta.storage_mode == "cookies_only"
+    assert meta.origin_storage_count == 0
+    loaded = reg.jar_store.load(meta.jar_id)
+    assert loaded.storage_state["origins"] == []
+    assert {c["name"] for c in loaded.storage_state["cookies"]} == {"sid"}

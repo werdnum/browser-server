@@ -250,6 +250,49 @@ async def test_jars_ui_page_lists_own_jars(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_detail_endpoint_marks_rolled_back_jar_invalidated(tmp_path, monkeypatch):
+    # GET /v1/jars/{id} must agree with list_meta: a jar rolled back behind a tombstone reads as
+    # needing re-login even though its cleartext file still says invalidated_at is null.
+    enable_jars(tmp_path)
+    async with client() as ac:
+        meta = await _save_human_jar(ac, monkeypatch)
+        jar_id = meta["jar_id"]
+        path = tmp_path / "jars" / f"{jar_id}.json"
+        snapshot = path.read_bytes()  # pre-invalidation file (invalidated_at None)
+        registry.jar_store.invalidate(jar_id)  # tombstone the generation
+        path.write_bytes(snapshot)  # restore the older file: cleartext now lies "usable"
+
+        resp = await ac.get(f"/v1/jars/{jar_id}", headers=agent_headers())
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["invalidated_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_save_button_hidden_when_save_auth_gate_enabled(tmp_path, monkeypatch):
+    # With the gate off the built-in "Save this login" button is offered; with the gate on it is
+    # hidden, because this generic UI cannot supply the FA-issued save authorization.
+    enable_jars(tmp_path)
+    async with client() as ac:
+        headers = oidc_headers(monkeypatch, "user123")
+        body = (
+            await ac.post("/v1/sessions", json={"conversation_id": "c1", "initial_owner": "human"}, headers=headers)
+        ).json()
+        page = await ac.get(f"/sessions/{body['session_id']}?token={body['control_token']}")
+        assert page.status_code == 200
+        assert 'id="save-jar"' in page.text
+
+    registry.jar_store.require_save_authorization = True
+    async with client() as ac:
+        headers = oidc_headers(monkeypatch, "user123")
+        body = (
+            await ac.post("/v1/sessions", json={"conversation_id": "c2", "initial_owner": "human"}, headers=headers)
+        ).json()
+        page = await ac.get(f"/sessions/{body['session_id']}?token={body['control_token']}")
+        assert page.status_code == 200
+        assert 'id="save-jar"' not in page.text
+
+
+@pytest.mark.asyncio
 async def test_service_token_can_delete_jar_after_key_rotation(tmp_path, monkeypatch):
     # A jar under a rotated/removed key can no longer be decrypted, but the service-token
     # "forget" kill-switch must still work (management must not decrypt to authorize the service).

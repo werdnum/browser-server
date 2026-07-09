@@ -428,7 +428,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
             <button id="handover" class="btn btn-primary">Hand over to agent</button>
           </div>
         </div>
-        {% if not session.jar_id %}
+        {% if not session.jar_id and save_jar_available %}
         <div class="field">
           <label for="save-jar-label">Save this login for the assistant</label>
           <input id="save-jar-label" type="text" placeholder="Name this login, e.g. Woolworths (me)" />
@@ -999,7 +999,10 @@ def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
 
 @app.get("/v1/jars/{jar_id}", response_model=CookieJarMeta)
 async def get_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
-    return _authorize_jar_management(auth, jar_id)
+    meta = _authorize_jar_management(auth, jar_id)
+    # Match list_meta: a jar rolled back behind a refresh/invalidation tombstone must read as
+    # needing re-login here too, so a caller cannot pick a jar that load()/probe() will reject.
+    return registry.jar_store.annotate_revocation(meta)
 
 
 def _audit_actor(auth: AuthContext) -> str:
@@ -1284,11 +1287,17 @@ async def session_detail(session_id: str, request: Request, token: str | None = 
         raise map_errors(exc) from exc
     profile = form_factor_profile(session.form_factor)
     box_width, box_height = _viewport_box(profile.width, profile.height)
+    # The built-in "Save this login" button posts only {token, label, probe}. When the save-auth
+    # gate is enabled the save requires an FA-issued authorization this generic UI cannot supply,
+    # so the server would always reject it — hide the button in that deployment (the FA renders its
+    # own save flow) rather than offer an action that can only fail.
+    save_jar_available = registry.jar_store.enabled and not registry.jar_store.require_save_authorization
     return SESSION_DETAIL_TEMPLATE.render(
         session=session,
         token=token or "",
         viewport_width=box_width,
         viewport_height=box_height,
+        save_jar_available=save_jar_available,
         base_path=_public_base_path(request),
     )
 

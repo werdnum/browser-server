@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -35,6 +36,8 @@ from .models import (
 from .runtime import BrowserRuntime, RuntimeUnavailable, StorageTooLarge, make_worker
 from .security import hash_token, mint_token, redact_url
 from .transitions import transition
+
+logger = logging.getLogger(__name__)
 
 
 class NotFoundError(KeyError):
@@ -180,7 +183,14 @@ class SessionRegistry:
                 await self._cleanup_locked(session)
                 self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked"})
                 raise JarRevokedError("jar was revoked during load")
-            self.jar_store.touch_loaded(req.jar_id or "")
+            # Best-effort: last_loaded_at is a non-critical metadata touch. If its write fails (full
+            # volume, permissions) it must NOT bubble up here — the session and its seeded worker
+            # are already registered, so propagating would leave a live authenticated context alive
+            # until expiry while returning an error to the caller.
+            try:
+                self.jar_store.touch_loaded(req.jar_id or "")
+            except Exception:
+                logger.warning("touch_loaded failed for jar %s; continuing", req.jar_id, exc_info=True)
             # Confinement gates only agent-driven navigation. If the jar is loaded straight into a
             # human-owned session (service token + initial_owner="human"), the human drives via
             # noVNC and the handoff toggle never runs, so disable confinement now — otherwise the
@@ -561,8 +571,14 @@ class SessionRegistry:
             worker = self.workers.get(session.worker_id or "")
             if worker is None or worker.closed:
                 raise ConflictError("worker is not available")
+            # A cookies_only jar (requested now, or the stored mode of the jar being refreshed)
+            # discards client storage anyway, so export cookies only — otherwise a large IndexedDB
+            # would fail the size cap before JarStore ever filters it out.
+            effective_mode = req.storage if req.storage is not None else (existing.storage_mode if existing else "all")
             try:
-                raw = await worker.export_storage_state(self.jar_store.max_bytes)
+                raw = await worker.export_storage_state(
+                    self.jar_store.max_bytes, cookies_only=effective_mode == "cookies_only"
+                )
             except StorageTooLarge as exc:
                 raise ConflictError(str(exc)) from exc
 
@@ -598,6 +614,15 @@ class SessionRegistry:
             # producing context holds the *unfiltered* login state (never tagged with jar_id).
             session.produced_jar_ids.add(meta.jar_id)
             session.produced_jar_generations[meta.jar_id] = meta.generation
+            # A jar-loaded session that just refreshed ITS OWN jar has published a new generation
+            # and tombstoned the one it was seeded from. Advance the loaded generation (and scope)
+            # to the new one, or the very next kill-switch check would see the now-superseded
+            # loaded generation as revoked and cancel the session right after a successful refresh.
+            if session.jar_id == meta.jar_id:
+                session.jar_generation = meta.generation
+                session.jar_origins = list(meta.origins)
+                session.jar_nav_allowlist = list(meta.nav_allowlist)
+                session.jar_registrable_domains = list(meta.registrable_domains)
             session.updated_at = now_utc()
             self._event(
                 session,
