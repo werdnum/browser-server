@@ -176,8 +176,14 @@ class SessionRegistry:
             return session, None
         if loaded is not None:
             # Close the load/revocation race: after registering the session, re-read the jar and
-            # tear the just-created context down if it was revoked in the window.
-            if not self.jar_store.recheck_loadable(req.jar_id or ""):
+            # tear the just-created context down if it was revoked in the window. Check the SEEDED
+            # generation (the one materialized into this context), not just "is the current file
+            # loadable": on a shared volume another pod may have refreshed the jar while
+            # worker.start() awaited, tombstoning the seeded generation while the file advanced to a
+            # newer loadable one — recheck_loadable alone would pass against that newer generation.
+            if not self.jar_store.recheck_loadable(req.jar_id or "") or self.jar_store.is_revoked_generation(
+                req.jar_id or "", loaded.meta.generation
+            ):
                 session.state = SessionState.CANCELLED
                 session.lease_owner = LeaseOwner.NONE
                 await self._cleanup_locked(session)
@@ -529,7 +535,7 @@ class SessionRegistry:
             existing: CookieJarMeta | None = None
             if req.jar_id is not None:
                 existing = self.jar_store.get_meta_verified(req.jar_id)
-                self._authorize_jar_refresh(existing, actor, owner_subject)
+                self._authorize_jar_refresh(session, existing, actor, owner_subject)
 
             if existing is not None:
                 # Refresh: re-filter against the STORED scope. An omitted `origins` must NOT
@@ -697,12 +703,19 @@ class SessionRegistry:
             raise AuthorizationError("agent save is denied unless the agent owns the lease")
         return session.owner_subject, "agent"
 
-    def _authorize_jar_refresh(self, existing: CookieJarMeta, actor: str, owner_subject: str | None) -> None:
+    def _authorize_jar_refresh(
+        self, session: BrowserSession, existing: CookieJarMeta, actor: str, owner_subject: str | None
+    ) -> None:
         """Refreshing overwrites durable credentials, so it needs ownership of the *target* jar,
-        not just control of the live source session. Service (FA) may refresh any jar; a human
-        may refresh only a jar whose owner_subject non-null-equals theirs (None == None is not
-        ownership — ownerless jars are service/FA-only)."""
+        not just control of the live source session. A human may refresh only a jar whose
+        owner_subject non-null-equals theirs (None == None is not ownership — ownerless jars are
+        service/FA-only). An agent may refresh ONLY the jar currently loaded into its own session:
+        a jarless (or differently-loaded) agent session refreshing an arbitrary jar_id is a
+        prompt-injection vector — it would filter the live browser state into the victim's jar scope
+        and tombstone their generation, emptying or replacing their saved login."""
         if actor == "agent":
+            if session.jar_id is None or session.jar_id != existing.jar_id:
+                raise AuthorizationError("an agent may only refresh the jar loaded into its own session")
             return
         if existing.owner_subject is None or owner_subject is None or existing.owner_subject != owner_subject:
             raise AuthorizationError("refresh requires ownership of the target jar")
@@ -792,12 +805,18 @@ class SessionRegistry:
         a jar-loaded session and one that produced a jar (which holds the unfiltered login state)."""
         if not self.jar_store.enabled:
             return None
-        candidates: list[tuple[str, int | None]] = list(session.produced_jar_generations.items())
-        if session.jar_id is not None:
-            candidates.append((session.jar_id, session.jar_generation))
-        for jar_id, generation in candidates:
+        for jar_id, generation in session.produced_jar_generations.items():
             if self.jar_store.is_revoked_generation(jar_id, generation):
                 return jar_id
+        if session.jar_id is not None:
+            # The loaded jar backs THIS running context. Fail closed on a tombstone of the seeded
+            # generation, and also when the current file no longer authenticates (removed, corrupted,
+            # or AAD-tampered without a tombstone): a shared-volume writer must not keep a seeded
+            # authenticated context alive past its kill-switch by mangling the file.
+            if self.jar_store.is_revoked_generation(session.jar_id, session.jar_generation):
+                return session.jar_id
+            if not self.jar_store.jar_authenticates(session.jar_id):
+                return session.jar_id
         return None
 
     async def _close_sessions_for_jar(self, jar_id: str, *, reason: str) -> None:
@@ -832,9 +851,11 @@ class SessionRegistry:
             if next_allowed is not None:
                 raise ConflictError("probe is rate-limited; try again later")
         result, final_origin = await self._run_probe(loaded)
-        # If the jar was revoked/deleted while the probe ran, skip persisting a stale result.
+        # If the jar was revoked/deleted while the probe ran, skip persisting a stale result. Pass
+        # the probed generation so record_probe can also drop the result if a refresh published a
+        # newer generation in the meantime (the old probe must not stamp the fresh login).
         if not self.jar_store.is_revoked_generation(jar_id, loaded.meta.generation):
-            self.jar_store.record_probe(jar_id, result)
+            self.jar_store.record_probe(jar_id, result, expected_generation=loaded.meta.generation)
         return ProbeResult(result=result, final_origin=final_origin)
 
     async def _run_probe(self, loaded) -> tuple[ProbeResultName, str | None]:

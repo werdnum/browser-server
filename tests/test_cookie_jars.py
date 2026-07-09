@@ -1432,9 +1432,10 @@ async def test_agent_save_from_human_session_keeps_human_owner(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_agent_refresh_does_not_reassign_owner(tmp_path):
-    # An agent's refresh authority is unconditional, so it must NOT be able to reassign another
-    # human's jar to the current session's owner just by refreshing it.
+async def test_agent_cannot_refresh_a_jar_not_loaded_into_its_session(tmp_path):
+    # An agent may refresh ONLY the jar loaded into its own session. A jarless (handed-over) agent
+    # session refreshing another user's jar_id is a prompt-injection vector — it must be rejected,
+    # not filter the live state into the victim's scope and tombstone their generation.
     reg = registry_with_store(tmp_path)
     human, ctl = await _human_login_session(reg, subject="user123")
     meta = await reg.save_jar(
@@ -1442,16 +1443,18 @@ async def test_agent_refresh_does_not_reassign_owner(tmp_path):
         SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
         actor="human",
     )
-    # A different human's session, handed over to the agent, refreshes the jar.
     other, ctl2 = await _human_login_session(reg, subject="user456")
     _, ho = await reg.handover(other.session_id, ctl2, "take over")
-    await reg.agent_claim(other.session_id, ho)
-    refreshed = await reg.save_jar(
-        other.session_id,
-        SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://shop.example.com"], probe=ProbeSpec()),
-        actor="agent",
-    )
-    assert refreshed.owner_subject == "user123"  # not reassigned to user456
+    await reg.agent_claim(other.session_id, ho)  # jarless agent session
+    with pytest.raises(AuthorizationError):
+        await reg.save_jar(
+            other.session_id,
+            SaveJarRequest(label="Shop", jar_id=meta.jar_id, origins=["https://shop.example.com"], probe=ProbeSpec()),
+            actor="agent",
+        )
+    # The victim's jar is untouched (still owned by user123, generation unchanged).
+    after = reg.jar_store.get_meta_verified(meta.jar_id)
+    assert after.owner_subject == "user123" and after.generation == meta.generation
 
 
 @pytest.mark.asyncio
@@ -1486,20 +1489,11 @@ async def test_save_authorization_uses_dedicated_secret_not_service_token(tmp_pa
 # --- regression tests for Codex review round 10 ---------------------------
 
 
-def _age_updated_at(tmp_path, jar_id, *, days):
-    # updated_at is not AAD-bound, so editing the cleartext file does not break decrypt — it lets a
-    # test simulate an old jar without waiting.
-    path = tmp_path / "jars" / f"{jar_id}.json"
-    record = json.loads(path.read_text())
-    record["meta"]["updated_at"] = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-    path.write_text(json.dumps(record))
-
-
 def test_session_cookie_jar_expires_after_ttl(tmp_path):
-    store = make_store(tmp_path)  # default 12h session TTL
+    store = make_store(tmp_path)
     meta = save_login(store)  # LOGIN_STATE's "sid" is a session cookie (expires -1)
     assert meta.contains_session_cookies is True
-    _age_updated_at(tmp_path, meta.jar_id, days=2)
+    store.session_ttl = timedelta(seconds=-1)  # any elapsed time now exceeds the window
     with pytest.raises(JarRevokedError):
         store.load(meta.jar_id)
     # And it surfaces as needing re-login in listings, not as usable.
@@ -1524,8 +1518,31 @@ def test_persistent_cookie_jar_not_expired_by_ttl(tmp_path):
     }
     meta = save_login(store, raw_storage_state=persistent)
     assert meta.contains_session_cookies is False
-    _age_updated_at(tmp_path, meta.jar_id, days=2)
-    assert store.load(meta.jar_id).meta.jar_id == meta.jar_id  # persistent-cookie jars have no TTL
+    store.session_ttl = timedelta(seconds=-1)  # even so, persistent-cookie jars carry no TTL
+    assert store.load(meta.jar_id).meta.jar_id == meta.jar_id
+
+
+def test_session_retention_fields_are_authenticated(tmp_path):
+    # contains_session_cookies and updated_at gate the TTL, so a filesystem writer must not be able
+    # to clear the flag or push the timestamp forward to dodge retention: both are AAD-bound, so a
+    # cleartext edit of either fails the load closed.
+    store = make_store(tmp_path)
+
+    a = save_login(store)
+    pa = tmp_path / "jars" / f"{a.jar_id}.json"
+    ra = json.loads(pa.read_text())
+    ra["meta"]["contains_session_cookies"] = False  # try to dodge the TTL by clearing the flag
+    pa.write_text(json.dumps(ra))
+    with pytest.raises(JarError):
+        store.load(a.jar_id)
+
+    b = save_login(store, origins=["https://api.example.com"], probe_spec_url="https://api.example.com/")
+    pb = tmp_path / "jars" / f"{b.jar_id}.json"
+    rb = json.loads(pb.read_text())
+    rb["meta"]["updated_at"] = (datetime.now(UTC) + timedelta(days=3650)).isoformat()  # push past the window
+    pb.write_text(json.dumps(rb))
+    with pytest.raises(JarError):
+        store.load(b.jar_id)
 
 
 def test_probe_spec_field_length_bounded():
@@ -1699,3 +1716,71 @@ async def test_cookies_only_save_ignores_large_client_storage(tmp_path):
     loaded = reg.jar_store.load(meta.jar_id)
     assert loaded.storage_state["origins"] == []
     assert {c["name"] for c in loaded.storage_state["cookies"]} == {"sid"}
+
+
+# --- regression tests for Codex review round 11 ---------------------------
+
+
+def test_record_probe_dropped_when_generation_advanced(tmp_path):
+    # A probe that ran against an old generation must not stamp its result / rate-limit timestamp
+    # onto a jar that was refreshed to a newer generation in the meantime.
+    store = make_store(tmp_path)
+    meta = save_login(store)  # gen 1
+    save_login(store, jar_id=meta.jar_id)  # gen 2 (current)
+    stale = store.record_probe(meta.jar_id, "fresh", expected_generation=meta.generation)  # gen 1
+    assert stale.last_probe_result is None  # not stamped onto gen 2
+    current = store.get_meta_verified(meta.jar_id)
+    store.record_probe(meta.jar_id, "fresh", expected_generation=current.generation)  # gen 2 matches
+    assert store.load(meta.jar_id).meta.last_probe_result == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_live_session_closed_when_jar_file_removed(tmp_path):
+    # A shared-volume writer that removes/corrupts the jar file WITHOUT a tombstone must not keep a
+    # seeded authenticated context alive: the per-command recheck fails closed when it no longer
+    # authenticates.
+    reg = registry_with_store(tmp_path)
+    human, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        human.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    (tmp_path / "jars" / f"{meta.jar_id}.json").unlink()  # file vanishes from the shared volume
+    with pytest.raises(SessionInactiveError):
+        await reg.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))
+
+
+@pytest.mark.asyncio
+async def test_create_cancels_when_seeded_generation_revoked_during_startup(tmp_path, monkeypatch):
+    # If another pod refreshes the jar while worker.start() is awaiting, the seeded generation is
+    # tombstoned while the file advances to a newer loadable one. The post-start recheck must catch
+    # the SEEDED generation being revoked, not just "is the current file loadable".
+    key = _key()
+    reg_a = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    producer, ctl = await _human_login_session(reg_a)
+    meta = await reg_a.save_jar(
+        producer.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )  # gen 1
+    reg_b = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+
+    orig_start = FakeBrowserWorker.start
+    done: list[bool] = []
+
+    async def start_then_refresh(self):
+        await orig_start(self)
+        if not done:  # once, and before any nested worker start re-enters here
+            done.append(True)
+            prod2, ctl2 = await _human_login_session(reg_b)
+            await reg_b.save_jar(
+                prod2.session_id,
+                SaveJarRequest(label="Shop", jar_id=meta.jar_id, token=ctl2, probe=ProbeSpec(logged_in_selector="[x]")),
+                actor="human",
+            )  # publishes gen 2, tombstones gen 1
+
+    monkeypatch.setattr(FakeBrowserWorker, "start", start_then_refresh)
+    with pytest.raises(JarRevokedError):
+        await reg_a.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))

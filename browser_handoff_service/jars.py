@@ -15,9 +15,9 @@ Security invariants enforced here:
 - Jar contents (cookie/storage names and values) are never returned or logged — only metadata.
 - Jars are encrypted with AES-256-GCM under an operator key; keyless => feature disabled, 503.
 - Security-critical cleartext metadata (origins, nav_allowlist, owner_subject, storage_mode,
-  key_id, jar_id, generation, invalidated_at, and the freshness fields last_probe_at/
-  last_probe_result) is bound as AES-GCM AAD, so tampering with the file without the key fails
-  decryption closed.
+  key_id, jar_id, generation, invalidated_at, the freshness fields last_probe_at/last_probe_result,
+  and the retention inputs contains_session_cookies/updated_at) is bound as AES-GCM AAD, so
+  tampering with the file without the key fails decryption closed.
 - Revocation is rollback-proof via a monotonic ``generation`` counter and an append-only,
   HMAC-authenticated tombstone log whose high-water mark is re-derived (verified) on each check.
 - Every ``jar_id`` is validated against ``jar_[0-9a-f]{32}`` before it touches the filesystem.
@@ -586,6 +586,11 @@ _AAD_FIELDS = (
     # real probes. record_probe re-seals so these stay authenticated.
     "last_probe_at",
     "last_probe_result",
+    # Session-cookie retention inputs: a filesystem writer must not be able to clear
+    # contains_session_cookies or push updated_at forward to keep an expired session-cookie jar
+    # loadable past its bounded TTL. Both are set at save and never patched in cleartext.
+    "contains_session_cookies",
+    "updated_at",
 )
 
 
@@ -601,6 +606,8 @@ def _aad_for(meta: CookieJarMeta, key_id: str) -> bytes:
         "invalidated_at": meta.invalidated_at.isoformat() if meta.invalidated_at else None,
         "last_probe_at": meta.last_probe_at.isoformat() if meta.last_probe_at else None,
         "last_probe_result": meta.last_probe_result,
+        "contains_session_cookies": meta.contains_session_cookies,
+        "updated_at": meta.updated_at.isoformat(),
         "key_id": key_id,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1153,6 +1160,17 @@ class JarStore:
         probe = JarProbeConfig.model_validate(payload.get("probe", {"url": ""}))
         return LoadedJar(meta=meta, storage_state=payload.get("storage_state", {}), probe=probe)
 
+    def jar_authenticates(self, jar_id: str) -> bool:
+        """Whether the current on-disk jar file still decrypts under a configured key. False for a
+        removed/corrupted/AAD-tampered file. Used by the live-session kill-switch to fail closed on
+        a shared-volume tamper that carries no tombstone (distinct from TTL, which gates fresh loads
+        only, not an already-running context)."""
+        try:
+            self.get_meta_verified(jar_id)
+            return True
+        except JarError:
+            return False
+
     def is_revoked_generation(self, jar_id: str, generation: int | None) -> bool:
         """Whether a SPECIFIC (authenticated) generation of a jar is revoked. Used for live-session
         kill-switch checks against the generation actually seeded into the running context, so a
@@ -1288,10 +1306,17 @@ class JarStore:
         next_allowed = meta.last_probe_at + PROBE_MIN_INTERVAL
         return next_allowed if next_allowed > now_utc() else None
 
-    def record_probe(self, jar_id: str, result: ProbeResultName) -> CookieJarMeta:
+    def record_probe(
+        self, jar_id: str, result: ProbeResultName, *, expected_generation: int | None = None
+    ) -> CookieJarMeta:
         with self._ops_lock():
             record = self._read_record(jar_id)
             meta = self._meta_from_record(record)
+            if expected_generation is not None and meta.generation != expected_generation:
+                # A refresh landed between the probe and this write. Do not stamp the old probe's
+                # result / rate-limit timestamp onto the new generation — that would make a
+                # just-refreshed login inherit the previous credentials' stale freshness state.
+                return meta
             try:
                 payload = self._decrypt(meta, record)
             except JarError:
