@@ -34,7 +34,12 @@ from browser_handoff_service.models import (
     SessionState,
     StorageMode,
 )
-from browser_handoff_service.registry import AuthorizationError, ConflictError, SessionRegistry
+from browser_handoff_service.registry import (
+    AuthorizationError,
+    ConflictError,
+    SessionInactiveError,
+    SessionRegistry,
+)
 from browser_handoff_service.runtime import FakeBrowserWorker
 
 
@@ -822,3 +827,97 @@ async def test_human_owned_jar_load_disables_confinement(tmp_path):
     )
     assert human_loaded.jar_id == meta.jar_id
     assert fake_worker(reg, human_loaded.worker_id)._confinement_active is False
+
+
+# --- regression tests for Codex review round 2 ----------------------------
+
+
+def test_normalize_origin_preserves_ipv6_brackets():
+    assert normalize_origin("http://[::1]:8000/x") == "http://[::1]:8000"
+    assert normalize_origin("http://[::1]:80/x") == "http://[::1]"
+    assert normalize_origin("https://[2001:db8::1]/x") == "https://[2001:db8::1]"
+
+
+def test_tombstone_survives_key_rotation_blocks_rollback(tmp_path):
+    # After BROWSER_JAR_KEY=new,old rotation, tombstone entries signed under the old key must
+    # still verify — otherwise the high-water mark is dropped and a restored pre-invalidation
+    # file loads under the still-configured old data key.
+    old = _key()
+    a = make_store(tmp_path, keys=old)
+    meta = save_login(a)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    pre_invalidation = path.read_bytes()  # gen 1, invalidated_at is None
+    a.invalidate(meta.jar_id)
+    path.write_bytes(pre_invalidation)  # rollback to before invalidation
+    rotated = make_store(tmp_path, keys=f"{_key()},{old}")  # new write key, old retained for reads
+    with pytest.raises(JarRevokedError):
+        rotated.load(meta.jar_id)
+
+
+def test_refresh_tombstones_superseded_generation(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store, origins=["https://shop.example.com", "https://api.example.com"])
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    wider = path.read_bytes()  # gen 1, two origins
+    save_login(store, jar_id=meta.jar_id, origins=["https://shop.example.com"])  # gen 2, narrowed
+    path.write_bytes(wider)  # restore the older, wider file
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)  # the superseded generation was tombstoned by the refresh
+
+
+def test_forged_line_does_not_hide_a_later_revocation(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    log = tmp_path / "jar-tombstones.jsonl"
+    with log.open("a") as handle:  # inject a forged line BEFORE the real revocation
+        handle.write(
+            json.dumps({"jar_id": "jar_" + "0" * 32, "generation": 1, "reason": "invalidated", "hmac": "bad"}) + "\n"
+        )
+    store.invalidate(meta.jar_id)  # legitimate revocation appended after the forged line
+    # The forged line is skipped (not a stop) and the real revocation chains from the verified
+    # tail, so it is still observed.
+    with pytest.raises(JarRevokedError):
+        store.load(meta.jar_id)
+
+
+def test_list_meta_skips_restored_deleted_jar(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    path = tmp_path / "jars" / f"{meta.jar_id}.json"
+    blob = path.read_bytes()
+    store.delete(meta.jar_id)
+    path.write_bytes(blob)  # a backup/rollback restores the deleted blob
+    assert meta.jar_id not in [m.jar_id for m in store.list_meta()]
+
+
+def test_jar_audit_records_the_real_actor(tmp_path):
+    store = make_store(tmp_path)
+    meta = save_login(store)
+    store.delete(meta.jar_id, actor="subject:alice")
+    audit = (tmp_path / "jar-audit.jsonl").read_text().splitlines()
+    last = json.loads(audit[-1])
+    assert last["op"] == "jar_deleted" and last["actor"] == "subject:alice"
+
+
+@pytest.mark.asyncio
+async def test_agent_command_rechecks_revocation_across_instances(tmp_path):
+    # A revoke in another process (separate registry sharing the jar dir) is not in this
+    # registry's in-memory session set; the per-command tombstone recheck closes the session.
+    key = _key()
+    reg_a = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    producer, ctl = await _human_login_session(reg_a)
+    meta = await reg_a.save_jar(
+        producer.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg_a.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    # It works before revocation.
+    assert (await reg_a.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))).ok
+
+    reg_b = SessionRegistry(jar_store=make_store(tmp_path, keys=key))
+    await reg_b.delete_jar(meta.jar_id)  # only touches reg_b's (empty) session set
+
+    with pytest.raises(SessionInactiveError):
+        await reg_a.agent_command(loaded.session_id, AgentCommandRequest(type="current_page"))
+    assert reg_a.sessions[loaded.session_id].state == SessionState.CANCELLED

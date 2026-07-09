@@ -648,11 +648,26 @@ class PlaywrightBrowserWorker:
 
         ``indexed_db=True`` is required — a bare storage_state() drops IndexedDB, silently
         producing jars that reload logged-out for the growing set of sites that keep their
-        auth token there. The result is size-checked so an attacker-inflated store is rejected
-        rather than persisted (V1 materializes then checks; a source-side incremental bound is
-        the documented follow-up)."""
+        auth token there.
+
+        Size is bounded twice: a **source-side** pre-check via ``navigator.storage.estimate()``
+        rejects an origin whose client storage already exceeds the cap *before* the full state is
+        materialized in the service (so a compromised in-scope page cannot force the oversized
+        allocation), backed by a post-materialization check. A fully incremental export is the
+        documented follow-up; the estimate covers the realistic IndexedDB-inflation DoS."""
         if self._context is None:
             raise RuntimeError("worker is closed")
+        # Source-side bound: abort if the live page's origin already reports usage over the cap.
+        if self._page is not None:
+            try:
+                usage = await self._page.evaluate(
+                    "async () => { try { return (await navigator.storage.estimate()).usage || 0; }"
+                    " catch (e) { return 0; } }"
+                )
+            except Exception:
+                usage = 0
+            if isinstance(usage, (int, float)) and usage > max_bytes:
+                raise StorageTooLarge(f"origin client storage (~{int(usage)} bytes) exceeds {max_bytes} bytes")
         try:
             state = await self._context.storage_state(indexed_db=True)
         except TypeError:

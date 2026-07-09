@@ -997,11 +997,19 @@ async def get_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_serv
     return _authorize_jar_management(auth, jar_id)
 
 
+def _audit_actor(auth: AuthContext) -> str:
+    """Attribution for the durable jar-audit trail: the OIDC subject for a human, else the
+    service actor. Keeps a user-initiated kill-switch from being logged as "service"."""
+    if auth.actor_type == "human" and auth.subject:
+        return f"subject:{auth.subject}"
+    return "service"
+
+
 @app.delete("/v1/jars/{jar_id}", response_model=CookieJarMeta)
 async def delete_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
     _authorize_jar_management(auth, jar_id)
     try:
-        return await registry.delete_jar(jar_id)
+        return await registry.delete_jar(jar_id, actor=_audit_actor(auth))
     except Exception as exc:
         raise map_errors(exc) from exc
 
@@ -1010,7 +1018,7 @@ async def delete_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_s
 async def invalidate_jar(jar_id: str, auth: Annotated[AuthContext, Depends(require_service_auth)]):
     _authorize_jar_management(auth, jar_id)
     try:
-        return await registry.invalidate_jar(jar_id)
+        return await registry.invalidate_jar(jar_id, actor=_audit_actor(auth))
     except Exception as exc:
         raise map_errors(exc) from exc
 

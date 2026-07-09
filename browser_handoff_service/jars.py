@@ -47,7 +47,11 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 def _canonical_netloc(scheme: str, host: str, port: int | None) -> str:
     """Host plus port, with the scheme's default port canonicalized away so ``https://h`` and
-    ``https://h:443`` compare equal (else confinement/probe treat them as different origins)."""
+    ``https://h:443`` compare equal (else confinement/probe treat them as different origins).
+
+    An IPv6 literal host (``::1``) is re-bracketed so the result stays a parseable origin."""
+    if ":" in host:
+        host = f"[{host}]"
     if port is not None and port != _DEFAULT_PORTS.get(scheme):
         return f"{host}:{port}"
     return host
@@ -318,16 +322,21 @@ class TombstoneStore:
     log — that HMAC chaining alone cannot detect. Absent it, protection is against single-file
     tampering and forged appends, not a whole-filesystem restore that also truncates the log."""
 
-    def __init__(self, log_path: Path, external_anchor_path: Path, hmac_key: bytes) -> None:
+    def __init__(self, log_path: Path, external_anchor_path: Path, hmac_keys: list[bytes]) -> None:
         self._log_path = log_path
         self._external_anchor_path = external_anchor_path
-        self._hmac_key = hmac_key
+        # A list so verification survives BROWSER_JAR_KEY rotation: entries signed with an older
+        # key still verify under that key's derived HMAC key. New entries sign with keys[0].
+        self._hmac_keys = hmac_keys or [hashlib.sha256(b"jar-tombstone\x00").digest()]
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_mtime: float | None = None
         self._cache_valid = False
 
-    def _chain_hmac(self, prev: str, payload: str) -> str:
-        return hmac.new(self._hmac_key, (prev + "\n" + payload).encode("utf-8"), hashlib.sha256).hexdigest()
+    def _chain_hmac(self, prev: str, payload: str, key: bytes) -> str:
+        return hmac.new(key, (prev + "\n" + payload).encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _verify(self, prev: str, payload: str, mac: str) -> bool:
+        return any(hmac.compare_digest(self._chain_hmac(prev, payload, k), mac) for k in self._hmac_keys)
 
     def _payload(self, jar_id: str, generation: int, reason: str) -> str:
         return json.dumps({"jar_id": jar_id, "generation": generation, "reason": reason}, sort_keys=True)
@@ -339,23 +348,25 @@ class TombstoneStore:
         new_reason = "deleted" if reason == "deleted" or current.get("reason") == "deleted" else "invalidated"
         anchor[jar_id] = {"generation": max(generation, current.get("generation", 0)), "reason": new_reason}
 
-    def _rebuild(self) -> dict[str, dict[str, Any]]:
+    def _replay(self) -> tuple[dict[str, dict[str, Any]], str]:
+        """Replay the log, verifying each line's HMAC against any configured key. A forged or
+        malformed line is SKIPPED (not a stop) and does not advance the chain, so a legitimate
+        revocation appended after an injected line is still observed — and its ``prev`` chains
+        from the last *verified* entry, never a forged tail. Returns (high-water anchor,
+        last-verified hmac)."""
         anchor: dict[str, dict[str, Any]] = {}
+        prev = ""
         if self._log_path.exists():
-            prev = ""
             for line in self._log_path.read_text().splitlines():
                 if not line.strip():
                     continue
                 try:
                     record = json.loads(line)
-                    expected = self._chain_hmac(
-                        prev, self._payload(record["jar_id"], record["generation"], record["reason"])
-                    )
+                    payload = self._payload(record["jar_id"], record["generation"], record["reason"])
                 except Exception:
-                    break
-                if not hmac.compare_digest(expected, str(record.get("hmac", ""))):
-                    # Tampered/forged entry: the verified prefix is authoritative; stop here.
-                    break
+                    continue
+                if not self._verify(prev, payload, str(record.get("hmac", ""))):
+                    continue  # forged/tampered line: skip without advancing the verified chain
                 prev = record["hmac"]
                 self._fold(anchor, record["jar_id"], record["generation"], record["reason"])
         # An optional trusted external anchor may only RAISE the mark (close the truncation gap).
@@ -366,7 +377,7 @@ class TombstoneStore:
                 external = {}
             for jar_id, entry in external.items() if isinstance(external, dict) else []:
                 self._fold(anchor, jar_id, int(entry.get("generation", 0)), str(entry.get("reason", "invalidated")))
-        return anchor
+        return anchor, prev
 
     def _current(self) -> dict[str, dict[str, Any]]:
         try:
@@ -374,23 +385,22 @@ class TombstoneStore:
         except OSError:
             mtime = None
         if not self._cache_valid or mtime != self._cache_mtime:
-            self._cache = self._rebuild()
+            self._cache, _ = self._replay()
             self._cache_mtime = mtime
             self._cache_valid = True
         return self._cache
 
     def record(self, jar_id: str, generation: int, reason: str) -> None:
-        prev = ""
-        if self._log_path.exists():
-            for line in reversed(self._log_path.read_text().splitlines()):
-                if line.strip():
-                    try:
-                        prev = json.loads(line)["hmac"]
-                    except Exception:
-                        prev = ""
-                    break
+        # Chain from the last *verified* entry, not the last physical line, so an injected line
+        # cannot poison the chain for subsequent real revocations.
+        _, prev = self._replay()
         payload = self._payload(jar_id, generation, reason)
-        record = {"jar_id": jar_id, "generation": generation, "reason": reason, "hmac": self._chain_hmac(prev, payload)}
+        record = {
+            "jar_id": jar_id,
+            "generation": generation,
+            "reason": reason,
+            "hmac": self._chain_hmac(prev, payload, self._hmac_keys[0]),
+        }
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._log_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
@@ -475,10 +485,14 @@ class JarStore:
         self.max_bytes = max_bytes
         self.require_save_authorization = require_save_authorization
         anchor_dir = self.jar_dir.parent
-        # The tombstone HMAC key is derived from the write key so it needs no separate secret;
-        # without the key an attacker cannot forge a consistent chain.
-        hmac_key = hashlib.sha256(b"jar-tombstone\x00" + (self._keys[0][1] if self._keys else b"")).digest()
-        self._tombstones = TombstoneStore(anchor_dir / "jar-tombstones.jsonl", anchor_dir / "jar-anchor.json", hmac_key)
+        # A tombstone HMAC key per configured data key (needs no separate secret; an attacker
+        # without any key cannot forge a consistent chain). Passing *all* keys means the log stays
+        # verifiable across a BROWSER_JAR_KEY=new,old rotation — entries signed under the old key
+        # still verify — while new entries are signed with the current write key (keys[0]).
+        hmac_keys = [hashlib.sha256(b"jar-tombstone\x00" + key).digest() for _, key in self._keys]
+        self._tombstones = TombstoneStore(
+            anchor_dir / "jar-tombstones.jsonl", anchor_dir / "jar-anchor.json", hmac_keys
+        )
         self._audit_path = anchor_dir / "jar-audit.jsonl"
 
     # -- configuration ------------------------------------------------------
@@ -564,9 +578,14 @@ class JarStore:
             return metas
         for path in sorted(self.jar_dir.glob("jar_*.json")):
             try:
-                metas.append(self._meta_from_record(json.loads(path.read_text())))
+                meta = self._meta_from_record(json.loads(path.read_text()))
             except Exception:
                 continue
+            # A restored/rolled-back jar file whose id was deleted (terminal tombstone) must not
+            # reappear in listings, even though its blob is back on disk.
+            if self._tombstones.is_deleted(meta.jar_id):
+                continue
+            metas.append(meta)
         return metas
 
     def verify_owner(self, meta: CookieJarMeta, jar_id: str) -> bool:
@@ -707,6 +726,12 @@ class JarStore:
             last_probe_result=None,
             invalidated_at=None,
         )
+        if existing is not None:
+            # Tombstone the superseded generation before publishing the new one, so restoring the
+            # prior jar_*.json after a scope-narrowing/credential-rotating refresh cannot load the
+            # older, wider file (blocked_reason(old_gen) then fails closed; the new, higher
+            # generation stays loadable).
+            self._tombstones.record(meta.jar_id, existing.generation, "invalidated")
         self._write_record(meta, filtered, probe)
         self._audit("jar_refreshed" if existing else "jar_saved", meta, saved_by)
         return meta
@@ -794,7 +819,7 @@ class JarStore:
         self._audit("jar_loaded", meta, "service")
 
     # -- revocation ---------------------------------------------------------
-    def invalidate(self, jar_id: str) -> CookieJarMeta:
+    def invalidate(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_enabled()
         validate_jar_id(jar_id)
         record = self._read_record(jar_id)
@@ -814,17 +839,17 @@ class JarStore:
             meta.updated_at = meta.invalidated_at
             record["meta"] = meta.model_dump(mode="json")
             _atomic_write(self._path(jar_id), json.dumps(record).encode("utf-8"))
-            self._audit("jar_invalidated", meta, "service")
+            self._audit("jar_invalidated", meta, actor)
             return meta
         # Now set invalidated_at and re-seal so it is bound as AAD (clearing it in cleartext then
         # fails closed).
         meta.invalidated_at = now_utc()
         meta.updated_at = meta.invalidated_at
         self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
-        self._audit("jar_invalidated", meta, "service")
+        self._audit("jar_invalidated", meta, actor)
         return meta
 
-    def delete(self, jar_id: str) -> CookieJarMeta:
+    def delete(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_enabled()
         validate_jar_id(jar_id)
         record = self._read_record(jar_id)
@@ -833,7 +858,7 @@ class JarStore:
         # never be recreated, even by a caller that still holds it.
         self._tombstones.record(jar_id, meta.generation, "deleted")
         self._path(jar_id).unlink(missing_ok=True)
-        self._audit("jar_deleted", meta, "service")
+        self._audit("jar_deleted", meta, actor)
         return meta
 
     # -- probe --------------------------------------------------------------

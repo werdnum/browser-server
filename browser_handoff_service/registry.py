@@ -427,6 +427,19 @@ class SessionRegistry:
             # credential". Default-deny it in a jar-loaded session unless the creator opted in.
             if req.type == "exec" and session.jar_id is not None and not session.allow_exec:
                 raise AuthorizationError("exec is denied in a jar-loaded session unless allow_exec was set")
+            # Per-command revocation recheck. In a multi-process deployment sharing the jar
+            # directory, a revoke in another process cannot reach into this registry's in-memory
+            # session set, so a jar-loaded (or jar-producing) session would keep serving an
+            # authenticated context until it noticed. Consulting the shared, durable tombstone
+            # before each command turns the kill-switch into a near-real-time, cross-process one.
+            revoked = self._revoked_jar_for(session)
+            if revoked is not None:
+                session.lease_owner = LeaseOwner.NONE
+                session.state = SessionState.CANCELLED
+                await self._cleanup_locked(session)
+                session.updated_at = now_utc()
+                self._event(session, "session_closed", "service", metadata={"reason": "jar_revoked", "jar_id": revoked})
+                raise SessionInactiveError("the jar backing this session was revoked")
             worker = self.workers.get(session.worker_id or "")
             if worker is None or worker.closed:
                 session.lease_owner = LeaseOwner.NONE
@@ -671,19 +684,33 @@ class SessionRegistry:
         self._require_jars_enabled()
         return self.jar_store.get_meta_unverified(jar_id)
 
-    async def invalidate_jar(self, jar_id: str) -> CookieJarMeta:
+    async def invalidate_jar(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_jars_enabled()
         async with self._jar_lock(jar_id):
-            meta = self.jar_store.invalidate(jar_id)
+            meta = self.jar_store.invalidate(jar_id, actor=actor)
             await self._close_sessions_for_jar(jar_id, reason="jar_invalidated")
             return meta
 
-    async def delete_jar(self, jar_id: str) -> CookieJarMeta:
+    async def delete_jar(self, jar_id: str, *, actor: str = "service") -> CookieJarMeta:
         self._require_jars_enabled()
         async with self._jar_lock(jar_id):
-            meta = self.jar_store.delete(jar_id)
+            meta = self.jar_store.delete(jar_id, actor=actor)
             await self._close_sessions_for_jar(jar_id, reason="jar_deleted")
             return meta
+
+    def _revoked_jar_for(self, session: BrowserSession) -> str | None:
+        """Return a jar id backing ``session`` that is now revoked (invalidated/deleted/rolled
+        back), consulting the shared durable tombstone — or None. Covers both a jar-loaded
+        session and one that produced a jar (which holds the unfiltered login state)."""
+        if not self.jar_store.enabled:
+            return None
+        candidates = list(session.produced_jar_ids)
+        if session.jar_id is not None:
+            candidates.append(session.jar_id)
+        for jar_id in candidates:
+            if not self.jar_store.recheck_loadable(jar_id):
+                return jar_id
+        return None
 
     async def _close_sessions_for_jar(self, jar_id: str, *, reason: str) -> None:
         """Revocation is the user's real-time kill-switch: close every live session seeded from
