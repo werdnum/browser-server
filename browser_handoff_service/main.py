@@ -965,17 +965,23 @@ async def list_jars(auth: Annotated[AuthContext, Depends(require_service_auth)])
 
 
 def _authorize_jar_management(auth: AuthContext, jar_id: str) -> CookieJarMeta:
-    """Return the (envelope-verified) jar meta if the caller may manage it, else 403/404/503.
+    """Return the jar meta if the caller may manage it, else 403/404/503.
 
-    Ownership is checked against *authenticated* metadata: get_jar verifies the AEAD envelope,
-    so editing cleartext owner_subject in a file without the key cannot transfer management
-    rights. A non-null subject is required — None == None is not ownership."""
+    The service token (FA) manages all jars and uses *cleartext* metadata without decrypting,
+    so a jar under a rotated/removed key stays deletable (the design requires the kill-switch to
+    keep working across key rotation). An OIDC human may manage only their own jar, so ownership
+    is checked against *authenticated* metadata: get_jar verifies the AEAD envelope, so editing
+    cleartext owner_subject in a file without the key cannot transfer management rights. A
+    non-null subject is required — None == None is not ownership."""
+    if auth.actor_type == "agent":
+        try:
+            return registry.get_jar_unverified(jar_id)
+        except Exception as exc:
+            raise map_errors(exc) from exc
     try:
         meta = registry.get_jar(jar_id)
     except Exception as exc:
         raise map_errors(exc) from exc
-    if auth.actor_type == "agent":
-        return meta
     if auth.subject is None or meta.owner_subject is None or meta.owner_subject != auth.subject:
         raise HTTPException(status_code=403, detail="not authorized to manage this jar")
     return meta

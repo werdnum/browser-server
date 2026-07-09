@@ -247,3 +247,29 @@ async def test_jars_ui_page_lists_own_jars(tmp_path, monkeypatch):
         assert "Bob Coles" not in page.text
         # Cookie values never appear in the rendered page.
         assert SECRET_COOKIE_VALUE not in page.text
+
+
+@pytest.mark.asyncio
+async def test_service_token_can_delete_jar_after_key_rotation(tmp_path, monkeypatch):
+    # A jar under a rotated/removed key can no longer be decrypted, but the service-token
+    # "forget" kill-switch must still work (management must not decrypt to authorize the service).
+    from browser_handoff_service.jars import JarStore, load_jar_keys
+
+    enable_jars(tmp_path)
+    async with client() as ac:
+        meta = await _save_human_jar(ac, monkeypatch)
+        jar_id = meta["jar_id"]
+        # Rotate to a brand-new key (old key removed), pointing at the same jar dir.
+        os.environ["BROWSER_JAR_KEY"] = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        rotated_keys = load_jar_keys()
+        os.environ.pop("BROWSER_JAR_KEY", None)
+        registry.jar_store = JarStore(tmp_path / "jars", keys=rotated_keys)
+
+        # Load fails closed (rotation), but the service token can still delete.
+        create = await ac.post(
+            "/v1/sessions", json={"conversation_id": "c9", "jar_id": jar_id}, headers=agent_headers()
+        )
+        assert create.status_code == 409
+        deleted = await ac.delete(f"/v1/jars/{jar_id}", headers=agent_headers())
+        assert deleted.status_code == 200, deleted.text
+        assert not (tmp_path / "jars" / f"{jar_id}.json").exists()

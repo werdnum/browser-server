@@ -583,3 +583,132 @@ async def test_agent_probe_url_is_derived_not_arbitrary(tmp_path):
     # The agent-supplied /logout url is ignored; the stored probe targets the derived landing page.
     loaded = reg.jar_store.load(meta.jar_id)
     assert loaded.probe.url == "https://shop.example.com/"
+
+
+# --- regression tests for review findings ---------------------------------
+
+
+def test_probe_path_rejects_five_digit_account_id(tmp_path):
+    # Design example /users/12345/account: a 5-digit account id in the path is sensitive.
+    store = make_store(tmp_path)
+    with pytest.raises(JarValidationError):
+        save_login(store, probe_spec_url="https://shop.example.com/users/12345/account")
+
+
+@pytest.mark.asyncio
+async def test_registry_refresh_omitted_origins_preserves_multi_origin_scope(tmp_path):
+    # A refresh through the registry that omits `origins` must keep the stored multi-origin
+    # scope, not collapse it to the live page's single origin.
+    reg = registry_with_store(tmp_path)
+    session, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(
+            label="Shop",
+            token=ctl,
+            origins=["https://shop.example.com", "https://api.example.com"],
+            probe=ProbeSpec(logged_in_selector="[x]"),
+        ),
+        actor="human",
+    )
+    assert set(meta.origins) == {"https://shop.example.com", "https://api.example.com"}
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    fake_worker(reg, loaded.worker_id).storage_state = LOGIN_STATE
+    refreshed = await reg.save_jar(
+        loaded.session_id,
+        SaveJarRequest(label="Shop", jar_id=meta.jar_id, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="agent",
+    )
+    assert set(refreshed.origins) == {"https://shop.example.com", "https://api.example.com"}
+
+
+def test_invalidate_and_delete_work_after_key_rotation(tmp_path):
+    # A jar under a rotated/removed key can no longer be decrypted, but must stay revocable.
+    old = _key()
+    store = make_store(tmp_path, keys=old)
+    meta = save_login(store)
+    rotated = make_store(tmp_path, keys=_key())  # brand-new key, old key removed
+    with pytest.raises(JarDecryptError):
+        rotated.load(meta.jar_id)
+    # invalidate lands the tombstone even though it cannot re-seal the blob.
+    rotated.invalidate(meta.jar_id)
+    with pytest.raises(JarRevokedError):
+        # load now fails closed on the tombstone (revoked) rather than only on decrypt.
+        rotated.load(meta.jar_id)
+    # delete still destroys the blob.
+    rotated.delete(meta.jar_id)
+    assert not (tmp_path / "jars" / f"{meta.jar_id}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_confinement_disabled_when_jar_loaded_session_handed_to_human(tmp_path):
+    from browser_handoff_service.models import HandoffRequest
+
+    reg = registry_with_store(tmp_path)
+    session, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    worker = fake_worker(reg, loaded.worker_id)
+    assert worker._confinement_active is True
+    await reg.handoff(loaded.session_id, HandoffRequest(reason="captcha"), "http://testserver")
+    # Confinement must be off once the human is about to drive (no off-scope SSO trap).
+    assert worker._confinement_active is False
+
+
+@pytest.mark.asyncio
+async def test_handover_rejected_for_jar_loaded_session(tmp_path):
+    from browser_handoff_service.models import HandoffRequest
+
+    reg = registry_with_store(tmp_path)
+    session, ctl = await _human_login_session(reg)
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(label="Shop", token=ctl, probe=ProbeSpec(logged_in_selector="[x]")),
+        actor="human",
+    )
+    loaded, _ = await reg.create_session(CreateSessionRequest(conversation_id="c2", jar_id=meta.jar_id))
+    _, url = await reg.handoff(loaded.session_id, HandoffRequest(reason="captcha"), "http://testserver")
+    handoff_token = url.split("token=", 1)[1]
+    _, control_token = await reg.claim(loaded.session_id, handoff_token)
+    # A jar-loaded session that passed to human control cannot be handed back to the agent as the
+    # same context; the agent must start a fresh, re-filtered jar-loaded session.
+    with pytest.raises(ConflictError):
+        await reg.handover(loaded.session_id, control_token, "take over")
+
+
+@pytest.mark.asyncio
+async def test_agent_selector_dropped_when_present_on_logged_out_baseline(tmp_path, monkeypatch):
+    reg = registry_with_store(tmp_path)
+    session, _ = await reg.create_session(CreateSessionRequest(conversation_id="c1"))
+    fake_worker(reg, session.worker_id).storage_state = LOGIN_STATE
+    await reg.agent_command(
+        session.session_id, AgentCommandRequest(type="navigate", args={"url": "https://shop.example.com/home"})
+    )
+
+    import browser_handoff_service.registry as reg_mod
+
+    original = reg_mod.make_worker
+
+    def make_worker_selector_present(*args, **kwargs) -> FakeBrowserWorker:
+        worker = cast(FakeBrowserWorker, original(*args, **kwargs))
+        # The selector is present even when logged out => it does not discriminate.
+        worker.present_selectors = {"[data-testid=logout]"}
+        return worker
+
+    monkeypatch.setattr(reg_mod, "make_worker", make_worker_selector_present)
+    meta = await reg.save_jar(
+        session.session_id,
+        SaveJarRequest(
+            label="Shop",
+            origins=["https://shop.example.com"],
+            probe=ProbeSpec(logged_in_selector="[data-testid=logout]"),
+        ),
+        actor="agent",
+    )
+    # A non-discriminating agent selector is dropped, so the jar reads uncertain, never fake-fresh.
+    loaded = reg.jar_store.load(meta.jar_id)
+    assert loaded.probe.logged_in_selector is None

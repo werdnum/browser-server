@@ -149,7 +149,9 @@ def registrable_domain(origin: str) -> str | None:
 # High-entropy / sensitive path segments a probe target must not carry (secrets, magic links,
 # account ids in the path — stripping query/fragment is not enough).
 _HEX_SEG_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
-_LONG_DIGIT_RE = re.compile(r"^\d{6,}$")
+# 5+ all-digit segments read as account ids (the design's own example is /users/12345/account);
+# 4-digit segments (years, etc.) are left alone.
+_LONG_DIGIT_RE = re.compile(r"^\d{5,}$")
 
 
 def _path_looks_sensitive(path: str) -> bool:
@@ -737,11 +739,20 @@ class JarStore:
         validate_jar_id(jar_id)
         record = self._read_record(jar_id)
         meta = self._meta_from_record(record)
-        payload = self._decrypt(meta, record)
-        # Tombstone at the current generation, then re-seal with invalidated_at bound as AAD.
+        # Tombstone FIRST (needs only the cleartext generation), so the kill-switch lands even
+        # for a jar whose blob can no longer be decrypted after a key rotation. The tombstone —
+        # not the cleartext invalidated_at — is the rollback-proof block on load/probe.
         self._tombstones.record(jar_id, meta.generation, "invalidated")
         meta.invalidated_at = now_utc()
         meta.updated_at = meta.invalidated_at
+        try:
+            payload = self._decrypt(meta, record)
+        except JarDecryptError:
+            # Rotated/corrupt key: cannot re-seal (invalidated_at is not AAD-bound here), but the
+            # jar is already unloadable (decrypt fails on load too) and the tombstone blocks it.
+            self._audit("jar_invalidated", meta, "service")
+            return meta
+        # Re-seal with invalidated_at bound as AAD so clearing it in cleartext fails closed.
         self._write_record(meta, payload.get("storage_state", {}), JarProbeConfig.model_validate(payload["probe"]))
         self._audit("jar_invalidated", meta, "service")
         return meta

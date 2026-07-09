@@ -34,17 +34,16 @@ class StorageTooLarge(RuntimeError):
 
 
 def origin_of(url: str | None) -> str | None:
-    """Exact web origin (scheme + host + port) of a URL, or None."""
+    """Exact web origin (scheme + host + port) of a URL, or None.
+
+    Delegates to the canonical ``jars.normalize_origin`` so navigation confinement and jar
+    scope-filtering compare origins computed by the *same* code — divergent normalizers would
+    be exactly the mismatch that opens a confinement bypass."""
     if not url:
         return None
-    from urllib.parse import urlsplit
+    from .jars import normalize_origin
 
-    parsed = urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return None
-    host = parsed.hostname.lower()
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
-    return f"{parsed.scheme}://{netloc}"
+    return normalize_origin(url)
 
 
 # In-page DOM walker. Tags interactive/labeled elements with a stable
@@ -201,6 +200,7 @@ class BrowserRuntime(Protocol):
     async def close(self) -> None: ...
     async def export_storage_state(self, max_bytes: int) -> dict[str, Any]: ...
     async def selector_present(self, selector: str) -> bool: ...
+    def set_confinement_active(self, enabled: bool) -> None: ...
 
 
 class FakeBrowserWorker:
@@ -230,6 +230,7 @@ class FakeBrowserWorker:
             storage_state if storage_state is not None else {"cookies": [], "origins": []}
         )
         self.confine_origins = [o for o in (confine_origins or [])]
+        self._confinement_active = True
         self.present_selectors: set[str] = set()
         self.redirect_map: dict[str, str] = {}
         self.last_blocked: dict[str, Any] | None = None
@@ -248,8 +249,11 @@ class FakeBrowserWorker:
     async def selector_present(self, selector: str) -> bool:
         return selector in self.present_selectors
 
+    def set_confinement_active(self, enabled: bool) -> None:
+        self._confinement_active = enabled
+
     def _off_scope(self, url: str) -> bool:
-        if not self.confine_origins:
+        if not self.confine_origins or not self._confinement_active:
             return False
         return origin_of(url) not in set(self.confine_origins)
 
@@ -360,6 +364,11 @@ class PlaywrightBrowserWorker:
         # ``confine_origins`` (exact scheme+host+port) restricts every top-level document.
         self._storage_state = storage_state
         self.confine_origins = [o for o in (confine_origins or [])]
+        # Confinement gates only *agent-driven* navigation; it is disabled while a human holds
+        # the control token (a human re-login may bounce through an off-scope IdP/SSO origin).
+        self._confinement_active = True
+        # Strong refs to fire-and-forget popup-close tasks so they are not GC'd mid-flight.
+        self._popup_tasks: set[Any] = set()
         self._playwright = None
         self._browser = None
         self._context = None
@@ -459,19 +468,32 @@ class PlaywrightBrowserWorker:
             raise RuntimeUnavailable(str(exc)) from exc
 
     async def _install_confinement(self, context: Any) -> None:
-        """Confine top-level documents in *every* frame (main, child, popup) to the jar's exact
-        origins via pre-request route interception, so an off-scope navigation/redirect is
-        aborted before any request can carry a Domain=.example.com cookie off-scope."""
+        """Confine top-level *document* requests in every frame (main, child, popup) to the jar's
+        exact origins via pre-request route interception, so an off-scope navigation/redirect is
+        aborted before the document request is sent. Only document/navigation requests are
+        blocked — page-JavaScript subresource egress (fetch/beacon/img to an off-scope host) is a
+        deliberate, documented residual deferred to the egress-proxy/CSP layer (see the design's
+        "does not do" section); it is bounded meanwhile by exec default-deny."""
         allowed = set(self.confine_origins)
 
         async def route_handler(route: Any) -> None:
+            if not self._confinement_active:
+                await route.continue_()
+                return
             request = route.request
+            off_scope = origin_of(request.url) not in allowed
             try:
                 is_document = request.resource_type == "document"
                 is_nav = request.is_navigation_request()
             except Exception:
-                is_document = is_nav = False
-            if is_document and is_nav and origin_of(request.url) not in allowed:
+                # Fail closed: if the request cannot be classified, block it when off-scope
+                # rather than let a possibly-credentialed document navigation through.
+                if off_scope:
+                    await route.abort()
+                    return
+                await route.continue_()
+                return
+            if is_document and is_nav and off_scope:
                 await route.abort()
                 return
             await route.continue_()
@@ -481,13 +503,20 @@ class PlaywrightBrowserWorker:
         def on_page(page: Any) -> None:
             # A popup / window.open / target=_blank new top-level document off-scope is closed,
             # not left as a hole around main-frame confinement.
+            if not self._confinement_active:
+                return
             try:
                 if page.url and page.url != "about:blank" and origin_of(page.url) not in allowed:
-                    asyncio.create_task(page.close())
+                    task = asyncio.ensure_future(page.close())
+                    self._popup_tasks.add(task)
+                    task.add_done_callback(self._popup_tasks.discard)
             except Exception:
                 pass
 
         context.on("page", on_page)
+
+    def set_confinement_active(self, enabled: bool) -> None:
+        self._confinement_active = enabled
 
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed or self._page is None:
@@ -497,7 +526,7 @@ class PlaywrightBrowserWorker:
             from rebrowser_playwright.async_api import Error as PlaywrightError
 
             url = str(request.args["url"])
-            if self.confine_origins and origin_of(url) not in set(self.confine_origins):
+            if self.confine_origins and self._confinement_active and origin_of(url) not in set(self.confine_origins):
                 # Fail fast before issuing a request the route guard would abort anyway.
                 return {
                     "blocked": True,
