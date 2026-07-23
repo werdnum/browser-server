@@ -172,6 +172,7 @@ class SessionRegistry:
             user_agent=profile.user_agent,
             storage_state=storage_state,
             confine_origins=confine_origins,
+            timezone_id=session.timezone_id,
         )
         self.workers[session.worker_id or ""] = worker
         try:

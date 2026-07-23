@@ -212,12 +212,14 @@ class FakeBrowserWorker:
         *,
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
+        timezone_id: str | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
         self.remote_url: str | None = None
         self.url: str | None = None
         self.title = "Blank"
+        self.timezone_id = timezone_id
         self.actions: list[dict[str, Any]] = []
         # Fixture UCP profiles keyed by well-known URL ("{origin}/.well-known/ucp"),
         # so tests can simulate a merchant advertising shopping support.
@@ -379,6 +381,7 @@ class PlaywrightBrowserWorker:
         user_agent: str | None = None,
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
+        timezone_id: str | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
@@ -386,6 +389,7 @@ class PlaywrightBrowserWorker:
         self.width = width
         self.height = height
         self.user_agent = user_agent
+        self.timezone_id = timezone_id
         # Cookie-jar load/confinement. ``storage_state`` seeds the context at creation;
         # ``confine_origins`` (exact scheme+host+port) restricts every top-level document.
         self._storage_state = storage_state
@@ -483,6 +487,11 @@ class PlaywrightBrowserWorker:
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 )
+            # Apply the resolved IANA timezone so in-page new Date()/Intl report the
+            # caller's local time. Chromium/ICU validates the id; an unknown zone
+            # surfaces as a RuntimeUnavailable when the context is created.
+            if self.timezone_id:
+                context_kwargs["timezone_id"] = self.timezone_id
             if self._storage_state is not None:
                 context_kwargs["storage_state"] = self._storage_state
             if self.confine_origins:
@@ -993,10 +1002,19 @@ def make_worker(
     user_agent: str | None = None,
     storage_state: dict[str, Any] | None = None,
     confine_origins: list[str] | None = None,
+    timezone_id: str | None = None,
 ) -> BrowserRuntime:
     runtime = os.environ.get("BROWSER_RUNTIME", "playwright").lower()
+    # Fall back to the operator-level default timezone when the caller did not request
+    # one, so sessions created without an explicit timezone still report local time.
+    resolved_timezone_id = timezone_id or os.environ.get("BROWSER_TIMEZONE") or None
     if runtime == "fake":
-        return FakeBrowserWorker(worker_id, storage_state=storage_state, confine_origins=confine_origins)
+        return FakeBrowserWorker(
+            worker_id,
+            storage_state=storage_state,
+            confine_origins=confine_origins,
+            timezone_id=resolved_timezone_id,
+        )
     return PlaywrightBrowserWorker(
         worker_id,
         headed=os.environ.get("BROWSER_HEADED") == "1",
@@ -1005,6 +1023,7 @@ def make_worker(
         user_agent=user_agent,
         storage_state=storage_state,
         confine_origins=confine_origins,
+        timezone_id=resolved_timezone_id,
     )
 
 

@@ -119,6 +119,10 @@ class CreateSessionRequest(BaseModel):
     allow_exec: bool = False
     # None => default (confine when a jar is loaded); an explicit bool always wins.
     confine_navigation: bool | None = None
+    # IANA timezone (e.g. "Australia/Sydney") applied to the browser context so in-page
+    # JS (new Date(), Intl) reports the caller's local time. None => the server default
+    # (BROWSER_TIMEZONE env, else the host/Chromium default).
+    timezone_id: str | None = None
 
     def resolved_form_factor(self) -> FormFactorName:
         if self.form_factor != "auto":
@@ -213,6 +217,8 @@ class BrowserSession(BaseModel):
     jar_origins: list[str] | None = None
     jar_nav_allowlist: list[str] | None = None
     jar_registrable_domains: list[str] | None = None
+    # IANA timezone requested for this session's browser context (None => server default).
+    timezone_id: str | None = None
     # Effective safety flags persisted at create time so later commands and policy readers
     # (which only see the session record) can tell an opt-in apart from the default.
     allow_exec: bool = False
@@ -348,6 +354,7 @@ def new_session(req: CreateSessionRequest) -> BrowserSession:
         state=SessionState.HUMAN_ACTIVE if human_first else SessionState.AGENT_ACTIVE,
         lease_owner=LeaseOwner.HUMAN if human_first else LeaseOwner.AGENT,
         worker_id=f"worker_{uuid4().hex}",
+        timezone_id=req.timezone_id,
         created_at=created,
         updated_at=created,
         idle_expires_at=created + timedelta(minutes=15),
