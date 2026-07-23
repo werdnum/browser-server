@@ -179,6 +179,18 @@ export BROWSER_HANDOFF_PUBLIC_URL="https://example.com/browser"
 
 When set, this value always wins over the request host and forwarding headers.
 
+### Timezone
+
+Each `POST /v1/sessions` request may include a `timezone_id` (an IANA name such as
+`Australia/Sydney`), which is applied to the browser context so in-page JavaScript
+(`new Date()`, `Intl.DateTimeFormat`) reports that local time. When a request omits
+`timezone_id`, the service falls back to the `BROWSER_TIMEZONE` environment variable;
+when neither is set, Chromium's host default is used.
+
+```bash
+export BROWSER_TIMEZONE="Australia/Sydney"
+```
+
 Headed Chromium with noVNC, when Xvfb/x11vnc/noVNC are installed:
 
 ```bash
