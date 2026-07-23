@@ -678,18 +678,20 @@ class PlaywrightBrowserWorker:
                 return {"error": str(exc), "url": redact_url(page.url)[0]}
             return {"result": result, "url": redact_url(page.url)[0]}
         if request.type == "wait":
-            from typing import Literal, cast
+            from typing import Literal
 
             from rebrowser_playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
             selector = request.args.get("selector")
             timeout_ms = float(request.args.get("timeout_ms", 5000))
             raw_state = str(request.args.get("state", "domcontentloaded"))
-            valid_states = ("domcontentloaded", "load", "networkidle")
-            state = cast(
-                'Literal["domcontentloaded", "load", "networkidle"]',
-                raw_state if raw_state in valid_states else "domcontentloaded",
-            )
+            state: Literal["domcontentloaded", "load", "networkidle"]
+            if raw_state == "load":
+                state = "load"
+            elif raw_state == "networkidle":
+                state = "networkidle"
+            else:
+                state = "domcontentloaded"
             try:
                 if selector:
                     await page.wait_for_selector(str(selector), timeout=timeout_ms)
