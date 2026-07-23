@@ -70,6 +70,7 @@ async def test_create_session_applies_requested_timezone_to_worker():
     assert created.status_code == 200, created.text
     session = registry.sessions[created.json()["session_id"]]
     assert session.timezone_id == "Australia/Sydney"
+    assert session.worker_id is not None
     worker = registry.workers[session.worker_id]
     assert isinstance(worker, FakeBrowserWorker)
     assert worker.timezone_id == "Australia/Sydney"
