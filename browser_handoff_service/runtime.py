@@ -481,12 +481,8 @@ class PlaywrightBrowserWorker:
                 context_kwargs["user_agent"] = self.user_agent
                 context_kwargs["is_mobile"] = True
                 context_kwargs["has_touch"] = True
-            else:
-                # Use a realistic desktop Chrome UA to avoid bot detection.
-                context_kwargs["user_agent"] = (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                )
+            # Otherwise leave the UA alone: the browser's own string always matches its
+            # real version and its Client Hints, which a pinned override drifts away from.
             # Apply the resolved IANA timezone so in-page new Date()/Intl report the
             # caller's local time. Chromium/ICU validates the id; an unknown zone
             # surfaces as a RuntimeUnavailable when the context is created.
