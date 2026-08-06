@@ -43,6 +43,10 @@ testpaths = ["tests"]
 line-length = 120
 target-version = "py312"
 src = ["browser_handoff_service", "scripts", "tests"]
+# Ruff formats Python code blocks inside Markdown. The design docs use aligned
+# trailing comments to annotate schemas, which reformatting collapses; they are
+# illustrations, not code we ship.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
