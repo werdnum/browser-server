@@ -97,6 +97,30 @@ async def test_real_chromium_jar_seed_export_and_confinement(monkeypatch):
         await worker.close()
 
 
+@pytest.mark.asyncio
+async def test_headless_desktop_session_does_not_advertise_headless_chrome(monkeypatch):
+    """A headless desktop session must not leak the "HeadlessChrome" product token, and must
+    still report the running build's own version rather than a pinned literal."""
+    monkeypatch.delenv("BROWSER_RUNTIME", raising=False)
+    worker = PlaywrightBrowserWorker("worker_real_ua", headed=False)
+    try:
+        await worker.start()
+    except RuntimeUnavailable as exc:
+        pytest.skip(f"real local Chromium unavailable on this host: {exc}")
+    try:
+        result = await worker.command(AgentCommandRequest(type="exec", args={"code": "navigator.userAgent"}))
+        user_agent = result["result"]
+        assert "HeadlessChrome" not in user_agent
+        assert "Chrome/" in user_agent
+
+        # The UA must match the browser actually running, not a frozen string.
+        assert worker._browser is not None
+        major = worker._browser.version.split(".")[0]
+        assert f"Chrome/{major}." in user_agent
+    finally:
+        await worker.close()
+
+
 def _collect_names(nodes: list[dict]) -> list[str]:
     names: list[str] = []
     for node in nodes:

@@ -23,6 +23,9 @@ from .ucp import UCPDetector
 _UCP_PROBE_TIMEOUT_S = 5.0
 _UCP_PROBE_MAX_BYTES = 256 * 1024
 
+# Product token Chromium's headless build puts in its native user agent, in place of "Chrome".
+_HEADLESS_UA_TOKEN = "HeadlessChrome"
+
 
 class RuntimeUnavailable(RuntimeError):
     pass
@@ -481,8 +484,14 @@ class PlaywrightBrowserWorker:
                 context_kwargs["user_agent"] = self.user_agent
                 context_kwargs["is_mobile"] = True
                 context_kwargs["has_touch"] = True
-            # Otherwise leave the UA alone: the browser's own string always matches its
-            # real version and its Client Hints, which a pinned override drifts away from.
+            else:
+                # Otherwise leave the UA alone: the browser's own string always matches its
+                # real version and its Client Hints, which a pinned override drifts away from.
+                # The one exception is the headless build, whose native UA advertises
+                # "HeadlessChrome" — a louder automation tell than any UA we could pin.
+                demasked = await self._demasked_headless_user_agent()
+                if demasked:
+                    context_kwargs["user_agent"] = demasked
             # Apply the resolved IANA timezone so in-page new Date()/Intl report the
             # caller's local time. Chromium/ICU validates the id; an unknown zone
             # surfaces as a RuntimeUnavailable when the context is created.
@@ -501,6 +510,29 @@ class PlaywrightBrowserWorker:
         except Exception as exc:
             await self.close()
             raise RuntimeUnavailable(str(exc)) from exc
+
+    async def _demasked_headless_user_agent(self) -> str | None:
+        """Return the browser's own UA with the ``HeadlessChrome`` token rewritten to ``Chrome``,
+        or ``None`` when there is nothing to rewrite (headed builds, or a probe that failed).
+
+        Read from the live browser rather than pinned to a literal, so the version and platform
+        always track the Chromium actually running instead of drifting as the image is rebuilt.
+        """
+        if self.headed or self._browser is None:
+            return None
+        try:
+            context = await self._browser.new_context()
+            try:
+                page = await context.new_page()
+                user_agent = await page.evaluate("navigator.userAgent")
+            finally:
+                await context.close()
+        except Exception:
+            # A UA probe is a nicety; never fail session start over it.
+            return None
+        if not isinstance(user_agent, str) or _HEADLESS_UA_TOKEN not in user_agent:
+            return None
+        return user_agent.replace(_HEADLESS_UA_TOKEN, "Chrome")
 
     async def _install_confinement(self, context: Any) -> None:
         """Confine top-level *document* requests in every frame (main, child, popup) to the jar's
