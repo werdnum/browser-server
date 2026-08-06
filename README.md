@@ -191,6 +191,19 @@ when neither is set, Chromium's host default is used.
 export BROWSER_TIMEZONE="Australia/Sydney"
 ```
 
+### OIDC clock skew
+
+Humans authenticate with an OIDC JWT (`BROWSER_HANDOFF_OIDC_JWKS_URL`,
+`BROWSER_HANDOFF_OIDC_ISSUER`, `BROWSER_HANDOFF_OIDC_AUDIENCE`); agents use the opaque
+`BROWSER_HANDOFF_SERVICE_TOKEN`. JWT `iat`/`nbf`/`exp` are checked against the local
+clock, so a token minted on a host whose clock runs marginally ahead can arrive before
+it is nominally valid. `BROWSER_HANDOFF_OIDC_LEEWAY_SECONDS` sets the tolerance
+(default `60`); set it to `0` to require exact agreement.
+
+```bash
+export BROWSER_HANDOFF_OIDC_LEEWAY_SECONDS=60
+```
+
 Headed Chromium with noVNC, when Xvfb/x11vnc/noVNC are installed:
 
 ```bash
