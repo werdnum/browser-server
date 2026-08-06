@@ -690,6 +690,13 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 OIDC_JWKS_URL_ENV = "BROWSER_HANDOFF_OIDC_JWKS_URL"
 OIDC_AUDIENCE_ENV = "BROWSER_HANDOFF_OIDC_AUDIENCE"
 OIDC_ISSUER_ENV = "BROWSER_HANDOFF_OIDC_ISSUER"
+OIDC_LEEWAY_ENV = "BROWSER_HANDOFF_OIDC_LEEWAY_SECONDS"
+
+# PyJWT validates iat/nbf/exp against the local clock with zero tolerance, so a
+# token minted microseconds ago on another host can arrive with iat > now and be
+# rejected as "not yet valid". Real deployments always allow some skew; 60s is
+# the usual default (oauth2-proxy, the Keycloak adapters).
+DEFAULT_OIDC_LEEWAY_SECONDS = 60.0
 
 _jwks_client = None
 
@@ -702,11 +709,31 @@ def _get_jwks_client() -> jwt.PyJWKClient | None:
     return _jwks_client
 
 
+def _oidc_leeway() -> float:
+    raw = os.environ.get(OIDC_LEEWAY_ENV)
+    if not raw:
+        return DEFAULT_OIDC_LEEWAY_SECONDS
+    try:
+        leeway = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %ss", OIDC_LEEWAY_ENV, raw, DEFAULT_OIDC_LEEWAY_SECONDS)
+        return DEFAULT_OIDC_LEEWAY_SECONDS
+    if leeway < 0:
+        logger.warning("%s=%r is negative; using %ss", OIDC_LEEWAY_ENV, raw, DEFAULT_OIDC_LEEWAY_SECONDS)
+        return DEFAULT_OIDC_LEEWAY_SECONDS
+    return leeway
+
+
 def require_service_auth(authorization: str | None = Header(default=None)) -> AuthContext:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing or invalid authorization header format")
 
     token = authorization[len("Bearer ") :]
+
+    # Only a JWT can plausibly be an OIDC token; the agent's opaque service token
+    # never is. Used to keep the failure reporting below aimed at the right side.
+    looks_like_jwt = token.count(".") == 2
+    oidc_error: str | None = None
 
     jwks_client = _get_jwks_client()
     if jwks_client:
@@ -720,7 +747,13 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> Au
             options: Options | None = {"verify_aud": False} if not audience else None
 
             claims = jwt.decode(
-                token, signing_key.key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=audience,
+                issuer=issuer,
+                options=options,
+                leeway=_oidc_leeway(),
             )
             subject = claims.get("sub") if isinstance(claims, dict) and isinstance(claims.get("sub"), str) else None
             return AuthContext(actor_type="human", subject=subject)
@@ -728,10 +761,10 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> Au
             # An agent authenticates with the opaque service token, which is not a
             # JWT and always fails here — that's the expected path, so keep it quiet.
             # A human comes in through the gateway with a real JWT; if that fails we
-            # fall back to the service-token check and the caller sees the misleading
-            # "invalid service token". Surface the real reason (bad audience/issuer,
-            # unreachable JWKS, expired token) at warning so it isn't swallowed.
-            if token.count(".") == 2:
+            # fall back to the service-token check. Surface the real reason (bad
+            # audience/issuer, unreachable JWKS, expired token) so it isn't swallowed.
+            if looks_like_jwt:
+                oidc_error = str(e)
                 logger.warning("OIDC token validation failed, falling back to service token: %s", e)
             else:
                 logger.debug("Non-JWT bearer token; trying service-token fallback: %s", e)
@@ -746,6 +779,11 @@ def require_service_auth(authorization: str | None = Header(default=None)) -> Au
             raise HTTPException(status_code=401, detail="invalid OIDC token and no fallback service token configured")
         raise HTTPException(status_code=503, detail="service token is not configured")
     if token != service_token:
+        # A caller who presented a JWT was never trying the service token, so
+        # "invalid service token" sends them hunting in the wrong place. Report
+        # why the OIDC check actually rejected them.
+        if oidc_error:
+            raise HTTPException(status_code=401, detail=f"invalid OIDC token: {oidc_error}")
         raise HTTPException(status_code=401, detail="invalid service token")
     return AuthContext(actor_type="agent")
 

@@ -79,7 +79,7 @@ def oidc_headers(monkeypatch, subject: str = "user123") -> dict[str, str]:
         def get_signing_key_from_jwt(self, token):
             return MockSigningKey()
 
-    def mock_decode(token, key, algorithms, audience, issuer, options):
+    def mock_decode(token, key, algorithms, audience, issuer, options, leeway):
         if token.startswith("oidc-"):
             return {"sub": token[len("oidc-") :]}
         raise main.jwt.InvalidTokenError("invalid token")
