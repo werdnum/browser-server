@@ -162,7 +162,18 @@ STEALTH_INIT_SCRIPT = """
     const originalQuery = navigator.permissions.query.bind(navigator.permissions);
     navigator.permissions.query = (parameters) => {
       if (parameters && parameters.name === 'notifications') {
-        return Promise.resolve({ state: Notification.permission, onchange: null });
+        // Spoof only the state getter on the NATIVE PermissionStatus so sites
+        // keep a real EventTarget (addEventListener/removeEventListener/onchange)
+        // instead of the plain object a hand-rolled response would give them.
+        return originalQuery(parameters).then((status) => {
+          try {
+            Object.defineProperty(status, 'state', {
+              get: () => Notification.permission,
+              configurable: true,
+            });
+          } catch (err) {}
+          return status;
+        });
       }
       return originalQuery(parameters);
     };
@@ -862,9 +873,12 @@ class PlaywrightBrowserWorker:
             return {"url": redact_url(page.url)[0], "title": title}
         if request.type == "click":
             await self._human_pause(0.05, 0.2)
-            # A randomized mousedown->mouseup hold instead of the instant
-            # synthetic click default.
-            await page.locator(str(request.args["selector"])).click(delay=random.uniform(30, 90))
+            if self.stealth:
+                # A randomized mousedown->mouseup hold instead of the instant
+                # synthetic click default.
+                await page.locator(str(request.args["selector"])).click(delay=random.uniform(30, 90))
+            else:
+                await page.locator(str(request.args["selector"])).click()
             return await self._current_page_result({"accepted": True})
         if request.type == "type_text":
             locator = page.locator(str(request.args["selector"]))
@@ -872,8 +886,12 @@ class PlaywrightBrowserWorker:
             if self.stealth and len(text) <= 200:
                 # Human-ish entry for short fields: focus with a click, then per-key
                 # delivery at a jittered cadence, rather than an instantaneous fill().
+                # fill("") first so the command keeps type_text's REPLACEMENT
+                # semantics — press_sequentially alone inserts at the caret and
+                # would splice new text into an autofilled/pre-filled value.
                 await self._human_pause(0.05, 0.2)
                 await locator.click(delay=random.uniform(30, 90))
+                await locator.fill("")
                 await locator.press_sequentially(text, delay=random.uniform(45, 110))
             else:
                 await locator.fill(text)
@@ -937,7 +955,10 @@ class PlaywrightBrowserWorker:
             return {"url": redact_url(page.url)[0], "title": await self._safe_title(page)}
         if request.type == "mouse_click":
             await self._human_pause(0.05, 0.2)
-            await page.mouse.click(float(request.args["x"]), float(request.args["y"]), delay=random.uniform(30, 90))
+            if self.stealth:
+                await page.mouse.click(float(request.args["x"]), float(request.args["y"]), delay=random.uniform(30, 90))
+            else:
+                await page.mouse.click(float(request.args["x"]), float(request.args["y"]))
             return await self._current_page_result({"accepted": True})
         if request.type == "mouse_move":
             await page.mouse.move(float(request.args["x"]), float(request.args["y"]))
