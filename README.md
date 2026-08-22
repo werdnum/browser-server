@@ -191,6 +191,24 @@ when neither is set, Chromium's host default is used.
 export BROWSER_TIMEZONE="Australia/Sydney"
 ```
 
+### Stealth hardening
+
+Chromium sessions are hardened against bot detection by default: Playwright's
+`--enable-automation` default flag is dropped, the context matches its viewport to
+`window.screen`, and an init script in every frame patches the cheap JS-level tells
+(`navigator.webdriver`, a missing `window.chrome` object, empty plugins/mimeTypes
+arrays, the permissions-query inconsistency, software-renderer WebGL strings). Input
+is humanized too — short text is delivered per-key at a jittered cadence instead of an
+instantaneous `fill()`, and clicks carry a randomized mousedown→mouseup hold. Set
+`BROWSER_STEALTH=0` for a plain vanilla browser (e.g. when debugging a site that
+misbehaves under the patched surfaces), and `BROWSER_LOCALE` to override the default
+`en-US` locale.
+
+This is not a full anti-fingerprinting layer: CDP-protocol and TLS-level detection are
+out of scope. Headed mode (`BROWSER_HEADED=1`) remains meaningfully harder to detect
+than headless, and a hard Cloudflare-class interstitial may still need to be solved
+manually through the noVNC handoff view.
+
 ### OIDC clock skew
 
 Humans authenticate with an OIDC JWT (`BROWSER_HANDOFF_OIDC_JWKS_URL`,
