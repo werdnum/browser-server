@@ -49,8 +49,8 @@ def stealth_enabled() -> bool:
 STEALTH_INIT_SCRIPT = """
 (() => {
   const win = window;
-  if (win.__stealthPatched) return;
-  win.__stealthPatched = true;
+  // Init scripts run exactly once per document, so no re-entry guard is needed —
+  // and a page-visible marker would itself be a trivial automation tell.
 
   try {
     Object.defineProperty(Navigator.prototype, 'webdriver', {
@@ -100,56 +100,64 @@ STEALTH_INIT_SCRIPT = """
     });
   }
 
-  const pluginFactories = [
-    ['PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-    ['Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-    ['Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-    ['Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-    ['WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer'],
-  ];
-  const mimeObj = Object.create(MimeType.prototype);
-  Object.defineProperties(mimeObj, {
-    type: { value: 'application/pdf' },
-    suffixes: { value: 'pdf' },
-    description: { value: 'Portable Document Format' },
-  });
-  const plugins = pluginFactories.map(([name, description, filename]) => {
-    const plugin = Object.create(Plugin.prototype);
-    Object.defineProperties(plugin, {
-      name: { value: name },
-      description: { value: description },
-      filename: { value: filename },
+  // Synthesize the plugin collections ONLY when the build provides none (headless
+  // Chromium reports empty arrays; headed builds have real ones we must not clobber
+  // with incomplete stand-ins).
+  if (navigator.plugins.length === 0 && navigator.mimeTypes.length === 0) {
+    const pluginFactories = [
+      ['PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+      ['Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+      ['Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+      ['Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+      ['WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer'],
+    ];
+    const mimeObj = Object.create(MimeType.prototype);
+    Object.defineProperties(mimeObj, {
+      type: { value: 'application/pdf' },
+      suffixes: { value: 'pdf' },
+      description: { value: 'Portable Document Format' },
+      enabledPlugin: { value: null, writable: true },
+    });
+    const plugins = pluginFactories.map(([name, description, filename]) => {
+      const plugin = Object.create(Plugin.prototype);
+      Object.defineProperties(plugin, {
+        name: { value: name },
+        description: { value: description },
+        filename: { value: filename },
+        length: { value: 1 },
+        0: { value: mimeObj },
+        item: { value: (index) => (index === 0 ? mimeObj : null) },
+        namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
+      });
+      return plugin;
+    });
+    mimeObj.enabledPlugin = plugins[0];
+    const pluginArray = Object.create(PluginArray.prototype);
+    plugins.forEach((plugin, index) => {
+      Object.defineProperty(pluginArray, index, { value: plugin, enumerable: true });
+    });
+    Object.defineProperties(pluginArray, {
+      length: { value: plugins.length },
+      item: { value: (index) => plugins[index] || null },
+      namedItem: { value: (name) => plugins.find((plugin) => plugin.name === name) || null },
+      refresh: { value: () => {} },
+      [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
+    });
+    const mimeTypeArray = Object.create(MimeTypeArray.prototype);
+    Object.defineProperties(mimeTypeArray, {
       length: { value: 1 },
-      0: { value: mimeObj },
+      0: { value: mimeObj, enumerable: true },
       item: { value: (index) => (index === 0 ? mimeObj : null) },
       namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
+      [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
     });
-    return plugin;
-  });
-  const pluginArray = Object.create(PluginArray.prototype);
-  plugins.forEach((plugin, index) => {
-    Object.defineProperty(pluginArray, index, { value: plugin, enumerable: true });
-  });
-  Object.defineProperties(pluginArray, {
-    length: { value: plugins.length },
-    item: { value: (index) => plugins[index] || null },
-    namedItem: { value: (name) => plugins.find((plugin) => plugin.name === name) || null },
-    refresh: { value: () => {} },
-    [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
-  });
-  const mimeTypeArray = Object.create(MimeTypeArray.prototype);
-  Object.defineProperties(mimeTypeArray, {
-    length: { value: 1 },
-    0: { value: mimeObj, enumerable: true },
-    application__pdf_: { get: () => mimeObj },
-    item: { value: (index) => (index === 0 ? mimeObj : null) },
-    namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
-    [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
-  });
-  try {
-    Object.defineProperty(Navigator.prototype, 'plugins', { get: () => pluginArray, configurable: true });
-    Object.defineProperty(Navigator.prototype, 'mimeTypes', { get: () => mimeTypeArray, configurable: true });
-  } catch (err) {}
+    // Native named access ("application/pdf") is a non-enumerable own property.
+    Object.defineProperty(mimeTypeArray, 'application/pdf', { get: () => mimeObj });
+    try {
+      Object.defineProperty(Navigator.prototype, 'plugins', { get: () => pluginArray, configurable: true });
+      Object.defineProperty(Navigator.prototype, 'mimeTypes', { get: () => mimeTypeArray, configurable: true });
+    } catch (err) {}
+  }
 
   try {
     Object.defineProperty(Navigator.prototype, 'languages', {
