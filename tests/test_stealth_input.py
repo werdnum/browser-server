@@ -56,10 +56,11 @@ async def test_short_text_like_input_uses_humanized_typing_and_replaces_value():
     locator = _RecordingLocator(text_like=True)
     await _run_type_text(worker, locator, "hello")
     kinds = [call[0] for call in locator.calls]
-    assert kinds == ["click", "fill", "press_sequentially"], kinds
+    # No synthetic click: onclick handlers must not fire during type_text.
+    assert kinds == ["fill", "press_sequentially"], kinds
     # fill("") clears before keystrokes so typing REPLACES rather than splices.
-    assert locator.calls[1][1] == ("",)
-    assert locator.calls[2][1] == ("hello",)
+    assert locator.calls[0][1] == ("",)
+    assert locator.calls[1][1] == ("hello",)
 
 
 @pytest.mark.asyncio
@@ -96,6 +97,30 @@ async def test_unresolvable_target_falls_back_to_fill(monkeypatch):
     locator = _GoneLocator()
     await _run_type_text(worker, locator, "hi")
     assert locator.fill_args == ("hi",)
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_block_when_off_scope_abort_lands_during_settle():
+    # An off-scope redirect scheduled just after DOMContentLoaded is aborted by the
+    # route guard DURING the settling pause, after goto() already returned: the flag
+    # must be rechecked or the navigation would report success on retained stale DOM.
+    worker = PlaywrightBrowserWorker("worker_nav_late_block", confine_origins=["https://shop.example.com"])
+
+    class _LateAbortPage:
+        url = "https://idp.example.com/login"
+
+        async def goto(self, _url, **_kwargs):
+            worker._nav_off_scope_block = "https://idp.example.com"
+
+        async def title(self) -> str:
+            return "Sign in"
+
+    worker._page = _LateAbortPage()  # ty: ignore[invalid-assignment]
+    result = await worker.command(
+        AgentCommandRequest(type="navigate", args={"url": "https://shop.example.com/account"})
+    )
+    assert result["blocked"] is True
+    assert result["target_origin"] == "https://idp.example.com"
 
 
 class _ClickRecordingLocator:

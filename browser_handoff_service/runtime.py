@@ -882,6 +882,19 @@ class PlaywrightBrowserWorker:
                     return {"error": True, "reason": "navigation failed", "url": redact_url(page.url)[0]}
                 raise
             await self._human_pause(0.2, 0.7)
+            # The settling interval is exactly when a confined page schedules an
+            # off-scope redirect (expired sessions bounce after DOMContentLoaded):
+            # goto() may have returned first, the route guard aborts the redirect
+            # during the pause and sets the flag, and no exception crosses the try
+            # above. Recheck, or a freshness probe could read retained authenticated-
+            # looking DOM and classify a stale jar as fresh.
+            if self.confine_origins and self._nav_off_scope_block is not None:
+                return {
+                    "blocked": True,
+                    "reason": "off-scope navigation blocked",
+                    "url": redact_url(page.url)[0],
+                    "target_origin": self._nav_off_scope_block,
+                }
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
         if request.type == "click":
@@ -914,13 +927,15 @@ class PlaywrightBrowserWorker:
                     # Target not resolvable to an element: fall back to fill().
                     human_typing = False
             if human_typing:
-                # Human-ish entry for short fields: focus with a click, then per-key
-                # delivery at a jittered cadence, rather than an instantaneous fill().
-                # fill("") first so the command keeps type_text's REPLACEMENT
-                # semantics — press_sequentially alone inserts at the caret and
-                # would splice new text into an autofilled/pre-filled value.
+                # Human-ish entry for short fields: per-key delivery at a jittered
+                # cadence rather than an instantaneous fill(). No synthetic mouse
+                # click — fill("")/press_sequentially focus the control themselves,
+                # and a click could fire onclick handlers (submit, navigate, clear
+                # dependent fields) that plain typing never did. fill("") first so
+                # the command keeps type_text's REPLACEMENT semantics —
+                # press_sequentially alone inserts at the caret and would splice
+                # new text into an autofilled/pre-filled value.
                 await self._human_pause(0.05, 0.2)
-                await locator.click(delay=random.uniform(30, 90))
                 await locator.fill("")
                 await locator.press_sequentially(text, delay=random.uniform(45, 110))
             else:
