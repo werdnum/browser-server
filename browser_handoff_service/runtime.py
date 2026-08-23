@@ -4,12 +4,13 @@ import asyncio
 import base64
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import httpx
 
@@ -25,6 +26,200 @@ _UCP_PROBE_MAX_BYTES = 256 * 1024
 
 # Product token Chromium's headless build puts in its native user agent, in place of "Chrome".
 _HEADLESS_UA_TOKEN = "HeadlessChrome"
+
+
+def stealth_enabled() -> bool:
+    """Whether the JS-fingerprint patches and humanized input timing are active.
+
+    On by default; ``BROWSER_STEALTH=0`` (or false/no/off) turns them off, e.g. to
+    debug a site that misbehaves under the patched ``navigator``/``window.chrome``
+    surfaces. The launch-flag hardening below is gated on this too so an operator
+    can get a plain vanilla Playwright browser back with one variable.
+    """
+    return os.environ.get("BROWSER_STEALTH", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Runs in every frame (main + iframes) before page scripts on each navigation.
+# Covers the cheap JS-level tells: ``navigator.webdriver``, the missing
+# ``window.chrome`` object of a non-Chrome UA, the empty plugins/mimeTypes arrays
+# of headless builds, the permissions-query inconsistency, and the SwiftShader /
+# llvmpipe software-renderer strings headless WebGL reports. Deliberately NOT a
+# full anti-fingerprinting layer: CDP-protocol and TLS-level detection are out of
+# scope here (rebrowser-patches handles part of the former).
+STEALTH_INIT_SCRIPT = """
+(() => {
+  const win = window;
+  // Init scripts run exactly once per document, so no re-entry guard is needed —
+  // and a page-visible marker would itself be a trivial automation tell.
+
+  try {
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
+      get: () => false,
+      set: () => {},
+      configurable: true,
+    });
+  } catch (err) {}
+
+  if (!win.chrome) {
+    win.chrome = {};
+  }
+  if (!win.chrome.runtime) {
+    win.chrome.runtime = {
+      connect: () => ({ onMessage: { addListener: () => {} }, postMessage: () => {} }),
+      sendMessage: () => {},
+      id: undefined,
+    };
+  }
+  if (!win.chrome.app) {
+    win.chrome.app = {
+      isInstalled: false,
+      InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+      RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+      getDetails: () => null,
+      installState: () => 'not_installed',
+    };
+  }
+  if (!win.chrome.csi) {
+    win.chrome.csi = () => ({ startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 0 });
+  }
+  if (!win.chrome.loadTimes) {
+    win.chrome.loadTimes = () => ({
+      commitLoadTime: Date.now() / 1000,
+      connectionInfo: 'h2',
+      finishDocumentLoadTime: Date.now() / 1000,
+      finishLoadTime: Date.now() / 1000,
+      firstPaintAfterLoadTime: 0,
+      firstPaintTime: Date.now() / 1000,
+      navigationType: 'Other',
+      npnNegotiatedProtocol: 'h2',
+      requestTime: Date.now() / 1000,
+      startLoadTime: Date.now() / 1000,
+      wasAlternateProtocolAvailable: false,
+      wasFetchedViaSpdy: true,
+      wasNpnNegotiated: true,
+    });
+  }
+
+  try {
+    Object.defineProperty(Navigator.prototype, 'languages', {
+      get: () => [navigator.language || 'en-US'],
+      configurable: true,
+    });
+  } catch (err) {}
+
+  if (win.Notification && navigator.permissions && navigator.permissions.query) {
+    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (parameters) => {
+      if (parameters && parameters.name === 'notifications') {
+        // Spoof only the state getter on the NATIVE PermissionStatus so sites
+        // keep a real EventTarget (addEventListener/removeEventListener/onchange)
+        // instead of the plain object a hand-rolled response would give them.
+        return originalQuery(parameters).then((status) => {
+          try {
+            Object.defineProperty(status, 'state', {
+              get: () => Notification.permission,
+              configurable: true,
+            });
+          } catch (err) {}
+          return status;
+        });
+      }
+      return originalQuery(parameters);
+    };
+  }
+
+  const maskWebGL = (proto) => {
+    if (!proto || !proto.getParameter) return;
+    const originalGetParameter = proto.getParameter;
+    proto.getParameter = function (parameter) {
+      const value = originalGetParameter.apply(this, arguments);
+      // Only rewrite when the build reports a software renderer; a real GPU
+      // string is consistent with everything else about the machine.
+      if (parameter === 37445 || parameter === 37446) {
+        if (/swiftshader|software|llvmpipe|basic render/i.test(String(value))) {
+          return parameter === 37445 ? 'Intel Inc.' : 'Intel Iris OpenGL Engine';
+        }
+      }
+      return value;
+    };
+  };
+  maskWebGL(win.WebGLRenderingContext && win.WebGLRenderingContext.prototype);
+  maskWebGL(win.WebGL2RenderingContext && win.WebGL2RenderingContext.prototype);
+
+  if (navigator.hardwareConcurrency === 1) {
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
+  }
+})();
+"""
+
+# Desktop-only companion to STEALTH_INIT_SCRIPT: synthesizes the classic desktop
+# Chromium PDF plugin collections when the build reports both empty (headless).
+# NEVER applied to mobile-profile sessions — Chrome on Android exposes no such
+# plugin array, and pairing it with a mobile UA + touch is an internally
+# impossible fingerprint.
+PLUGIN_SYNTHESIS_SCRIPT = """
+(() => {
+  if (!(navigator.plugins.length === 0 && navigator.mimeTypes.length === 0)) return;
+  const pluginFactories = [
+    ['PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer'],
+  ];
+  const mimeObj = Object.create(MimeType.prototype);
+  Object.defineProperties(mimeObj, {
+    type: { value: 'application/pdf' },
+    suffixes: { value: 'pdf' },
+    description: { value: 'Portable Document Format' },
+    enabledPlugin: { value: null, writable: true },
+  });
+  const plugins = pluginFactories.map(([name, description, filename]) => {
+    const plugin = Object.create(Plugin.prototype);
+    Object.defineProperties(plugin, {
+      name: { value: name },
+      description: { value: description },
+      filename: { value: filename },
+      length: { value: 1 },
+      0: { value: mimeObj },
+      item: { value: (index) => (index === 0 ? mimeObj : null) },
+      namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
+    });
+    return plugin;
+  });
+  mimeObj.enabledPlugin = plugins[0];
+  const pluginArray = Object.create(PluginArray.prototype);
+  plugins.forEach((plugin, index) => {
+    Object.defineProperty(pluginArray, index, { value: plugin, enumerable: true });
+  });
+  // Native PluginArray also supports named lookup (navigator.plugins['PDF Viewer']),
+  // as a non-enumerable own property per name.
+  plugins.forEach((plugin) => {
+    Object.defineProperty(pluginArray, plugin.name, { get: () => plugin });
+  });
+  Object.defineProperties(pluginArray, {
+    length: { value: plugins.length },
+    item: { value: (index) => plugins[index] || null },
+    namedItem: { value: (name) => plugins.find((plugin) => plugin.name === name) || null },
+    refresh: { value: () => {} },
+    [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
+  });
+  const mimeTypeArray = Object.create(MimeTypeArray.prototype);
+  Object.defineProperties(mimeTypeArray, {
+    length: { value: 1 },
+    0: { value: mimeObj, enumerable: true },
+    item: { value: (index) => (index === 0 ? mimeObj : null) },
+    namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
+    [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
+  });
+  // Native named access ("application/pdf") is a non-enumerable own property.
+  Object.defineProperty(mimeTypeArray, 'application/pdf', { get: () => mimeObj });
+  try {
+    Object.defineProperty(Navigator.prototype, 'plugins', { get: () => pluginArray, configurable: true });
+    Object.defineProperty(Navigator.prototype, 'mimeTypes', { get: () => mimeTypeArray, configurable: true });
+  } catch (err) {}
+})();
+"""
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -389,6 +584,7 @@ class PlaywrightBrowserWorker:
         self.worker_id = worker_id
         self.closed = False
         self.headed = headed
+        self.stealth = stealth_enabled()
         self.width = width
         self.height = height
         self.user_agent = user_agent
@@ -458,6 +654,13 @@ class PlaywrightBrowserWorker:
                 "--disable-infobars",
                 "--enable-features=NetworkService,NetworkServiceInProcess",
             ]
+            # Stealth-only launch hardening: drop Playwright's --enable-automation
+            # default (it drives the "controlled by automated software" infobar and a
+            # distinct automation code path) and skip the first-run/default-browser
+            # prompts a fresh profile would otherwise show.
+            ignore_default_args = ["--enable-automation"] if self.stealth else None
+            if self.stealth:
+                args += ["--no-first-run", "--no-default-browser-check"]
             if self.headed:
                 self._display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
                 self.remote_url = self._display.start()
@@ -473,12 +676,18 @@ class PlaywrightBrowserWorker:
             self._browser = await self._playwright.chromium.launch(
                 headless=not self.headed,
                 args=args,
+                ignore_default_args=ignore_default_args,
                 env=env,
                 executable_path=executable_path,
             )
             # Explicit context (rather than browser.new_page) so a jar's storage_state can be
             # seeded at creation and exported back out with context.storage_state(indexed_db=True).
             context_kwargs: dict[str, Any] = {"viewport": {"width": self.width, "height": self.height}}
+            if self.stealth and not self.headed:
+                # Match screen to the viewport so window.screen doesn't disagree with
+                # window.innerWidth/Height, a mismatch headless defaults can produce.
+                context_kwargs["screen"] = {"width": self.width, "height": self.height}
+                context_kwargs["device_scale_factor"] = 1
             if self.user_agent:
                 # A mobile UA plus touch makes sites render their mobile layout.
                 context_kwargs["user_agent"] = self.user_agent
@@ -497,6 +706,10 @@ class PlaywrightBrowserWorker:
             # surfaces as a RuntimeUnavailable when the context is created.
             if self.timezone_id:
                 context_kwargs["timezone_id"] = self.timezone_id
+            if self.stealth:
+                # A stable, common locale beats Chromium's possibly-empty default
+                # (headless builds can report navigator.languages == []).
+                context_kwargs["locale"] = os.environ.get("BROWSER_LOCALE", "").strip() or "en-US"
             if self._storage_state is not None:
                 context_kwargs["storage_state"] = self._storage_state
             if self.confine_origins:
@@ -504,6 +717,15 @@ class PlaywrightBrowserWorker:
                 # sees, routing around the guard — so block SWs in confined contexts.
                 context_kwargs["service_workers"] = "block"
             self._context = await self._browser.new_context(**context_kwargs)
+            if self.stealth:
+                script = STEALTH_INIT_SCRIPT
+                if not self.user_agent:
+                    # A pinned user agent means the mobile profile (UA + touch):
+                    # Chrome on Android has no desktop plugin array, so injecting
+                    # one would be an internally impossible fingerprint. Desktop
+                    # sessions (including plain headless) get the synthesis.
+                    script += "\n" + PLUGIN_SYNTHESIS_SCRIPT
+                await self._context.add_init_script(script)
             if self.confine_origins:
                 await self._install_confinement(self._context)
             self._page = await self._context.new_page()
@@ -630,6 +852,12 @@ class PlaywrightBrowserWorker:
                 }
             raise
 
+    async def _human_pause(self, low: float, high: float) -> None:
+        """Small randomized settle delay so consecutive agent commands don't land
+        with machine-regular (or zero) spacing. No-op when stealth is off."""
+        if self.stealth:
+            await asyncio.sleep(random.uniform(low, high))
+
     async def _dispatch_command(self, request: AgentCommandRequest, page: Any) -> dict[str, Any]:
         if request.type == "navigate":
             from rebrowser_playwright.async_api import Error as PlaywrightError
@@ -665,13 +893,69 @@ class PlaywrightBrowserWorker:
                 if "net::err_" in msg:
                     return {"error": True, "reason": "navigation failed", "url": redact_url(page.url)[0]}
                 raise
+            await self._human_pause(0.2, 0.7)
+            # The settling interval is exactly when a confined page schedules an
+            # off-scope redirect (expired sessions bounce after DOMContentLoaded):
+            # goto() may have returned first, the route guard aborts the redirect
+            # during the pause and sets the flag, and no exception crosses the try
+            # above. Recheck, or a freshness probe could read retained authenticated-
+            # looking DOM and classify a stale jar as fresh.
+            if self.confine_origins and self._nav_off_scope_block is not None:
+                return {
+                    "blocked": True,
+                    "reason": "off-scope navigation blocked",
+                    "url": redact_url(page.url)[0],
+                    "target_origin": self._nav_off_scope_block,
+                }
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
         if request.type == "click":
-            await page.locator(str(request.args["selector"])).click()
+            await self._human_pause(0.05, 0.2)
+            if self.stealth:
+                # A randomized mousedown->mouseup hold instead of the instant
+                # synthetic click default.
+                await page.locator(str(request.args["selector"])).click(delay=random.uniform(30, 90))
+            else:
+                await page.locator(str(request.args["selector"])).click()
             return await self._current_page_result({"accepted": True})
         if request.type == "type_text":
-            await page.locator(str(request.args["selector"])).fill(str(request.args["text"]))
+            locator = page.locator(str(request.args["selector"]))
+            text = str(request.args["text"])
+            human_typing = self.stealth and len(text) <= 200
+            if human_typing:
+                # Only text-like controls take per-key delivery. Specialized
+                # inputs (date/color/range/checkbox...) have value semantics that
+                # literal keystrokes either mangle or miss entirely — keep fill()'s
+                # serialized-value behavior for those.
+                try:
+                    human_typing = bool(
+                        await locator.evaluate(
+                            "(el) => el.isContentEditable || el.tagName === 'TEXTAREA' || "
+                            "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password', 'email', 'number']"
+                            ".includes((el.type || '').toLowerCase()))"
+                        )
+                    )
+                except Exception:
+                    # Target not resolvable to an element: fall back to fill().
+                    human_typing = False
+            if human_typing:
+                # Human-ish entry for short fields: per-key delivery with a FRESH
+                # jittered pause before every keystroke — a single constant delay
+                # passed to press_sequentially would produce a perfectly regular
+                # machine cadence. No synthetic mouse click — fill("")/
+                # press_sequentially focus the control themselves, and a click
+                # could fire onclick handlers (submit, navigate, clear dependent
+                # fields) that plain typing never did. fill("") first so the
+                # command keeps type_text's REPLACEMENT semantics —
+                # press_sequentially alone inserts at the caret and would splice
+                # new text into an autofilled/pre-filled value.
+                await self._human_pause(0.05, 0.2)
+                await locator.fill("")
+                for char in text:
+                    await locator.press_sequentially(char)
+                    await asyncio.sleep(random.uniform(0.045, 0.11))
+            else:
+                await locator.fill(text)
             return await self._current_page_result({"accepted": True})
         if request.type == "select":
             await page.locator(str(request.args["selector"])).select_option(str(request.args["value"]))
@@ -731,7 +1015,11 @@ class PlaywrightBrowserWorker:
         if request.type == "current_page":
             return {"url": redact_url(page.url)[0], "title": await self._safe_title(page)}
         if request.type == "mouse_click":
-            await page.mouse.click(float(request.args["x"]), float(request.args["y"]))
+            await self._human_pause(0.05, 0.2)
+            if self.stealth:
+                await page.mouse.click(float(request.args["x"]), float(request.args["y"]), delay=random.uniform(30, 90))
+            else:
+                await page.mouse.click(float(request.args["x"]), float(request.args["y"]))
             return await self._current_page_result({"accepted": True})
         if request.type == "mouse_move":
             await page.mouse.move(float(request.args["x"]), float(request.args["y"]))
@@ -746,7 +1034,15 @@ class PlaywrightBrowserWorker:
             await page.mouse.wheel(float(request.args["delta_x"]), float(request.args["delta_y"]))
             return {"accepted": True, "url": redact_url(page.url)[0]}
         if request.type == "keyboard_type":
-            await page.keyboard.type(str(request.args["text"]))
+            text = str(request.args["text"])
+            if self.stealth and len(text) <= 200:
+                # Fresh jittered pause per key; a single constant delay would be a
+                # perfectly regular (machine-recognizable) cadence.
+                for char in text:
+                    await page.keyboard.type(char)
+                    await asyncio.sleep(random.uniform(0.045, 0.11))
+            else:
+                await page.keyboard.type(text)
             return {"accepted": True, "url": redact_url(page.url)[0]}
         if request.type == "keyboard_press":
             keys = request.args.get("keys", request.args.get("key"))
@@ -814,7 +1110,9 @@ class PlaywrightBrowserWorker:
             state = await self._context.storage_state()
         if len(json.dumps(state).encode("utf-8")) > max_bytes:
             raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
-        return dict(state)
+        # storage_state()'s return is typed as a Playwright-specific mapping across versions;
+        # normalize to the plain dict the jar layer expects (copy, not alias).
+        return cast(dict[str, Any], dict(state))
 
     async def selector_present(self, selector: str) -> bool | None:
         """True/False if the selector is present/absent; None if it could not be evaluated (a

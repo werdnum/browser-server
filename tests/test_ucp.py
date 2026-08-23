@@ -307,7 +307,7 @@ async def test_click_off_scope_abort_returns_controlled_block():
     worker = PlaywrightBrowserWorker("worker_click_block", confine_origins=["https://shop.example.com"])
 
     class _StubLocator:
-        async def click(self):
+        async def click(self, delay=None):
             # Simulate the route guard aborting an off-scope nav triggered by this click.
             worker._nav_off_scope_block = "https://idp.example.com"
             raise PlaywrightError("net::ERR_ABORTED")
@@ -333,7 +333,7 @@ async def test_click_error_without_off_scope_flag_reraises():
     worker = PlaywrightBrowserWorker("worker_click_err", confine_origins=["https://shop.example.com"])
 
     class _StubLocator:
-        async def click(self):
+        async def click(self, delay=None):
             raise PlaywrightError("locator resolve timeout")
 
     class _StubPage:
