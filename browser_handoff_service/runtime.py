@@ -136,6 +136,11 @@ STEALTH_INIT_SCRIPT = """
     plugins.forEach((plugin, index) => {
       Object.defineProperty(pluginArray, index, { value: plugin, enumerable: true });
     });
+    // Native PluginArray also supports named lookup (navigator.plugins['PDF Viewer']),
+    // as a non-enumerable own property per name.
+    plugins.forEach((plugin) => {
+      Object.defineProperty(pluginArray, plugin.name, { get: () => plugin });
+    });
     Object.defineProperties(pluginArray, {
       length: { value: plugins.length },
       item: { value: (index) => plugins[index] || null },
@@ -891,7 +896,24 @@ class PlaywrightBrowserWorker:
         if request.type == "type_text":
             locator = page.locator(str(request.args["selector"]))
             text = str(request.args["text"])
-            if self.stealth and len(text) <= 200:
+            human_typing = self.stealth and len(text) <= 200
+            if human_typing:
+                # Only text-like controls take per-key delivery. Specialized
+                # inputs (date/color/range/checkbox...) have value semantics that
+                # literal keystrokes either mangle or miss entirely — keep fill()'s
+                # serialized-value behavior for those.
+                try:
+                    human_typing = bool(
+                        await locator.evaluate(
+                            "(el) => el.isContentEditable || el.tagName === 'TEXTAREA' || "
+                            "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password', 'email', 'number']"
+                            ".includes((el.type || '').toLowerCase()))"
+                        )
+                    )
+                except Exception:
+                    # Target not resolvable to an element: fall back to fill().
+                    human_typing = False
+            if human_typing:
                 # Human-ish entry for short fields: focus with a click, then per-key
                 # delivery at a jittered cadence, rather than an instantaneous fill().
                 # fill("") first so the command keeps type_text's REPLACEMENT
