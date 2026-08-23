@@ -100,70 +100,6 @@ STEALTH_INIT_SCRIPT = """
     });
   }
 
-  // Synthesize the plugin collections ONLY when the build provides none (headless
-  // Chromium reports empty arrays; headed builds have real ones we must not clobber
-  // with incomplete stand-ins).
-  if (navigator.plugins.length === 0 && navigator.mimeTypes.length === 0) {
-    const pluginFactories = [
-      ['PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-      ['Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-      ['Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-      ['Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
-      ['WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer'],
-    ];
-    const mimeObj = Object.create(MimeType.prototype);
-    Object.defineProperties(mimeObj, {
-      type: { value: 'application/pdf' },
-      suffixes: { value: 'pdf' },
-      description: { value: 'Portable Document Format' },
-      enabledPlugin: { value: null, writable: true },
-    });
-    const plugins = pluginFactories.map(([name, description, filename]) => {
-      const plugin = Object.create(Plugin.prototype);
-      Object.defineProperties(plugin, {
-        name: { value: name },
-        description: { value: description },
-        filename: { value: filename },
-        length: { value: 1 },
-        0: { value: mimeObj },
-        item: { value: (index) => (index === 0 ? mimeObj : null) },
-        namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
-      });
-      return plugin;
-    });
-    mimeObj.enabledPlugin = plugins[0];
-    const pluginArray = Object.create(PluginArray.prototype);
-    plugins.forEach((plugin, index) => {
-      Object.defineProperty(pluginArray, index, { value: plugin, enumerable: true });
-    });
-    // Native PluginArray also supports named lookup (navigator.plugins['PDF Viewer']),
-    // as a non-enumerable own property per name.
-    plugins.forEach((plugin) => {
-      Object.defineProperty(pluginArray, plugin.name, { get: () => plugin });
-    });
-    Object.defineProperties(pluginArray, {
-      length: { value: plugins.length },
-      item: { value: (index) => plugins[index] || null },
-      namedItem: { value: (name) => plugins.find((plugin) => plugin.name === name) || null },
-      refresh: { value: () => {} },
-      [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
-    });
-    const mimeTypeArray = Object.create(MimeTypeArray.prototype);
-    Object.defineProperties(mimeTypeArray, {
-      length: { value: 1 },
-      0: { value: mimeObj, enumerable: true },
-      item: { value: (index) => (index === 0 ? mimeObj : null) },
-      namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
-      [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
-    });
-    // Native named access ("application/pdf") is a non-enumerable own property.
-    Object.defineProperty(mimeTypeArray, 'application/pdf', { get: () => mimeObj });
-    try {
-      Object.defineProperty(Navigator.prototype, 'plugins', { get: () => pluginArray, configurable: true });
-      Object.defineProperty(Navigator.prototype, 'mimeTypes', { get: () => mimeTypeArray, configurable: true });
-    } catch (err) {}
-  }
-
   try {
     Object.defineProperty(Navigator.prototype, 'languages', {
       get: () => [navigator.language || 'en-US'],
@@ -213,6 +149,75 @@ STEALTH_INIT_SCRIPT = """
   if (navigator.hardwareConcurrency === 1) {
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
   }
+})();
+"""
+
+# Desktop-only companion to STEALTH_INIT_SCRIPT: synthesizes the classic desktop
+# Chromium PDF plugin collections when the build reports both empty (headless).
+# NEVER applied to mobile-profile sessions — Chrome on Android exposes no such
+# plugin array, and pairing it with a mobile UA + touch is an internally
+# impossible fingerprint.
+PLUGIN_SYNTHESIS_SCRIPT = """
+(() => {
+  if (!(navigator.plugins.length === 0 && navigator.mimeTypes.length === 0)) return;
+  const pluginFactories = [
+    ['PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'],
+    ['WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer'],
+  ];
+  const mimeObj = Object.create(MimeType.prototype);
+  Object.defineProperties(mimeObj, {
+    type: { value: 'application/pdf' },
+    suffixes: { value: 'pdf' },
+    description: { value: 'Portable Document Format' },
+    enabledPlugin: { value: null, writable: true },
+  });
+  const plugins = pluginFactories.map(([name, description, filename]) => {
+    const plugin = Object.create(Plugin.prototype);
+    Object.defineProperties(plugin, {
+      name: { value: name },
+      description: { value: description },
+      filename: { value: filename },
+      length: { value: 1 },
+      0: { value: mimeObj },
+      item: { value: (index) => (index === 0 ? mimeObj : null) },
+      namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
+    });
+    return plugin;
+  });
+  mimeObj.enabledPlugin = plugins[0];
+  const pluginArray = Object.create(PluginArray.prototype);
+  plugins.forEach((plugin, index) => {
+    Object.defineProperty(pluginArray, index, { value: plugin, enumerable: true });
+  });
+  // Native PluginArray also supports named lookup (navigator.plugins['PDF Viewer']),
+  // as a non-enumerable own property per name.
+  plugins.forEach((plugin) => {
+    Object.defineProperty(pluginArray, plugin.name, { get: () => plugin });
+  });
+  Object.defineProperties(pluginArray, {
+    length: { value: plugins.length },
+    item: { value: (index) => plugins[index] || null },
+    namedItem: { value: (name) => plugins.find((plugin) => plugin.name === name) || null },
+    refresh: { value: () => {} },
+    [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
+  });
+  const mimeTypeArray = Object.create(MimeTypeArray.prototype);
+  Object.defineProperties(mimeTypeArray, {
+    length: { value: 1 },
+    0: { value: mimeObj, enumerable: true },
+    item: { value: (index) => (index === 0 ? mimeObj : null) },
+    namedItem: { value: (kind) => (kind === mimeObj.type ? mimeObj : null) },
+    [Symbol.iterator]: { value: Array.prototype[Symbol.iterator] },
+  });
+  // Native named access ("application/pdf") is a non-enumerable own property.
+  Object.defineProperty(mimeTypeArray, 'application/pdf', { get: () => mimeObj });
+  try {
+    Object.defineProperty(Navigator.prototype, 'plugins', { get: () => pluginArray, configurable: true });
+    Object.defineProperty(Navigator.prototype, 'mimeTypes', { get: () => mimeTypeArray, configurable: true });
+  } catch (err) {}
 })();
 """
 
@@ -713,7 +718,14 @@ class PlaywrightBrowserWorker:
                 context_kwargs["service_workers"] = "block"
             self._context = await self._browser.new_context(**context_kwargs)
             if self.stealth:
-                await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+                script = STEALTH_INIT_SCRIPT
+                if not self.user_agent:
+                    # A pinned user agent means the mobile profile (UA + touch):
+                    # Chrome on Android has no desktop plugin array, so injecting
+                    # one would be an internally impossible fingerprint. Desktop
+                    # sessions (including plain headless) get the synthesis.
+                    script += "\n" + PLUGIN_SYNTHESIS_SCRIPT
+                await self._context.add_init_script(script)
             if self.confine_origins:
                 await self._install_confinement(self._context)
             self._page = await self._context.new_page()
@@ -927,17 +939,21 @@ class PlaywrightBrowserWorker:
                     # Target not resolvable to an element: fall back to fill().
                     human_typing = False
             if human_typing:
-                # Human-ish entry for short fields: per-key delivery at a jittered
-                # cadence rather than an instantaneous fill(). No synthetic mouse
-                # click — fill("")/press_sequentially focus the control themselves,
-                # and a click could fire onclick handlers (submit, navigate, clear
-                # dependent fields) that plain typing never did. fill("") first so
-                # the command keeps type_text's REPLACEMENT semantics —
+                # Human-ish entry for short fields: per-key delivery with a FRESH
+                # jittered pause before every keystroke — a single constant delay
+                # passed to press_sequentially would produce a perfectly regular
+                # machine cadence. No synthetic mouse click — fill("")/
+                # press_sequentially focus the control themselves, and a click
+                # could fire onclick handlers (submit, navigate, clear dependent
+                # fields) that plain typing never did. fill("") first so the
+                # command keeps type_text's REPLACEMENT semantics —
                 # press_sequentially alone inserts at the caret and would splice
                 # new text into an autofilled/pre-filled value.
                 await self._human_pause(0.05, 0.2)
                 await locator.fill("")
-                await locator.press_sequentially(text, delay=random.uniform(45, 110))
+                for char in text:
+                    await locator.press_sequentially(char)
+                    await asyncio.sleep(random.uniform(0.045, 0.11))
             else:
                 await locator.fill(text)
             return await self._current_page_result({"accepted": True})
@@ -1020,7 +1036,11 @@ class PlaywrightBrowserWorker:
         if request.type == "keyboard_type":
             text = str(request.args["text"])
             if self.stealth and len(text) <= 200:
-                await page.keyboard.type(text, delay=random.uniform(45, 110))
+                # Fresh jittered pause per key; a single constant delay would be a
+                # perfectly regular (machine-recognizable) cadence.
+                for char in text:
+                    await page.keyboard.type(char)
+                    await asyncio.sleep(random.uniform(0.045, 0.11))
             else:
                 await page.keyboard.type(text)
             return {"accepted": True, "url": redact_url(page.url)[0]}

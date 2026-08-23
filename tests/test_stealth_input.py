@@ -57,10 +57,13 @@ async def test_short_text_like_input_uses_humanized_typing_and_replaces_value():
     await _run_type_text(worker, locator, "hello")
     kinds = [call[0] for call in locator.calls]
     # No synthetic click: onclick handlers must not fire during type_text.
-    assert kinds == ["fill", "press_sequentially"], kinds
+    # Keystrokes are delivered ONE PER CALL so each gap gets a fresh jitter
+    # (a single press_sequentially(text, delay=...) is perfectly regular).
+    assert kinds == ["fill", *["press_sequentially"] * 5], kinds
     # fill("") clears before keystrokes so typing REPLACES rather than splices.
     assert locator.calls[0][1] == ("",)
-    assert locator.calls[1][1] == ("hello",)
+    assert [call[1][0] for call in locator.calls[1:]] == list("hello")
+    assert all("delay" not in call[2] for call in locator.calls[1:])
 
 
 @pytest.mark.asyncio
