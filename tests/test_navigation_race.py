@@ -1,6 +1,6 @@
 """The navigate command must survive a page that redirects out from under it.
 
-These run the *real* ``PlaywrightBrowserWorker`` (rebrowser + Chromium) against a
+These run the *real* ``PlaywrightBrowserWorker`` (patchright + Chromium) against a
 *real* locally served page, so the navigate -> ``page.title()`` path actually
 meets a navigating page instead of a stub. The production failure was an opaque
 HTTP 500 whose detail read ``Page.title: Execution context was destroyed, most
@@ -94,7 +94,7 @@ async def test_safe_title_recovers_when_a_navigation_destroys_the_context():
     ``title()`` raises the genuine context-destroyed error, exactly as a
     mid-navigation read does, then the real ``page.title()`` is retried.
     """
-    from rebrowser_playwright.async_api import Error as PlaywrightError
+    from patchright.async_api import Error as PlaywrightError
 
     worker = await _started_worker()
     try:
