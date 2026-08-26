@@ -10,6 +10,7 @@ import socket
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Protocol, cast
 
 import httpx
@@ -45,7 +46,7 @@ def stealth_enabled() -> bool:
 # of headless builds, the permissions-query inconsistency, and the SwiftShader /
 # llvmpipe software-renderer strings headless WebGL reports. Deliberately NOT a
 # full anti-fingerprinting layer: CDP-protocol and TLS-level detection are out of
-# scope here (rebrowser-patches handles part of the former).
+# scope here (patchright handles part of the former).
 STEALTH_INIT_SCRIPT = """
 (() => {
   const win = window;
@@ -644,7 +645,7 @@ class PlaywrightBrowserWorker:
 
     async def start(self) -> None:
         try:
-            from rebrowser_playwright.async_api import async_playwright
+            from patchright.async_api import async_playwright
 
             env: dict[str, str | float | bool] = dict(os.environ)
             args = [
@@ -670,7 +671,7 @@ class PlaywrightBrowserWorker:
                 args.append("--window-position=0,0")
             self._playwright = await async_playwright().start()
             # BROWSER_CHROMIUM_PATH lets an operator pin a system/sidecar Chrome instead
-            # of the revision bundled with rebrowser-playwright (also how tests can drive a
+            # of the revision bundled with patchright (also how tests can drive a
             # real browser when only a different revision is installed). Unset => bundled.
             executable_path = os.environ.get("BROWSER_CHROMIUM_PATH") or None
             self._browser = await self._playwright.chromium.launch(
@@ -834,7 +835,7 @@ class PlaywrightBrowserWorker:
         if self.closed or self._page is None:
             raise RuntimeError("worker is closed")
         page = self._page
-        from rebrowser_playwright.async_api import Error as PlaywrightError
+        from patchright.async_api import Error as PlaywrightError
 
         # Any action (a click on a link, Enter submitting a form, go_back to an off-scope page) can
         # trigger a navigation the route guard aborts. Reset the flag and, if such an abort escapes
@@ -860,7 +861,7 @@ class PlaywrightBrowserWorker:
 
     async def _dispatch_command(self, request: AgentCommandRequest, page: Any) -> dict[str, Any]:
         if request.type == "navigate":
-            from rebrowser_playwright.async_api import Error as PlaywrightError
+            from patchright.async_api import Error as PlaywrightError
 
             url = str(request.args["url"])
             if self.confine_origins and self._confinement_active and origin_of(url) not in set(self.confine_origins):
@@ -982,7 +983,7 @@ class PlaywrightBrowserWorker:
                 html = await page.content()
             return {"url": redact_url(page.url)[0], "html": html, "selector": selector}
         if request.type == "exec":
-            from rebrowser_playwright.async_api import Error as PlaywrightError
+            from patchright.async_api import Error as PlaywrightError
 
             try:
                 result = await page.evaluate(_wrap_exec_code(str(request.args.get("code", ""))))
@@ -992,7 +993,7 @@ class PlaywrightBrowserWorker:
         if request.type == "wait":
             from typing import Literal
 
-            from rebrowser_playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
             selector = request.args.get("selector")
             timeout_ms = float(request.args.get("timeout_ms", 5000))
@@ -1129,7 +1130,7 @@ class PlaywrightBrowserWorker:
     async def _current_page_result(self, result: dict[str, Any]) -> dict[str, Any]:
         if self._page is None:
             raise RuntimeError("worker is closed")
-        from rebrowser_playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
         try:
             await self._page.wait_for_load_state("domcontentloaded", timeout=1000)
@@ -1151,7 +1152,7 @@ class PlaywrightBrowserWorker:
         settle and retry a bounded number of times, falling back to an empty
         title rather than failing the whole command.
         """
-        from rebrowser_playwright.async_api import Error as PlaywrightError
+        from patchright.async_api import Error as PlaywrightError
 
         attempts = 3
         for attempt in range(attempts):
@@ -1285,7 +1286,19 @@ class LocalNovncDisplay:
             self._tmpdir = None
 
 
+@lru_cache(maxsize=1)
 def remote_display_status() -> RemoteDisplayStatus:
+    """Probe the host for the headed-session noVNC stack.
+
+    The result is memoized: when the binaries are absent, the fallback scan in
+    ``_find_file`` walks ``/usr/share``, ``/usr/local/share``, ``/opt`` and
+    ``/workspace`` with a 2s timeout per root, which can cost several seconds on
+    hosts with large filesystem trees (e.g. a macOS VM's /opt). That made every
+    ``/health`` request take multiple seconds and broke clients polling health
+    with short timeouts. Binary availability cannot change within a running
+    process, so one probe per process is sufficient; tests that need to re-detect
+    can call ``remote_display_status.cache_clear()`` first.
+    """
     novnc_path = shutil.which("novnc_proxy") or _find_file("novnc_proxy")
     novnc_web_path = _find_novnc_web_path(novnc_path)
     websockify_path = shutil.which("websockify")

@@ -139,7 +139,7 @@ close it.
 python -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e '.[test]'
-.venv/bin/python -m playwright install chromium
+.venv/bin/python -m patchright install chromium
 npm install
 npx playwright install chromium
 ```

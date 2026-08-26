@@ -302,7 +302,7 @@ async def test_click_off_scope_abort_returns_controlled_block():
     # A click that triggers an off-scope document navigation is aborted by the route guard, which
     # surfaces as a PlaywrightError out of a non-navigate command. The command wrapper must turn
     # that into a controlled {"blocked": True} (not re-raise a 500) when the off-scope flag is set.
-    from rebrowser_playwright.async_api import Error as PlaywrightError
+    from patchright.async_api import Error as PlaywrightError
 
     worker = PlaywrightBrowserWorker("worker_click_block", confine_origins=["https://shop.example.com"])
 
@@ -328,7 +328,7 @@ async def test_click_off_scope_abort_returns_controlled_block():
 async def test_click_error_without_off_scope_flag_reraises():
     # A PlaywrightError from a click with NO off-scope abort (an ordinary broken selector/timeout)
     # must NOT be masked as a block — it re-raises so a genuine failure is not swallowed.
-    from rebrowser_playwright.async_api import Error as PlaywrightError
+    from patchright.async_api import Error as PlaywrightError
 
     worker = PlaywrightBrowserWorker("worker_click_err", confine_origins=["https://shop.example.com"])
 

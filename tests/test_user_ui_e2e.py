@@ -7,8 +7,8 @@ from time import monotonic
 import httpx
 import pytest
 import uvicorn
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import expect, sync_playwright
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import expect, sync_playwright
 
 TEST_SERVICE_TOKEN = "test-service-token"
 
@@ -85,12 +85,14 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_service(url: str, *, timeout_seconds: float = 5) -> None:
+def _wait_for_service(url: str, *, timeout_seconds: float = 30) -> None:
+    # Generous per-request timeout: the first /health pays the one-time cost of
+    # the noVNC binary scan (remote_display_status is memoized after that).
     deadline = monotonic() + timeout_seconds
     pause = threading.Event()
     while monotonic() < deadline:
         try:
-            if httpx.get(url, timeout=2).status_code == 200:
+            if httpx.get(url, timeout=10).status_code == 200:
                 return
         except httpx.HTTPError:
             pause.wait(0.1)
