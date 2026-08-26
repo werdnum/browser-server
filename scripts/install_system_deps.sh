@@ -53,5 +53,5 @@ fi
 
 echo "System browser/noVNC dependencies installed."
 echo "Next, as the workspace user, run:"
-echo "  .venv/bin/python -m playwright install chromium"
+echo "  .venv/bin/python -m patchright install chromium"
 echo "  npx playwright install chromium"
