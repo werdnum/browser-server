@@ -10,6 +10,7 @@ import socket
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Protocol, cast
 
 import httpx
@@ -1285,7 +1286,19 @@ class LocalNovncDisplay:
             self._tmpdir = None
 
 
+@lru_cache(maxsize=1)
 def remote_display_status() -> RemoteDisplayStatus:
+    """Probe the host for the headed-session noVNC stack.
+
+    The result is memoized: when the binaries are absent, the fallback scan in
+    ``_find_file`` walks ``/usr/share``, ``/usr/local/share``, ``/opt`` and
+    ``/workspace`` with a 2s timeout per root, which can cost several seconds on
+    hosts with large filesystem trees (e.g. a macOS VM's /opt). That made every
+    ``/health`` request take multiple seconds and broke clients polling health
+    with short timeouts. Binary availability cannot change within a running
+    process, so one probe per process is sufficient; tests that need to re-detect
+    can call ``remote_display_status.cache_clear()`` first.
+    """
     novnc_path = shutil.which("novnc_proxy") or _find_file("novnc_proxy")
     novnc_web_path = _find_novnc_web_path(novnc_path)
     websockify_path = shutil.which("websockify")
