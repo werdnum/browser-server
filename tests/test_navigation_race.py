@@ -134,3 +134,121 @@ async def test_safe_title_recovers_when_a_navigation_destroys_the_context():
     assert title == "Landing"
     assert flaky.title_calls == 2  # failed once, retried once
     assert flaky.load_state_waits == 1  # waited for the new document before retrying
+
+
+@pytest.mark.asyncio
+async def test_snapshot_recovers_when_a_navigation_destroys_the_context():
+    """The snapshot command must survive the same navigation race as _safe_title.
+
+    Production failure: browser_open/snapshot 500'd with ``Page.evaluate:
+    Execution context was destroyed, most likely because of a navigation.``
+    because the snapshot handler called ``page.evaluate(_SNAPSHOT_JS)`` with no
+    recovery, unlike the title-read path. Fault injection on a real page: the
+    first ``evaluate`` fails like a mid-navigation read, then the real walker
+    runs.
+    """
+    from patchright.async_api import Error as PlaywrightError
+
+    worker = await _started_worker()
+    try:
+        await worker.command(
+            AgentCommandRequest(
+                type="navigate",
+                args={"url": "data:text/html,<title>Landing</title><h1>x</h1>"},
+            )
+        )
+        assert worker._page is not None
+        real_page = worker._page
+
+        class _ContextDestroyedOnce:
+            """Real page, but the first evaluate() fails like a navigation race."""
+
+            def __init__(self) -> None:
+                self.evaluate_calls = 0
+                self.load_state_waits = 0
+
+            @property
+            def url(self) -> str:  # delegated to real page
+                return real_page.url
+
+            async def evaluate(self, *args, **kwargs):
+                self.evaluate_calls += 1
+                if self.evaluate_calls == 1:
+                    raise PlaywrightError(
+                        "Page.evaluate: Execution context was destroyed, most likely because of a navigation."
+                    )
+                return await real_page.evaluate(*args, **kwargs)
+
+            async def title(self) -> str:  # pragma: no cover - delegated
+                return await real_page.title()
+
+            async def wait_for_load_state(self, *args, **kwargs):
+                self.load_state_waits += 1
+                return await real_page.wait_for_load_state(*args, **kwargs)
+
+        flaky = _ContextDestroyedOnce()
+        result = await worker._dispatch_command(AgentCommandRequest(type="snapshot", args={}), flaky)
+    finally:
+        await worker.close()
+
+    assert flaky.evaluate_calls == 2  # failed once, retried once
+    assert flaky.load_state_waits == 1  # waited for the new document before retrying
+    assert result["elements"] >= 1  # the retried walker saw the real DOM
+    assert "partial" not in result
+
+
+@pytest.mark.asyncio
+async def test_snapshot_returns_degraded_result_when_context_keeps_getting_destroyed():
+    """If the context is destroyed on every attempt, snapshot must not 500.
+
+    The agent-command endpoint converts an uncaught exception into an opaque
+    HTTP 500 while the registry holds the session lock; a well-formed empty
+    snapshot (marked ``partial``) lets clients refresh refs and retry instead.
+    """
+    from patchright.async_api import Error as PlaywrightError
+
+    worker = await _started_worker()
+    try:
+        await worker.command(
+            AgentCommandRequest(
+                type="navigate",
+                args={"url": "data:text/html,<title>Landing</title><h1>x</h1>"},
+            )
+        )
+        assert worker._page is not None
+        real_page = worker._page
+
+        class _AlwaysDestroyed:
+            """Real page whose evaluate() always fails like a navigation race."""
+
+            def __init__(self) -> None:
+                self.evaluate_calls = 0
+                self.load_state_waits = 0
+
+            @property
+            def url(self) -> str:  # delegated to real page
+                return real_page.url
+
+            async def evaluate(self, *args, **kwargs):
+                self.evaluate_calls += 1
+                raise PlaywrightError(
+                    "Page.evaluate: Execution context was destroyed, most likely because of a navigation."
+                )
+
+            async def title(self) -> str:  # pragma: no cover - delegated
+                return await real_page.title()
+
+            async def wait_for_load_state(self, *args, **kwargs):
+                self.load_state_waits += 1
+                return await real_page.wait_for_load_state(*args, **kwargs)
+
+        always = _AlwaysDestroyed()
+        result = await worker._dispatch_command(AgentCommandRequest(type="snapshot", args={}), always)
+    finally:
+        await worker.close()
+
+    assert always.evaluate_calls == 3  # initial attempt + bounded retries
+    assert result["partial"] is True
+    assert result["elements"] == 0
+    assert result["roots"] == []
+    assert "data:" in result["url"]  # still a usable url, not an error payload

@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Protocol, cast
@@ -965,7 +966,27 @@ class PlaywrightBrowserWorker:
             await page.keyboard.press(str(request.args["key"]))
             return await self._current_page_result({"accepted": True})
         if request.type == "snapshot":
-            result = await page.evaluate(_SNAPSHOT_JS)
+
+            async def _walk() -> dict[str, Any]:
+                return cast(dict[str, Any], await page.evaluate(_SNAPSHOT_JS))
+
+            async def _degraded_snapshot() -> dict[str, Any]:
+                # The walker could not complete because the document it was
+                # reading was replaced mid-evaluate. Return a well-formed but
+                # empty snapshot (marked "partial") instead of raising: the
+                # agent-command endpoint would otherwise 500 while holding the
+                # session lock, and clients would keep acting on refs captured
+                # before the navigation.
+                return {
+                    "url": redact_url(page.url)[0],
+                    "title": await self._safe_title(page),
+                    "forms": 0,
+                    "elements": 0,
+                    "roots": [],
+                    "partial": True,
+                }
+
+            result = await self._with_navigation_recovery(page, _walk, fallback=_degraded_snapshot)
             raw_url = result.get("url", "") or page.url
             result["url"] = redact_url(raw_url)[0]
             hint = await self._ucp.snapshot_hint(raw_url)
@@ -1140,36 +1161,66 @@ class PlaywrightBrowserWorker:
         result["title"] = await self._safe_title(self._page)
         return result
 
-    async def _safe_title(self, page: Any) -> str:
-        """Read ``document.title`` without letting a navigation race fail the command.
+    async def _with_navigation_recovery(
+        self,
+        page: Any,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        fallback: Callable[[], Any] | None = None,
+    ) -> Any:
+        """Await an in-page ``operation`` without letting a navigation race fail the command.
 
-        ``page.title()`` evaluates inside the page's JS execution context. A
-        client-side redirect (meta refresh, ``location =`` in an inline script)
-        that fires immediately after ``goto`` resolves at ``domcontentloaded``
-        destroys that context, so the call raises "Execution context was
-        destroyed, most likely because of a navigation" — which otherwise
-        bubbles up as an opaque HTTP 500. Wait for the replacement document to
-        settle and retry a bounded number of times, falling back to an empty
-        title rather than failing the whole command.
+        Several commands evaluate inside the page's JS execution context
+        (``page.title()``, ``page.evaluate`` of the accessibility walker, …).
+        A client-side redirect (meta refresh, ``location =`` in an inline
+        script) that fires while the command runs destroys that context, so the
+        call raises "Execution context was destroyed, most likely because of a
+        navigation" — which otherwise bubbles up as an opaque HTTP 500 from the
+        agent-command endpoint while the command holds the session lock. This
+        is the shared recovery used by every such read: wait for the
+        replacement document to settle and retry a bounded number of times,
+        then fall back rather than failing the whole command.
+
+        Only a navigation-induced context teardown is retried; any other
+        Playwright failure is a real error worth surfacing.
         """
+        from inspect import isawaitable
+
         from patchright.async_api import Error as PlaywrightError
 
         attempts = 3
+        last_exc: Exception | None = None
         for attempt in range(attempts):
             try:
-                return await page.title()
+                return await operation()
             except PlaywrightError as exc:
                 # Only a navigation-induced context teardown is retryable; any
                 # other Playwright failure is a real error worth surfacing.
                 if "context was destroyed" not in str(exc):
                     raise
+                last_exc = exc
                 if attempt == attempts - 1:
                     break
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=5000)
                 except PlaywrightError:
                     pass
-        return ""
+        if fallback is None:
+            assert last_exc is not None
+            raise last_exc
+        outcome = fallback()
+        if isawaitable(outcome):
+            return await outcome
+        return outcome
+
+    async def _safe_title(self, page: Any) -> str:
+        """Read ``document.title`` without letting a navigation race fail the command.
+
+        Thin wrapper over :meth:`_with_navigation_recovery`; see its docstring for
+        the failure mechanism. Falls back to an empty title rather than failing
+        the whole command.
+        """
+        return await self._with_navigation_recovery(page, page.title, fallback=lambda: "")
 
     async def close(self) -> None:
         self.closed = True
