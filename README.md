@@ -69,6 +69,10 @@ returns `{"error": true, "code": "stale_ref", "cause": "missing|hidden|changed",
 rather than waiting out the actionability timeout. A ref that is not of the form `e12` returns
 `invalid_ref`. A raw `selector` still works unchanged.
 
+Identity is the stamped attributes (ref, role, name), not the node object: a page that replaces a
+stamped node with a clone carrying those attributes produces a look-alike the check cannot tell
+apart. This is a deliberate simplification shared with every surveyed harness except Playwright.
+
 ## Cookie jars (persistent authenticated browser state)
 
 A **cookie jar** is a named, durable, encrypted blob of Playwright `storage_state` (cookies +

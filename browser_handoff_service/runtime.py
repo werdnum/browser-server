@@ -457,8 +457,9 @@ CHECK_REF_JS = (
 )
 
 _REF_PATTERN = re.compile(r"e[0-9]+")
-# JavaScript's Number.MAX_SAFE_INTEGER, the largest counter the walker can advance exactly.
-_MAX_SAFE_NEXT_REF = 2**53 - 1
+# The walker increments the counter in JavaScript, which stops advancing exactly past 2**53 - 1.
+# Capping the starting point 2**32 below that leaves any real walk room to allocate.
+_MAX_SAFE_NEXT_REF = 2**53 - 2**32
 
 # What a caller is told when a ref no longer names a listable node. One sentence for the model:
 # the ref is not wrong, the page moved on, and the fix is a fresh snapshot.
@@ -476,8 +477,6 @@ def coerce_next_ref(raw: Any) -> int:
         value = int(raw)
     except (TypeError, ValueError):
         return 1
-    # The walker increments the counter in JavaScript, which cannot represent integers above
-    # 2**53 - 1 exactly; past that ``counter++`` could stall and issue one number twice.
     return min(max(value, 1), _MAX_SAFE_NEXT_REF)
 
 

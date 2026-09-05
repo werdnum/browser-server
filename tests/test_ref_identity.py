@@ -348,7 +348,7 @@ async def test_fake_runtime_same_url_reload_replaces_the_document():
 
 
 def test_coerce_next_ref_clamps_to_the_javascript_safe_integer_range():
-    assert coerce_next_ref(2**60) == 2**53 - 1
+    assert coerce_next_ref(2**60) == 2**53 - 2**32
     assert coerce_next_ref("12") == 12
     assert coerce_next_ref(None) == 1
     assert coerce_next_ref(-5) == 1
