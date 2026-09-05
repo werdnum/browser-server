@@ -30,6 +30,7 @@ _PAGE_A = b"""<!doctype html><title>Alpha</title>
 <label for="name">Name</label><input id="name" type="text">
 <select id="pick" aria-label="Pick"><option value="a">A</option><option value="b">B</option></select>
 <div id="box"><button id="boxed">Boxed</button></div>
+<input id="go" type="submit" value="Review">
 """
 
 _PAGE_B = b"""<!doctype html><title>Beta</title>
@@ -153,6 +154,20 @@ async def test_a_relabelled_node_is_stale_until_it_is_renumbered(worker, page_se
     assert _by_name(second, "Renamed")["ref"] == f"e{first['next_ref']}"
     assert ref not in _refs(second)
     assert _by_name(second, "One")["ref"] == _by_name(first, "One")["ref"]
+
+
+async def test_a_button_input_is_named_by_its_value_and_stale_when_it_changes(worker, page_server):
+    await _navigate(worker, f"{page_server}/a")
+    first = await _snapshot(worker, 1)
+    ref = _by_name(first, "Review")["ref"]
+
+    await _exec(worker, "document.getElementById('go').value = 'Pay'; return 1")
+
+    acted = await worker.command(AgentCommandRequest(type="click", args={"ref": ref}))
+    assert acted["code"] == "stale_ref"
+    assert acted["cause"] == "changed"
+    second = await _snapshot(worker, first["next_ref"])
+    assert _by_name(second, "Pay")["ref"] != ref
 
 
 async def test_numbering_continues_across_navigation_and_reload(worker, page_server):
@@ -352,3 +367,4 @@ def test_coerce_next_ref_clamps_to_the_javascript_safe_integer_range():
     assert coerce_next_ref("12") == 12
     assert coerce_next_ref(None) == 1
     assert coerce_next_ref(-5) == 1
+    assert coerce_next_ref(float("inf")) == 1
