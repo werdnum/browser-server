@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from browser_handoff_service.models import AgentCommandRequest, CreateSessionRequest
 from browser_handoff_service.registry import SessionRegistry
-from browser_handoff_service.runtime import PlaywrightBrowserWorker, RuntimeUnavailable
+from browser_handoff_service.runtime import PlaywrightBrowserWorker, RuntimeUnavailable, coerce_next_ref
 
 _PAGE_A = b"""<!doctype html><title>Alpha</title>
 <h1>Alpha</h1>
@@ -321,3 +321,34 @@ async def test_fake_runtime_returns_a_stale_ref_error_rather_than_failing_the_co
     )
     assert malformed.ok
     assert malformed.result["code"] == "invalid_ref"
+
+    trailing_newline = await registry.agent_command(
+        session.session_id, AgentCommandRequest(type="click", args={"ref": "e1\n"})
+    )
+    assert trailing_newline.result["code"] == "invalid_ref"
+
+
+async def test_fake_runtime_same_url_reload_replaces_the_document():
+    registry = SessionRegistry()
+    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_reload"))
+    url = "https://example.test/page"
+    await registry.agent_command(session.session_id, AgentCommandRequest(type="navigate", args={"url": url}))
+    before = await registry.agent_command(
+        session.session_id, AgentCommandRequest(type="snapshot", args={"next_ref": 3})
+    )
+    old_ref = before.result["roots"][0]["ref"]
+
+    await registry.agent_command(session.session_id, AgentCommandRequest(type="navigate", args={"url": url}))
+    stale = await registry.agent_command(session.session_id, AgentCommandRequest(type="click", args={"ref": old_ref}))
+    assert stale.result["code"] == "stale_ref"
+    after = await registry.agent_command(
+        session.session_id, AgentCommandRequest(type="snapshot", args={"next_ref": before.result["next_ref"]})
+    )
+    assert after.result["roots"][0]["ref"] != old_ref
+
+
+def test_coerce_next_ref_clamps_to_the_javascript_safe_integer_range():
+    assert coerce_next_ref(2**60) == 2**53 - 1
+    assert coerce_next_ref("12") == 12
+    assert coerce_next_ref(None) == 1
+    assert coerce_next_ref(-5) == 1

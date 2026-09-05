@@ -456,7 +456,9 @@ CHECK_REF_JS = (
 """
 )
 
-_REF_PATTERN = re.compile(r"^e[0-9]+$")
+_REF_PATTERN = re.compile(r"e[0-9]+")
+# JavaScript's Number.MAX_SAFE_INTEGER, the largest counter the walker can advance exactly.
+_MAX_SAFE_NEXT_REF = 2**53 - 1
 
 # What a caller is told when a ref no longer names a listable node. One sentence for the model:
 # the ref is not wrong, the page moved on, and the fix is a fresh snapshot.
@@ -474,7 +476,9 @@ def coerce_next_ref(raw: Any) -> int:
         value = int(raw)
     except (TypeError, ValueError):
         return 1
-    return max(value, 1)
+    # The walker increments the counter in JavaScript, which cannot represent integers above
+    # 2**53 - 1 exactly; past that ``counter++`` could stall and issue one number twice.
+    return min(max(value, 1), _MAX_SAFE_NEXT_REF)
 
 
 def invalid_ref_result(ref: str, url: str | None) -> dict[str, Any]:
@@ -575,7 +579,6 @@ class FakeBrowserWorker:
         # its ref for as long as the fake document is unchanged, fresh numbers come from the
         # caller's counter, and no number is ever issued twice by this worker.
         self._ref: str | None = None
-        self._ref_document: tuple[str | None, str] | None = None
         self._highest_ref = 0
 
     async def _ucp_fetch(self, url: str) -> Any:
@@ -614,21 +617,19 @@ class FakeBrowserWorker:
         return origin_of(url) not in set(self.confine_origins)
 
     def _current_ref(self) -> str | None:
-        """The ref the fake's current document carries, or None when it has not been snapshotted."""
-        if self._ref is None or self._ref_document != (self.url, self.title):
-            return None
+        """The ref the fake's current document carries, or None when it has not been snapshotted.
+
+        Every successful navigation, a same-URL reload included, replaces the document and drops it."""
         return self._ref
 
     def _issue_ref(self, next_ref: int) -> str:
         """The ref for the fake's single node: reused while the document is unchanged, otherwise a
         fresh number at or above the caller's counter and above anything this worker has issued."""
-        current = self._current_ref()
-        if current is not None:
-            return current
+        if self._ref is not None:
+            return self._ref
         number = max(next_ref, self._highest_ref + 1)
         self._highest_ref = number
         self._ref = f"e{number}"
-        self._ref_document = (self.url, self.title)
         return self._ref
 
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
@@ -661,13 +662,14 @@ class FakeBrowserWorker:
                 }
             self.url = target
             self.title = f"Fixture page at {redact_url(target)[1] or target}"
+            self._ref = None
             return {"url": redact_url(target)[0], "title": self.title}
         if request.type in {"click", "type_text", "select", "press_key"}:
             raw_ref = request.args.get("ref") if request.type != "press_key" else None
             if raw_ref is not None:
                 url = redact_url(self.url)[0] if self.url else None
                 ref = str(raw_ref)
-                if not _REF_PATTERN.match(ref):
+                if not _REF_PATTERN.fullmatch(ref):
                     return invalid_ref_result(ref, url)
                 if ref != self._current_ref():
                     return stale_ref_result(ref, "missing", url, self.title)
@@ -1030,7 +1032,7 @@ class PlaywrightBrowserWorker:
         if raw_ref is None:
             return str(request.args["selector"])
         ref = str(raw_ref)
-        if not _REF_PATTERN.match(ref):
+        if not _REF_PATTERN.fullmatch(ref):
             return invalid_ref_result(ref, redact_url(page.url)[0])
         cause = await self._ref_ineligibility(page, ref)
         if cause is not None:
