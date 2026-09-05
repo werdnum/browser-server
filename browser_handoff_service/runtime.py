@@ -575,7 +575,7 @@ class FakeBrowserWorker:
         # its ref for as long as the fake document is unchanged, fresh numbers come from the
         # caller's counter, and no number is ever issued twice by this worker.
         self._ref: str | None = None
-        self._ref_document: str | None = None
+        self._ref_document: tuple[str | None, str] | None = None
         self._highest_ref = 0
 
     async def _ucp_fetch(self, url: str) -> Any:
@@ -615,7 +615,7 @@ class FakeBrowserWorker:
 
     def _current_ref(self) -> str | None:
         """The ref the fake's current document carries, or None when it has not been snapshotted."""
-        if self._ref is None or self._ref_document != self.title:
+        if self._ref is None or self._ref_document != (self.url, self.title):
             return None
         return self._ref
 
@@ -628,7 +628,7 @@ class FakeBrowserWorker:
         number = max(next_ref, self._highest_ref + 1)
         self._highest_ref = number
         self._ref = f"e{number}"
-        self._ref_document = self.title
+        self._ref_document = (self.url, self.title)
         return self._ref
 
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
