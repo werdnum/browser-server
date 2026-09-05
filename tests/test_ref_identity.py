@@ -170,6 +170,27 @@ async def test_a_button_input_is_named_by_its_value_and_stale_when_it_changes(wo
     assert _by_name(second, "Pay")["ref"] != ref
 
 
+async def test_a_cloned_node_with_a_hidden_original_gets_a_fresh_usable_ref(worker, page_server):
+    await _navigate(worker, f"{page_server}/a")
+    first = await _snapshot(worker, 1)
+    ref = _by_name(first, "Two")["ref"]
+
+    await _exec(
+        worker,
+        "const two = document.getElementById('two'); const clone = two.cloneNode(true); "
+        "clone.id = 'two-clone'; two.after(clone); two.style.display = 'none'; return 1",
+    )
+
+    stale = await worker.command(AgentCommandRequest(type="click", args={"ref": ref}))
+    assert stale["code"] == "stale_ref"
+
+    second = await _snapshot(worker, first["next_ref"])
+    clone_ref = _by_name(second, "Two")["ref"]
+    assert clone_ref != ref
+    acted = await worker.command(AgentCommandRequest(type="click", args={"ref": clone_ref}))
+    assert acted["accepted"] is True
+
+
 async def test_numbering_continues_across_navigation_and_reload(worker, page_server):
     seen: list[str] = []
     counter = 1
