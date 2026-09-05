@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
@@ -246,18 +247,28 @@ def origin_of(url: str | None) -> str | None:
     return normalize_origin(url)
 
 
-# In-page DOM walker. Tags interactive/labeled elements with a stable
-# ``data-fa-ref`` attribute and returns a nested accessibility tree. The shape
-# matches the ``Snapshot`` contract consumed by the Family Assistant browser
-# tools, so the same rich tools work against this remote worker as against a
-# local Playwright page. The ref ``e12`` always resolves to the selector
-# ``[data-fa-ref="e12"]``, which agents pass straight to click/type_text/select.
-_SNAPSHOT_JS = r"""
-() => {
-  document.querySelectorAll('[data-fa-ref]').forEach(el => el.removeAttribute('data-fa-ref'));
+# In-page accessibility walker and ref resolver.
+#
+# This block is shared VERBATIM by browser-server (browser_handoff_service/runtime.py)
+# and Family Assistant (src/family_assistant/tools/browser_backend.py). Family
+# Assistant has a unit test asserting its copy is byte-identical to the one
+# installed from browser-server, so edit both or neither.
+#
+# Contract (docs/design/browser-ref-identity.md in family-assistant):
+# - A ref names one node and is never issued for another node in the same
+#   conversation. A node keeps its ref across snapshots while its role and
+#   accessible name are unchanged; anything else is stamped with a fresh number.
+# - Fresh numbers come from the caller-supplied counter (``nextRef``) and never
+#   go below the highest number already stamped on the document. The walker
+#   reports the advanced counter as ``next_ref``.
+# - ``CHECK_REF_JS`` decides whether a ref resolves: exactly when a snapshot
+#   taken now would list that node under it. It shares the walker's predicate.
 
-  let refCounter = 0;
-  const allocRef = () => 'e' + (++refCounter);
+_WALKER_HELPERS_JS = r"""
+  const REF_ATTR = 'data-fa-ref';
+  const ROLE_ATTR = 'data-fa-role';
+  const NAME_ATTR = 'data-fa-name';
+  const REF_PATTERN = /^e[0-9]+$/;
 
   const ROLE_MAP = {
     A: 'link', BUTTON: 'button', SELECT: 'combobox',
@@ -271,6 +282,9 @@ _SNAPSHOT_JS = r"""
     range: 'slider', file: 'textbox',
   };
   const HEADING_TAGS = new Set(['H1','H2','H3','H4','H5','H6']);
+  // Button-like inputs are labelled by their value, which is also what a page
+  // changes when it repurposes one, so identity has to include it.
+  const BUTTON_INPUT_TYPES = new Set(['submit', 'button', 'reset']);
   const NAME_FROM_CONTENT = new Set([
     'A', 'BUTTON', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
     'P', 'LI', 'SPAN', 'LABEL', 'OPTION', 'TD', 'TH', 'CAPTION',
@@ -308,6 +322,9 @@ _SNAPSHOT_JS = r"""
     if (el.getAttribute('alt')) return el.getAttribute('alt').trim();
     if (el.getAttribute('title')) return el.getAttribute('title').trim();
     if (el.getAttribute('placeholder')) return el.getAttribute('placeholder').trim();
+    if (el.tagName === 'INPUT' && BUTTON_INPUT_TYPES.has((el.getAttribute('type') || '').toLowerCase())) {
+      return (el.value || '').trim();
+    }
     if (!NAME_FROM_CONTENT.has(el.tagName)) return '';
     const txt = (el.innerText || el.textContent || '').trim();
     return txt.length > 120 ? txt.slice(0, 120) + '…' : txt;
@@ -329,14 +346,77 @@ _SNAPSHOT_JS = r"""
     return null;
   }
 
+  // Why a snapshot taken now would not list ``el`` under its stamped ref, or
+  // null when it would. This is the one eligibility predicate the walker and
+  // the resolver share: the walker lists exactly the nodes for which it is
+  // null, and an action resolves a ref exactly when it is null.
+  function ineligible(el) {
+    let inBody = false;
+    for (let n = el; n; n = n.parentElement) {
+      if (n.nodeType !== 1 || !isVisible(n)) return 'hidden';
+      if (n === document.body) { inBody = true; break; }
+    }
+    if (!inBody) return 'missing';
+    const role = interesting(el);
+    if (role === null) return 'changed';
+    if (role !== el.getAttribute(ROLE_ATTR)) return 'changed';
+    if (accName(el) !== el.getAttribute(NAME_ATTR)) return 'changed';
+    return null;
+  }
+"""
+
+# ``(nextRef) => snapshot``. ``nextRef`` is the lowest number the caller permits
+# for a fresh ref; the result's ``next_ref`` is the counter after this walk.
+SNAPSHOT_JS = (
+    "(nextRef) => {"
+    + _WALKER_HELPERS_JS
+    + r"""
+  let highest = 0;
+  // How many elements carry each stamp, hidden ones included: a page that
+  // clones a stamped node leaves two, and a ref shared by two nodes is no
+  // ref at all, so neither keeps it.
+  const carriers = new Map();
+  for (const el of document.querySelectorAll('[' + REF_ATTR + ']')) {
+    const stamped = el.getAttribute(REF_ATTR) || '';
+    if (!REF_PATTERN.test(stamped)) continue;
+    carriers.set(stamped, (carriers.get(stamped) || 0) + 1);
+    const n = parseInt(stamped.slice(1), 10);
+    if (n > highest) highest = n;
+  }
+  let counter = Math.max(Math.floor(Number(nextRef)) || 1, highest + 1);
+  const issued = new Set();
+
+  function refFor(el, role, name) {
+    const existing = el.getAttribute(REF_ATTR) || '';
+    if (
+      REF_PATTERN.test(existing) &&
+      carriers.get(existing) === 1 &&
+      !issued.has(existing) &&
+      el.getAttribute(ROLE_ATTR) === role &&
+      el.getAttribute(NAME_ATTR) === name
+    ) {
+      issued.add(existing);
+      return existing;
+    }
+    const ref = 'e' + (counter++);
+    el.setAttribute(REF_ATTR, ref);
+    el.setAttribute(ROLE_ATTR, role);
+    el.setAttribute(NAME_ATTR, name);
+    issued.add(ref);
+    return ref;
+  }
+
+  let listed = 0;
+
   function walk(el, out) {
     if (el.nodeType !== 1) return;
     if (!isVisible(el)) return;
     const role = interesting(el);
     if (role) {
-      const ref = allocRef();
-      el.setAttribute('data-fa-ref', ref);
-      const node = { ref, role, name: accName(el) };
+      const name = accName(el);
+      const ref = refFor(el, role, name);
+      listed += 1;
+      const node = { ref, role, name };
       const href = el.getAttribute('href');
       if (href) node.href = href;
       const value = el.value;
@@ -363,11 +443,76 @@ _SNAPSHOT_JS = r"""
     url: location.href,
     title: document.title,
     forms: formCount,
-    elements: refCounter,
+    elements: listed,
+    next_ref: counter,
     roots,
   };
 }
 """
+)
+
+# ``(ref) => {ok: true} | {ok: false, cause}``. ``cause`` is ``missing`` (no node
+# carries the ref), ``hidden`` (the node or an ancestor is not visible) or
+# ``changed`` (the node's role or name differs from what was snapshotted).
+CHECK_REF_JS = (
+    "(ref) => {"
+    + _WALKER_HELPERS_JS
+    + r"""
+  if (typeof ref !== 'string' || !REF_PATTERN.test(ref)) return { ok: false, cause: 'missing' };
+  const carriers = document.querySelectorAll('[' + REF_ATTR + '="' + ref + '"]');
+  if (carriers.length !== 1) return { ok: false, cause: 'missing' };
+  const el = carriers[0];
+  const cause = ineligible(el);
+  if (cause !== null) return { ok: false, cause };
+  return { ok: true };
+}
+"""
+)
+
+_REF_PATTERN = re.compile(r"e[0-9]+")
+# The walker increments the counter in JavaScript, which stops advancing exactly past 2**53 - 1.
+# Capping the starting point 2**32 below that leaves any real walk room to allocate.
+_MAX_SAFE_NEXT_REF = 2**53 - 2**32
+
+# What a caller is told when a ref no longer names a listable node. One sentence for the model:
+# the ref is not wrong, the page moved on, and the fix is a fresh snapshot.
+_STALE_REF_REASON = "ref {ref} is no longer on the page as snapshotted; the page has changed since the last snapshot"
+
+
+def coerce_next_ref(raw: Any) -> int:
+    """The lowest number a snapshot may issue as a fresh ref.
+
+    Callers thread this counter through their snapshots so a number is never issued twice within a
+    conversation. Anything unusable falls back to 1; the walker then raises it above the document's
+    own stamps anyway.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 1
+    return min(max(value, 1), _MAX_SAFE_NEXT_REF)
+
+
+def invalid_ref_result(ref: str, url: str | None) -> dict[str, Any]:
+    return {
+        "error": True,
+        "code": "invalid_ref",
+        "ref": ref,
+        "reason": "a ref looks like e12",
+        "url": url,
+    }
+
+
+def stale_ref_result(ref: str, cause: str, url: str | None, title: str) -> dict[str, Any]:
+    return {
+        "error": True,
+        "code": "stale_ref",
+        "ref": ref,
+        "cause": cause,
+        "reason": _STALE_REF_REASON.format(ref=ref),
+        "url": url,
+        "title": title,
+    }
 
 
 def _wrap_exec_code(code: str) -> str:
@@ -442,6 +587,11 @@ class FakeBrowserWorker:
         # URLs that simulate an in-scope network failure (DNS/TLS/connection outage) on navigate.
         self.nav_error_urls: set[str] = set()
         self.last_blocked: dict[str, Any] | None = None
+        # Ref identity, mirrored from the real walker at fake scale: the single listed node keeps
+        # its ref for as long as the fake document is unchanged, fresh numbers come from the
+        # caller's counter, and no number is ever issued twice by this worker.
+        self._ref: str | None = None
+        self._highest_ref = 0
 
     async def _ucp_fetch(self, url: str) -> Any:
         return self.ucp_documents.get(url)
@@ -478,6 +628,22 @@ class FakeBrowserWorker:
             return False
         return origin_of(url) not in set(self.confine_origins)
 
+    def _current_ref(self) -> str | None:
+        """The ref the fake's current document carries, or None when it has not been snapshotted.
+
+        Every successful navigation, a same-URL reload included, replaces the document and drops it."""
+        return self._ref
+
+    def _issue_ref(self, next_ref: int) -> str:
+        """The ref for the fake's single node: reused while the document is unchanged, otherwise a
+        fresh number at or above the caller's counter and above anything this worker has issued."""
+        if self._ref is not None:
+            return self._ref
+        number = max(next_ref, self._highest_ref + 1)
+        self._highest_ref = number
+        self._ref = f"e{number}"
+        return self._ref
+
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed:
             raise RuntimeError("worker is closed")
@@ -508,17 +674,29 @@ class FakeBrowserWorker:
                 }
             self.url = target
             self.title = f"Fixture page at {redact_url(target)[1] or target}"
+            self._ref = None
             return {"url": redact_url(target)[0], "title": self.title}
         if request.type in {"click", "type_text", "select", "press_key"}:
+            raw_ref = request.args.get("ref") if request.type != "press_key" else None
+            if raw_ref is not None:
+                url = redact_url(self.url)[0] if self.url else None
+                ref = str(raw_ref)
+                if not _REF_PATTERN.fullmatch(ref):
+                    return invalid_ref_result(ref, url)
+                if ref != self._current_ref():
+                    return stale_ref_result(ref, "missing", url, self.title)
             self.actions.append({"type": request.type, "args": request.args})
             return {"accepted": True, "url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "snapshot":
+            next_ref = coerce_next_ref(request.args.get("next_ref"))
+            ref = self._issue_ref(next_ref)
             result: dict[str, Any] = {
                 "url": redact_url(self.url)[0] if self.url else "about:blank",
                 "title": self.title,
                 "forms": 0,
                 "elements": 1,
-                "roots": [{"ref": "e1", "role": "document", "name": self.title}],
+                "next_ref": max(next_ref, int(ref[1:]) + 1),
+                "roots": [{"ref": ref, "role": "document", "name": self.title}],
             }
             hint = await self._ucp.snapshot_hint(self.url)
             if hint is not None:
@@ -854,6 +1032,40 @@ class PlaywrightBrowserWorker:
                 }
             raise
 
+    async def _resolve_action_target(self, request: AgentCommandRequest, page: Any) -> str | dict[str, Any]:
+        """The selector a click/type_text/select should act on, or the error result to return instead.
+
+        A ``ref`` is checked against the live page before Playwright is asked for anything, so a ref
+        whose node a snapshot would no longer list fails immediately with a specific error rather
+        than waiting out the actionability timeout. Without a ``ref`` the caller's raw ``selector``
+        is used unchanged.
+        """
+        raw_ref = request.args.get("ref")
+        if raw_ref is None:
+            return str(request.args["selector"])
+        ref = str(raw_ref)
+        if not _REF_PATTERN.fullmatch(ref):
+            return invalid_ref_result(ref, redact_url(page.url)[0])
+        cause = await self._ref_ineligibility(page, ref)
+        if cause is not None:
+            return stale_ref_result(ref, cause, redact_url(page.url)[0], await self._safe_title(page))
+        return f'[data-fa-ref="{ref}"]'
+
+    async def _ref_ineligibility(self, page: Any, ref: str) -> str | None:
+        """Why a snapshot taken now would not list ``ref``'s node, or None when it would.
+
+        The predicate runs in the page and is the walker's own, so the two cannot drift. A document
+        replaced under the check leaves nothing to act on, so an unrecoverable check reads as stale.
+        """
+
+        async def _check() -> dict[str, Any]:
+            return cast(dict[str, Any], await page.evaluate(CHECK_REF_JS, ref))
+
+        result = await self._with_navigation_recovery(page, _check, fallback=lambda: {"ok": False, "cause": "missing"})
+        if result.get("ok"):
+            return None
+        return str(result.get("cause") or "missing")
+
     async def _human_pause(self, low: float, high: float) -> None:
         """Small randomized settle delay so consecutive agent commands don't land
         with machine-regular (or zero) spacing. No-op when stealth is off."""
@@ -911,64 +1123,69 @@ class PlaywrightBrowserWorker:
                 }
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
-        if request.type == "click":
-            await self._human_pause(0.05, 0.2)
-            if self.stealth:
-                # A randomized mousedown->mouseup hold instead of the instant
-                # synthetic click default.
-                await page.locator(str(request.args["selector"])).click(delay=random.uniform(30, 90))
-            else:
-                await page.locator(str(request.args["selector"])).click()
-            return await self._current_page_result({"accepted": True})
-        if request.type == "type_text":
-            locator = page.locator(str(request.args["selector"]))
-            text = str(request.args["text"])
-            human_typing = self.stealth and len(text) <= 200
-            if human_typing:
-                # Only text-like controls take per-key delivery. Specialized
-                # inputs (date/color/range/checkbox...) have value semantics that
-                # literal keystrokes either mangle or miss entirely — keep fill()'s
-                # serialized-value behavior for those.
-                try:
-                    human_typing = bool(
-                        await locator.evaluate(
-                            "(el) => el.isContentEditable || el.tagName === 'TEXTAREA' || "
-                            "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password', 'email', 'number']"
-                            ".includes((el.type || '').toLowerCase()))"
-                        )
-                    )
-                except Exception:
-                    # Target not resolvable to an element: fall back to fill().
-                    human_typing = False
-            if human_typing:
-                # Human-ish entry for short fields: per-key delivery with a FRESH
-                # jittered pause before every keystroke — a single constant delay
-                # passed to press_sequentially would produce a perfectly regular
-                # machine cadence. No synthetic mouse click — fill("")/
-                # press_sequentially focus the control themselves, and a click
-                # could fire onclick handlers (submit, navigate, clear dependent
-                # fields) that plain typing never did. fill("") first so the
-                # command keeps type_text's REPLACEMENT semantics —
-                # press_sequentially alone inserts at the caret and would splice
-                # new text into an autofilled/pre-filled value.
+        if request.type in {"click", "type_text", "select"}:
+            target = await self._resolve_action_target(request, page)
+            if isinstance(target, dict):
+                return target
+            if request.type == "click":
                 await self._human_pause(0.05, 0.2)
-                await locator.fill("")
-                for char in text:
-                    await locator.press_sequentially(char)
-                    await asyncio.sleep(random.uniform(0.045, 0.11))
-            else:
-                await locator.fill(text)
-            return await self._current_page_result({"accepted": True})
-        if request.type == "select":
-            await page.locator(str(request.args["selector"])).select_option(str(request.args["value"]))
-            return await self._current_page_result({"accepted": True})
+                if self.stealth:
+                    # A randomized mousedown->mouseup hold instead of the instant
+                    # synthetic click default.
+                    await page.locator(target).click(delay=random.uniform(30, 90))
+                else:
+                    await page.locator(target).click()
+                return await self._current_page_result({"accepted": True})
+            if request.type == "type_text":
+                locator = page.locator(target)
+                text = str(request.args["text"])
+                human_typing = self.stealth and len(text) <= 200
+                if human_typing:
+                    # Only text-like controls take per-key delivery. Specialized
+                    # inputs (date/color/range/checkbox...) have value semantics that
+                    # literal keystrokes either mangle or miss entirely — keep fill()'s
+                    # serialized-value behavior for those.
+                    try:
+                        human_typing = bool(
+                            await locator.evaluate(
+                                "(el) => el.isContentEditable || el.tagName === 'TEXTAREA' || "
+                                "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password', 'email', 'number']"
+                                ".includes((el.type || '').toLowerCase()))"
+                            )
+                        )
+                    except Exception:
+                        # Target not resolvable to an element: fall back to fill().
+                        human_typing = False
+                if human_typing:
+                    # Human-ish entry for short fields: per-key delivery with a FRESH
+                    # jittered pause before every keystroke — a single constant delay
+                    # passed to press_sequentially would produce a perfectly regular
+                    # machine cadence. No synthetic mouse click — fill("")/
+                    # press_sequentially focus the control themselves, and a click
+                    # could fire onclick handlers (submit, navigate, clear dependent
+                    # fields) that plain typing never did. fill("") first so the
+                    # command keeps type_text's REPLACEMENT semantics —
+                    # press_sequentially alone inserts at the caret and would splice
+                    # new text into an autofilled/pre-filled value.
+                    await self._human_pause(0.05, 0.2)
+                    await locator.fill("")
+                    for char in text:
+                        await locator.press_sequentially(char)
+                        await asyncio.sleep(random.uniform(0.045, 0.11))
+                else:
+                    await locator.fill(text)
+                return await self._current_page_result({"accepted": True})
+            if request.type == "select":
+                await page.locator(target).select_option(str(request.args["value"]))
+                return await self._current_page_result({"accepted": True})
         if request.type == "press_key":
             await page.keyboard.press(str(request.args["key"]))
             return await self._current_page_result({"accepted": True})
         if request.type == "snapshot":
+            next_ref = coerce_next_ref(request.args.get("next_ref"))
 
             async def _walk() -> dict[str, Any]:
-                return cast(dict[str, Any], await page.evaluate(_SNAPSHOT_JS))
+                return cast(dict[str, Any], await page.evaluate(SNAPSHOT_JS, next_ref))
 
             async def _degraded_snapshot() -> dict[str, Any]:
                 # The walker could not complete because the document it was
@@ -982,6 +1199,7 @@ class PlaywrightBrowserWorker:
                     "title": await self._safe_title(page),
                     "forms": 0,
                     "elements": 0,
+                    "next_ref": next_ref,
                     "roots": [],
                     "partial": True,
                 }

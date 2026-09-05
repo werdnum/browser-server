@@ -142,7 +142,7 @@ async def test_snapshot_recovers_when_a_navigation_destroys_the_context():
 
     Production failure: browser_open/snapshot 500'd with ``Page.evaluate:
     Execution context was destroyed, most likely because of a navigation.``
-    because the snapshot handler called ``page.evaluate(_SNAPSHOT_JS)`` with no
+    because the snapshot handler called ``page.evaluate(SNAPSHOT_JS)`` with no
     recovery, unlike the title-read path. Fault injection on a real page: the
     first ``evaluate`` fails like a mid-navigation read, then the real walker
     runs.

@@ -40,7 +40,7 @@ async def test_snapshot_returns_accessibility_tree_shape():
     )
     resp = await registry.agent_command(session.session_id, AgentCommandRequest(type="snapshot"))
     assert resp.ok
-    for key in ("url", "title", "forms", "elements", "roots"):
+    for key in ("url", "title", "forms", "elements", "next_ref", "roots"):
         assert key in resp.result
     assert isinstance(resp.result["roots"], list)
 

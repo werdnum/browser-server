@@ -53,6 +53,26 @@ The service supports handing control of a single browser session in either direc
   `POST /v1/sessions/{id}/agent-claim` and the `handover_token`, which transitions the session
   to `agent_active` and lets the agent resume with agent commands. Unclaimed handovers expire.
 
+## Element refs
+
+`snapshot` stamps each listed element with a `data-fa-ref="eN"` attribute and returns it as the
+node's `ref`. Numbers are issued from the caller's own counter: pass `next_ref` (default `1`) with
+every snapshot and thread the `next_ref` the result reports into the next one, and no number is
+ever issued for two different nodes. A node keeps its ref across snapshots for as long as its role
+and accessible name are unchanged; anything else gets a fresh number, and the walker never
+allocates below a number already stamped on the document.
+
+`click`, `type_text` and `select` accept a `ref` instead of a `selector`. The ref is checked
+against the live page before the action runs — it resolves exactly when a snapshot taken at that
+moment would still list that node — so a removed, hidden, relabelled or previous-document ref
+returns `{"error": true, "code": "stale_ref", "cause": "missing|hidden|changed", ...}` immediately
+rather than waiting out the actionability timeout. A ref that is not of the form `e12` returns
+`invalid_ref`. A raw `selector` still works unchanged.
+
+Identity is the stamped attributes (ref, role, name), not the node object: a page that replaces a
+stamped node with a clone carrying those attributes produces a look-alike the check cannot tell
+apart. This is a deliberate simplification shared with every surveyed harness except Playwright.
+
 ## Cookie jars (persistent authenticated browser state)
 
 A **cookie jar** is a named, durable, encrypted blob of Playwright `storage_state` (cookies +
