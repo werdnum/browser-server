@@ -253,7 +253,9 @@ grant read, and the destination is decided here rather than taken on trust:
    into text/email/tel, and main frame only.
 
 browser-server **stores no credential**: it holds the released plaintext only long enough to place
-it in the field, zeroes the buffer, and puts it in no response, event, log or exception. Configure
+it in the field, zeroes the returned mutable secret buffer, and puts it in no response, event,
+log or exception. HTTP response bytes and parsed Python strings are not zeroed; memory erasure
+is not guaranteed. Configure
 the broker (unconfigured ⇒ autofill returns `refused(keychute_unavailable)`):
 
 ```bash

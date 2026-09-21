@@ -2,8 +2,9 @@
 
 browser-server is registered with Keychute as a ``trusted-client`` for the ``autofill``
 mechanism, so it receives credential bytes directly. Everything in this module is built around
-that: the plaintext exists as a ``bytearray`` the caller zeroes, and nothing derived from a
-response body ever reaches a log message or an exception string. Errors are built from Keychute's
+that: the returned secret is a ``bytearray`` the caller zeroes. HTTP response bytes and parsed
+Python strings are not zeroed; this is not a guarantee of memory erasure. No secret response
+body reaches a log message or an exception string. Errors are built from Keychute's
 own non-secret ``{"error": {"code", "message"}}`` envelope and from status codes.
 
 Configuration is read lazily from the environment per call, like the other ``BROWSER_*`` settings,
@@ -342,8 +343,8 @@ class KeychuteClient:
     async def read_grant(self, grant_id: str, idempotency_key: str) -> bytearray:
         """Exercise a grant's single read.
 
-        Returns a mutable buffer so the caller can zero it: the plaintext must not outlive the
-        fill. A different idempotency key is a second logical read and Keychute refuses it, which
+        Returns a mutable secret buffer that the caller zeroes after filling. HTTP and parser
+        copies are outside that best-effort cleanup. A different idempotency key is a second logical read and Keychute refuses it, which
         is what keeps one grant to one fill.
         """
         response, raw = await self._call(

@@ -203,6 +203,13 @@ class ExtendRequest(BaseModel):
     minutes: int = Field(default=5, ge=1, le=10)
 
 
+class PendingAutofill(BaseModel):
+    request_id: str
+    nonce: str
+    origin: str
+    targets: list[dict[str, Any]]
+
+
 class BrowserSession(BaseModel):
     session_id: str
     conversation_id: str
@@ -249,7 +256,7 @@ class BrowserSession(BaseModel):
     # step_key -> Keychute request_id map an approval_pending retry resumes from.
     autofill_fill_count: int = 0
     autofill_bad_password: bool = False
-    autofill_pending: dict[str, str] = Field(default_factory=dict)
+    autofill_pending: dict[str, PendingAutofill] = Field(default_factory=dict, exclude=True)
     produced_jar_ids: set[str] = Field(default_factory=set)
     # jar_id -> authenticated generation this session produced, for the same generation-scoped
     # kill-switch check on a producing (source) session as on a jar-loaded one.

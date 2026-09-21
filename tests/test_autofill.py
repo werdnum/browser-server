@@ -448,7 +448,7 @@ async def test_a_pending_decision_parks_and_a_retry_reuses_the_same_request(keyc
         first = await _autofill(ac, session["session_id"], wait_seconds=1)
         assert first.json()["status"] == "approval_pending"
         request_id = first.json()["request_id"]
-        assert registry.sessions[session["session_id"]].autofill_pending == {"password": request_id}
+        assert registry.sessions[session["session_id"]].autofill_pending["password"].request_id == request_id
 
         second = await _autofill(ac, session["session_id"], wait_seconds=1)
         assert second.json()["request_id"] == request_id
@@ -650,3 +650,41 @@ async def test_kind_only_request_uses_auto_detection(keychute, kind):
         assert response.json()["status"] == "filled", response.text
         assert [field["kind"] for field in response.json()["filled"]] == [kind]
         assert len(worker.filled) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_pending_retry_keeps_the_original_document_binding(keychute, changed):
+    keychute.state = "pending"
+    async with client() as ac:
+        session, worker = await _session(ac)
+        first = await _autofill(ac, session["session_id"])
+        assert first.json()["status"] == "approval_pending"
+        if changed:
+            await worker.autofill_prepare(None, "replacement-document")
+        keychute.state = "approved"
+        second = await _autofill(ac, session["session_id"])
+        if changed:
+            assert second.json()["reason"] == "target_invalidated"
+            assert keychute.reads == 0
+        else:
+            assert second.json()["status"] == "filled"
+            assert keychute.reads == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", ["expires_at", "idle_expires_at"])
+async def test_expiry_during_approval_prevents_the_grant_read(keychute, deadline):
+    keychute.state = "pending"
+    async with client() as ac:
+        session, worker = await _session(ac)
+
+        def approve_after_expiry():
+            setattr(registry.get(session["session_id"]), deadline, datetime.now(UTC) - timedelta(seconds=1))
+            keychute.state = "approved"
+
+        keychute.on_wait = approve_after_expiry
+        response = await _autofill(ac, session["session_id"], wait_seconds=1)
+        assert response.status_code == 410
+        assert keychute.reads == 0
+        assert not worker.filled

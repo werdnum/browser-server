@@ -35,6 +35,7 @@ from .models import (
     HandoffRequest,
     JarProbeConfig,
     LeaseOwner,
+    PendingAutofill,
     ProbeResult,
     ProbeResultName,
     SaveJarRequest,
@@ -758,18 +759,22 @@ class SessionRegistry:
 
         # 1. Pin the document and choose the targets. The origin is the document's own, never
         #    anything the caller supplied.
-        nonce = uuid4().hex
-        fields = [field.model_dump() for field in req.fields] if req.fields else None
-        prepared = await worker.autofill_prepare(fields, nonce)
-        if prepared.get("error"):
-            reason = str(prepared.get("reason") or "no_eligible_field")
-            return autofill_refused(
-                cast(AutofillRefusal, reason),
-                _AUTOFILL_DETAILS.get(reason, "the requested field cannot take a fill"),
-                origin=prepared.get("origin"),
-            )
-        origin = _normalize_origin(str(prepared.get("origin") or ""))
-        targets = list(prepared.get("targets") or [])
+        pending = session.autofill_pending.get(req.step_key)
+        if pending is not None:
+            nonce, origin, targets = pending.nonce, pending.origin, pending.targets
+        else:
+            nonce = uuid4().hex
+            fields = [field.model_dump() for field in req.fields] if req.fields else None
+            prepared = await worker.autofill_prepare(fields, nonce)
+            if prepared.get("error"):
+                reason = str(prepared.get("reason") or "no_eligible_field")
+                return autofill_refused(
+                    cast(AutofillRefusal, reason),
+                    _AUTOFILL_DETAILS.get(reason, "the requested field cannot take a fill"),
+                    origin=prepared.get("origin"),
+                )
+            origin = _normalize_origin(str(prepared.get("origin") or ""))
+            targets = list(prepared.get("targets") or [])
         if origin is None or origin not in set(session.confine_origins):
             # Cannot happen while the route guard holds, so it is a fail-closed backstop rather
             # than a routine outcome — about:blank reaches it too.
@@ -807,7 +812,9 @@ class SessionRegistry:
             if status.state == "pending" and req.wait_seconds > 0:
                 status = await self.keychute.wait(status.request_id, req.wait_seconds)
             if status.state == "pending":
-                session.autofill_pending[req.step_key] = status.request_id
+                session.autofill_pending[req.step_key] = PendingAutofill(
+                    request_id=status.request_id, nonce=nonce, origin=origin, targets=targets
+                )
                 approval_url = self.keychute.approval_url(status.request_id)
                 return AutofillResponse(
                     status="approval_pending",
@@ -849,6 +856,7 @@ class SessionRegistry:
                     "target_invalidated", "the page changed while the release was decided", origin=origin
                 )
 
+            self._raise_if_expired(session)
             await self._enforce_jar_not_revoked_locked(session)
             secret = await self.keychute.read_grant(status.grant_id, idempotency_key)
             session.autofill_fill_count += 1
@@ -868,6 +876,8 @@ class SessionRegistry:
                     f"the released secret carries no {missing[0]}",
                     origin=origin,
                 )
+            self._raise_if_expired(session)
+            await self._enforce_jar_not_revoked_locked(session)
             result = await worker.autofill_fill(nonce, origin, targets, values)
         finally:
             zero_secret(secret)
