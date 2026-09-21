@@ -123,6 +123,16 @@ class CreateSessionRequest(BaseModel):
     # JS (new Date(), Intl) reports the caller's local time. None => the server default
     # (BROWSER_TIMEZONE env, else the host/Chromium default).
     timezone_id: str | None = None
+    # Authenticated-site session (service-token-only, like jar_id). Deterministic effects,
+    # enforced regardless of what else the caller asked for: exec/extract denied, clipboard
+    # chords denied, navigation confinement always on, read-back protections active.
+    authenticated_site: bool = False
+    # Explicit confinement set (exact origins). Required for a JARLESS authenticated-site
+    # session; when a jar is also loaded it must equal the jar's effective set.
+    confine_origins: list[BoundedOriginStr] | None = Field(default=None, max_length=MAX_ORIGINS)
+    # The Keychute secret name this session's autofill may request. Routing, not release
+    # authority: a session without one has no autofill at all.
+    credential_alias: str | None = Field(default=None, max_length=256)
 
     def resolved_form_factor(self) -> FormFactorName:
         if self.form_factor != "auto":
@@ -223,6 +233,16 @@ class BrowserSession(BaseModel):
     # (which only see the session record) can tell an opt-in apart from the default.
     allow_exec: bool = False
     confine_navigation: bool = False
+    # Authenticated-site marker and the confinement set actually enforced (jar-derived or
+    # explicit), so the creating service can verify what it got. Never holds secret material.
+    authenticated_site: bool = False
+    confine_origins: list[str] = Field(default_factory=list)
+    credential_alias: str | None = None
+    # Autofill bookkeeping: the deterministic backstop cap, the bad-password latch, and the
+    # step_key -> Keychute request_id map an approval_pending retry resumes from.
+    autofill_fill_count: int = 0
+    autofill_bad_password: bool = False
+    autofill_pending: dict[str, str] = Field(default_factory=dict)
     produced_jar_ids: set[str] = Field(default_factory=set)
     # jar_id -> authenticated generation this session produced, for the same generation-scoped
     # kill-switch check on a producing (source) session as on a jar-loaded one.
@@ -234,6 +254,83 @@ class BrowserSession(BaseModel):
     cleanup_started_at: datetime | None = None
     cleanup_completed_at: datetime | None = None
     closed_at: datetime | None = None
+
+
+# --- autofill -------------------------------------------------------------
+
+AutofillKind = Literal["username", "password"]
+
+# Everything the autofill endpoint can answer with other than "filled"/"approval_pending".
+# A policy outcome is a 200 with one of these, so the caller never parses HTTP codes for it.
+AutofillRefusal = Literal[
+    "not_authenticated_site",
+    "no_alias",
+    "wrong_origin",
+    "no_eligible_field",
+    "ambiguous_fields",
+    "new_password_field",
+    "in_iframe",
+    "target_invalidated",
+    "policy_denied",
+    "request_expired",
+    "grant_invalid",
+    "bad_password_recorded",
+    "fill_cap_reached",
+    "keychute_unavailable",
+    "stale_ref",
+    "invalid_ref",
+]
+
+# Hard cap on fills per session: the deterministic backstop behind the agent-reported
+# bad-password latch, so a looping agent cannot burn releases indefinitely.
+AUTOFILL_FILL_CAP = 6
+# Longest the endpoint will long-poll Keychute before answering approval_pending.
+AUTOFILL_MAX_WAIT_SECONDS = 60
+# Bound on the caller-supplied context blob forwarded to Keychute's approval page.
+AUTOFILL_MAX_CONTEXT_BYTES = 2048
+
+
+class AutofillField(BaseModel):
+    """A field the caller addressed explicitly. ``ref`` is a walker ref (``e12``)."""
+
+    ref: str | None = Field(default=None, max_length=64)
+    kind: AutofillKind
+
+
+class AutofillRequest(BaseModel):
+    # Opaque per-step key; reused across approval_pending retries of the SAME step, because
+    # it is what makes the Keychute access request idempotent.
+    step_key: str = Field(min_length=1, max_length=64)
+    # Omitted => auto-detect on the current main-frame document.
+    fields: list[AutofillField] | None = Field(default=None, max_length=4)
+    wait_seconds: int = Field(default=25, ge=0, le=AUTOFILL_MAX_WAIT_SECONDS)
+    context: dict[str, Any] | None = None
+
+
+class AutofillOutcomeRequest(BaseModel):
+    outcome: Literal["bad_password"]
+
+
+class FilledField(BaseModel):
+    """What was filled. ``ref`` is null for a field the walker has never stamped."""
+
+    ref: str | None = None
+    kind: AutofillKind
+
+
+class AutofillResponse(BaseModel):
+    status: Literal["filled", "approval_pending", "refused"]
+    filled: list[FilledField] = Field(default_factory=list)
+    request_id: str | None = None
+    origin: str | None = None
+    reason: AutofillRefusal | None = None
+    # Human-readable and secret-free by construction: it is only ever built from codes,
+    # origins and Keychute's own non-secret error envelope.
+    detail: str | None = None
+
+
+def autofill_refused(reason: AutofillRefusal, detail: str, origin: str | None = None) -> AutofillResponse:
+    return AutofillResponse(status="refused", reason=reason, detail=detail, origin=origin)
 
 
 class SessionEvent(BaseModel):

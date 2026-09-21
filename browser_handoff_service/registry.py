@@ -10,6 +10,7 @@ from uuid import uuid4
 from .jars import (
     JarRevokedError,
     JarStore,
+    JarValidationError,
     jar_store_from_env,
     normalize_origin,
     validate_jar_id,
@@ -87,6 +88,50 @@ PAGE_STATE_COMMANDS = {
 }
 
 
+# Denied outright in an authenticated-site session: both read page content as raw values.
+AUTHENTICATED_SITE_DENIED_COMMANDS = {"exec", "extract"}
+
+# Key-chord fences for an authenticated-site session. Writing into a protected control is fine;
+# what is denied is every chord that MOVES a value out of one into somewhere observable.
+_TRANSFER_KEYS = {"c", "x", "v", "insert"}
+_TRANSFER_MODIFIERS = {"control", "meta"}
+
+
+def _is_transfer_chord(req: AgentCommandRequest) -> bool:
+    """Whether a key command is a copy/cut/paste chord (Ctrl/Cmd+C/X/V/Insert, Shift+Insert)."""
+    if req.type not in {"press_key", "keyboard_press"}:
+        return False
+    raw = req.args.get("keys", req.args.get("key"))
+    if not isinstance(raw, str):
+        return False
+    parts = [part.strip().lower() for part in raw.split("+") if part.strip()]
+    if not parts:
+        return False
+    base, modifiers = parts[-1], set(parts[:-1])
+    if base not in _TRANSFER_KEYS:
+        return False
+    if modifiers & _TRANSFER_MODIFIERS:
+        return True
+    return base == "insert" and "shift" in modifiers
+
+
+def _normalized_confine_origins(values: list[str] | None) -> list[str] | None:
+    """Normalize an explicit confinement set with the canonical origin normalizer.
+
+    Uses the same function the route guard compares against, so an accepted set cannot mean
+    one thing at validation and another at enforcement."""
+    if values is None:
+        return None
+    normalized: list[str] = []
+    for value in values:
+        origin = normalize_origin(value)
+        if origin is None:
+            raise JarValidationError(f"confine_origins entry is not an exact origin: {value!r}")
+        if origin not in normalized:
+            normalized.append(origin)
+    return normalized
+
+
 @dataclass
 class TokenRecord:
     session_id: str
@@ -132,6 +177,8 @@ class SessionRegistry:
 
         storage_state: dict | None = None
         confine_origins: list[str] | None = None
+        jar_scope: list[str] = []
+        explicit_origins = _normalized_confine_origins(req.confine_origins)
         loaded = None
         if req.jar_id is not None:
             # Validate the id BEFORE allocating a per-jar lock, so a caller passing malformed/random
@@ -150,16 +197,38 @@ class SessionRegistry:
             # call explicitly overrode it (storage_state does not carry the device profile).
             if req.form_factor == "auto" and req.client_viewport is None:
                 session.form_factor = loaded.meta.form_factor
-            confine = req.confine_navigation if req.confine_navigation is not None else True
+            # An authenticated-site session is confined unconditionally; the opt-out is a 400
+            # at the HTTP layer, and honouring it here would be the silent widening that layer
+            # exists to prevent.
+            confine = True if req.authenticated_site else (req.confine_navigation is not False)
+            jar_scope = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
             if confine:
-                confine_origins = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
+                confine_origins = list(jar_scope)
             session.jar_id = loaded.meta.jar_id
             session.jar_generation = loaded.meta.generation
             session.jar_origins = list(loaded.meta.origins)
             session.jar_nav_allowlist = list(loaded.meta.nav_allowlist)
             session.jar_registrable_domains = list(loaded.meta.registrable_domains)
-            session.allow_exec = req.allow_exec
+            session.allow_exec = False if req.authenticated_site else req.allow_exec
             session.confine_navigation = confine
+
+        if req.authenticated_site:
+            if loaded is not None:
+                # The session-creation chokepoint: when the caller states the confinement set AND
+                # loads a jar, the two must agree exactly. A silent preference for either one is
+                # how a session ends up confined to something other than what the caller verified.
+                if explicit_origins is not None and set(explicit_origins) != set(jar_scope):
+                    raise JarValidationError(
+                        "confinement mismatch: confine_origins does not equal the jar's effective origin set"
+                    )
+            else:
+                # Jarless: the explicit set IS the confinement, enforced by the same route guard.
+                confine_origins = list(explicit_origins or [])
+            session.authenticated_site = True
+            session.credential_alias = req.credential_alias
+            session.allow_exec = False
+            session.confine_navigation = True
+        session.confine_origins = list(confine_origins or [])
 
         self.sessions[session.session_id] = session
         self.locks[session.session_id] = asyncio.Lock()
@@ -173,6 +242,7 @@ class SessionRegistry:
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=session.timezone_id,
+            mask_protected=session.authenticated_site,
         )
         self.workers[session.worker_id or ""] = worker
         try:
@@ -210,7 +280,9 @@ class SessionRegistry:
             # human-owned session (service token + initial_owner="human"), the human drives via
             # noVNC and the handoff toggle never runs, so disable confinement now — otherwise the
             # route guard would block the human's off-scope SSO/re-login navigation.
-            if session.lease_owner == LeaseOwner.HUMAN:
+            # An authenticated-site session stays confined even under human control: the design
+            # parks it origin-confined, and dropping the guard here would widen it silently.
+            if session.lease_owner == LeaseOwner.HUMAN and not session.authenticated_site:
                 worker.set_confinement_active(False)
             self._event(
                 session,
@@ -265,7 +337,7 @@ class SessionRegistry:
             # session is handed to a human, drop confinement so the human is not trapped (e.g. an
             # off-scope SSO/IdP bounce during re-login). The context is torn down at completion
             # and never resumed by the agent (handover and resumable handoff are both refused).
-            if session.jar_id is not None:
+            if session.jar_id is not None and not session.authenticated_site:
                 worker = self.workers.get(session.worker_id or "")
                 if worker is not None:
                     worker.set_confinement_active(False)
@@ -457,6 +529,15 @@ class SessionRegistry:
             # credential". Default-deny it in a jar-loaded session unless the creator opted in.
             if req.type == "exec" and session.jar_id is not None and not session.allow_exec:
                 raise AuthorizationError("exec is denied in a jar-loaded session unless allow_exec was set")
+            # Read-back protection. exec and extract both hand the raw DOM (a filled password
+            # field included) straight to the model, so neither exists in an authenticated-site
+            # session — jar or no jar, and with no opt-in.
+            if session.authenticated_site and req.type in AUTHENTICATED_SITE_DENIED_COMMANDS:
+                raise AuthorizationError(f"{req.type} is denied in an authenticated-site session")
+            if session.authenticated_site and _is_transfer_chord(req):
+                raise AuthorizationError(
+                    "clipboard and transfer key chords are denied in an authenticated-site session"
+                )
             # Per-command revocation recheck. In a multi-process deployment sharing the jar
             # directory, a revoke in another process cannot reach into this registry's in-memory
             # session set, so a jar-loaded (or jar-producing) session would keep serving an

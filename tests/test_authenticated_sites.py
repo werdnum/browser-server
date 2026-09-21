@@ -1,0 +1,339 @@
+"""Authenticated-site sessions: what creating one fixes, and what it takes away.
+
+The session type is the enforcement point, so these tests drive the HTTP API rather than the
+registry: every protection has to hold for a caller who asks for the opposite.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+from typing import cast
+
+import pytest
+from browser_handoff_service import main
+from browser_handoff_service.jars import JarStore, load_jar_keys
+from browser_handoff_service.main import app, registry
+from browser_handoff_service.runtime import FakeBrowserWorker
+from httpx import ASGITransport, AsyncClient
+
+TEST_SERVICE_TOKEN = "test-service-token"
+
+SITE = "https://shop.example.com"
+AUX = "https://auth.example.com"
+
+LOGIN_STATE = {
+    "cookies": [{"name": "sid", "value": "SESSION", "domain": "shop.example.com", "path": "/", "expires": -1}],
+    "origins": [],
+}
+
+
+@pytest.fixture(autouse=True)
+def fake_runtime(monkeypatch):
+    monkeypatch.setenv("BROWSER_RUNTIME", "fake")
+    monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", TEST_SERVICE_TOKEN)
+
+
+@pytest.fixture(autouse=True)
+def clear_registry():
+    original_store = registry.jar_store
+    for attr in ("sessions", "locks", "events", "tokens", "workers", "jar_locks"):
+        getattr(registry, attr).clear()
+    main._jwks_client = None
+    yield
+    for attr in ("sessions", "locks", "events", "tokens", "workers", "jar_locks"):
+        getattr(registry, attr).clear()
+    registry.jar_store = original_store
+    main._jwks_client = None
+
+
+def client() -> AsyncClient:
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")
+
+
+def agent_headers() -> dict[str, str]:
+    return {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+
+
+def enable_jars(tmp_path) -> JarStore:
+    os.environ["BROWSER_JAR_KEY"] = base64.urlsafe_b64encode(os.urandom(32)).decode()
+    keys = load_jar_keys()
+    os.environ.pop("BROWSER_JAR_KEY", None)
+    store = JarStore(tmp_path / "jars", keys=keys)
+    registry.jar_store = store
+    return store
+
+
+def oidc_headers(monkeypatch, subject: str = "user123") -> dict[str, str]:
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_JWKS_URL", "http://testserver/.well-known/jwks.json")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_AUDIENCE", "test-audience")
+    monkeypatch.setenv("BROWSER_HANDOFF_OIDC_ISSUER", "test-issuer")
+
+    class MockSigningKey:
+        key = "secret_key"
+
+    class MockJWKClient:
+        def get_signing_key_from_jwt(self, token):
+            return MockSigningKey()
+
+    def mock_decode(token, key, algorithms, audience, issuer, options, leeway):
+        if token.startswith("oidc-"):
+            return {"sub": token[len("oidc-") :]}
+        raise main.jwt.InvalidTokenError("invalid token")
+
+    monkeypatch.setattr(main.jwt, "PyJWKClient", lambda url: MockJWKClient())
+    monkeypatch.setattr(main.jwt, "decode", mock_decode)
+    return {"authorization": f"Bearer oidc-{subject}"}
+
+
+async def _save_jar(ac, monkeypatch, nav_allowlist: list[str] | None = None) -> dict:
+    headers = oidc_headers(monkeypatch)
+    resp = await ac.post("/v1/sessions", json={"conversation_id": "c0", "initial_owner": "human"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    worker = cast(FakeBrowserWorker, registry.workers[body["worker_id"]])
+    worker.url = f"{SITE}/account"
+    worker.storage_state = LOGIN_STATE
+    save = await ac.post(
+        f"/v1/sessions/{body['session_id']}/save-jar",
+        json={
+            "label": "Shop",
+            "token": body["control_token"],
+            "origins": [SITE],
+            "nav_allowlist": nav_allowlist or [],
+            "probe": {"logged_in_selector": "[data-testid=logout]"},
+        },
+    )
+    assert save.status_code == 200, save.text
+    return save.json()
+
+
+async def _authenticated_session(ac, **overrides) -> dict:
+    payload = {
+        "conversation_id": "c1",
+        "authenticated_site": True,
+        "confine_origins": [SITE],
+        "credential_alias": "shop-login",
+    }
+    payload.update(overrides)
+    resp = await ac.post("/v1/sessions", json=payload, headers=agent_headers())
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+# --- session creation -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_jarless_authenticated_session_reports_and_enforces_its_confinement():
+    async with client() as ac:
+        session = await _authenticated_session(ac, confine_origins=[f"{SITE}/login?next=1", AUX])
+        # The record states the set actually enforced, normalized, so the creator can verify it.
+        assert session["confine_origins"] == [SITE, AUX]
+        assert session["authenticated_site"] is True
+        assert session["confine_navigation"] is True
+        assert session["allow_exec"] is False
+        assert session["credential_alias"] == "shop-login"
+        assert session["jar_id"] is None
+
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        assert worker.confine_origins == [SITE, AUX]
+        blocked = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "navigate", "args": {"url": "https://evil.example.com/"}},
+            headers=agent_headers(),
+        )
+        assert blocked.json()["result"]["blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_jarless_confinement_matches_a_jar_loaded_session(tmp_path, monkeypatch):
+    """The jarless path is the same route guard, not a second implementation."""
+    enable_jars(tmp_path)
+    async with client() as ac:
+        meta = await _save_jar(ac, monkeypatch, nav_allowlist=[AUX])
+        jar_session = await _authenticated_session(ac, jar_id=meta["jar_id"], confine_origins=[SITE, AUX])
+        jarless = await _authenticated_session(ac, confine_origins=[SITE, AUX])
+        assert jar_session["confine_origins"] == jarless["confine_origins"] == [SITE, AUX]
+        for session in (jar_session, jarless):
+            worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+            assert worker.confine_origins == [SITE, AUX]
+            for url, expect_blocked in ((f"{AUX}/sso", False), ("https://evil.example.com/", True)):
+                resp = await ac.post(
+                    f"/v1/sessions/{session['session_id']}/agent-command",
+                    json={"type": "navigate", "args": {"url": url}},
+                    headers=agent_headers(),
+                )
+                assert resp.json()["result"].get("blocked", False) is expect_blocked
+
+
+@pytest.mark.asyncio
+async def test_jar_and_explicit_confinement_must_agree(tmp_path, monkeypatch):
+    enable_jars(tmp_path)
+    async with client() as ac:
+        meta = await _save_jar(ac, monkeypatch, nav_allowlist=[AUX])
+        mismatch = await ac.post(
+            "/v1/sessions",
+            json={
+                "conversation_id": "c1",
+                "authenticated_site": True,
+                "jar_id": meta["jar_id"],
+                # Missing the jar's nav allowlist entry: the caller verified a narrower set than
+                # the session would actually enforce.
+                "confine_origins": [SITE],
+            },
+            headers=agent_headers(),
+        )
+        assert mismatch.status_code == 400
+        assert "confinement mismatch" in mismatch.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({"authenticated_site": True, "allow_exec": True, "confine_origins": [SITE]}, "allow_exec"),
+        (
+            {"authenticated_site": True, "confine_navigation": False, "confine_origins": [SITE]},
+            "confine_navigation",
+        ),
+        ({"authenticated_site": True}, "confine_origins"),
+        ({"authenticated_site": True, "confine_origins": []}, "confine_origins"),
+        ({"confine_origins": [SITE]}, "confine_origins requires authenticated_site"),
+        ({"credential_alias": "x"}, "credential_alias requires authenticated_site"),
+        ({"authenticated_site": True, "confine_origins": ["not-an-origin"]}, "not an exact origin"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_incoherent_authenticated_site_requests_are_rejected(payload, detail):
+    async with client() as ac:
+        resp = await ac.post("/v1/sessions", json={"conversation_id": "c1", **payload}, headers=agent_headers())
+        assert resp.status_code == 400, resp.text
+        assert detail in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_callers_cannot_create_authenticated_site_sessions(monkeypatch):
+    async with client() as ac:
+        headers = oidc_headers(monkeypatch)
+        for payload in (
+            {"authenticated_site": True, "confine_origins": [SITE]},
+            {"credential_alias": "shop-login"},
+            {"confine_origins": [SITE]},
+        ):
+            resp = await ac.post("/v1/sessions", json={"conversation_id": "c1", **payload}, headers=headers)
+            assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_human_handoff_keeps_the_session_confined():
+    """A parked authenticated-site session is still origin-confined; nothing widens it."""
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        resp = await ac.post(
+            f"/v1/sessions/{session['session_id']}/handoff",
+            json={"reason": "captcha", "allowed_resume": "never"},
+            headers=agent_headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        assert worker._confinement_active is True
+
+
+# --- read-back protection -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_and_extract_are_denied_before_any_fill():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        for command in ({"type": "exec", "args": {"code": "document.cookie"}}, {"type": "extract", "args": {}}):
+            resp = await ac.post(
+                f"/v1/sessions/{session['session_id']}/agent-command", json=command, headers=agent_headers()
+            )
+            assert resp.status_code == 403, resp.text
+            assert "authenticated-site session" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("keys", "denied"),
+    [
+        ("Control+c", True),
+        ("Meta+V", True),
+        ("Control+x", True),
+        ("Control+Insert", True),
+        ("Shift+Insert", True),
+        ("Enter", False),
+        ("Control+a", False),
+        ("Tab", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transfer_chords_are_denied(keys, denied):
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        for command_type, arg in (("press_key", "key"), ("keyboard_press", "keys")):
+            resp = await ac.post(
+                f"/v1/sessions/{session['session_id']}/agent-command",
+                json={"type": command_type, "args": {arg: keys}},
+                headers=agent_headers(),
+            )
+            assert (resp.status_code == 403) is denied, resp.text
+
+
+@pytest.mark.asyncio
+async def test_typing_into_a_protected_control_is_still_allowed():
+    """Writing is not leaking: the fence is on moving a value out, not putting one in."""
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        worker.url = f"{SITE}/login"
+        await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "snapshot", "args": {}},
+            headers=agent_headers(),
+        )
+        resp = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "type_text", "args": {"ref": worker._ref, "text": "someone@example.com"}},
+            headers=agent_headers(),
+        )
+        assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_screenshots_mask_protected_controls():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        assert worker.mask_protected is True
+        ordinary = await ac.post("/v1/sessions", json={"conversation_id": "c2"}, headers=agent_headers())
+        assert cast(FakeBrowserWorker, registry.workers[ordinary.json()["worker_id"]]).mask_protected is False
+
+
+@pytest.mark.asyncio
+async def test_a_password_field_is_masked_in_every_snapshot():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        worker.url = f"{SITE}/login"
+        worker.autofill_fields = [
+            {"ref": "e40", "input_type": "email", "name": "Email"},
+            {"ref": "e41", "input_type": "password", "name": "Password"},
+        ]
+        worker.filled = [
+            {"ref": "e40", "kind": "username", "value": "someone@example.com"},
+            {"ref": "e41", "kind": "password", "value": "hunter2"},
+        ]
+        resp = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "snapshot", "args": {}},
+            headers=agent_headers(),
+        )
+        assert resp.status_code == 200, resp.text
+        assert "hunter2" not in resp.text
+        nodes = {node["ref"]: node for node in resp.json()["result"]["roots"] if node["ref"].startswith("e4")}
+        assert nodes["e41"]["value_masked"] is True
+        assert nodes["e41"]["has_value"] is True
+        assert "value" not in nodes["e41"]
+        # An ordinary field is untouched: blanket masking buys nothing and costs the task.
+        assert nodes["e40"]["value"] == "someone@example.com"

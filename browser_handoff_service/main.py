@@ -912,6 +912,7 @@ async def create_session(
     # gate, so jar_id is rejected for OIDC callers.
     if req.jar_id is not None and auth.actor_type != "agent":
         raise HTTPException(status_code=403, detail="loading a saved session requires the service token")
+    _validate_authenticated_site_request(req, auth)
     # Resolve (and validate) the public base URL before launching a browser, so a
     # misconfigured BROWSER_HANDOFF_PUBLIC_URL fails fast instead of leaking a started session.
     base_url = public_base_url(request).rstrip("/")
@@ -929,6 +930,39 @@ async def create_session(
     response["control_token"] = control_token
     response["session_url"] = f"{base_url}/sessions/{session.session_id}?token={control_token}"
     return response
+
+
+# Fields that mark (and parameterize) an authenticated-site session. Like jar_id they are the
+# trusted-orchestration path only: a direct OIDC human must not be able to mint a session that
+# claims an alias or an arbitrary confinement set.
+_AUTHENTICATED_SITE_FIELDS = ("authenticated_site", "confine_origins", "credential_alias")
+
+
+def _validate_authenticated_site_request(req: CreateSessionRequest, auth: AuthContext) -> None:
+    """Reject every authenticated-site request shape that would widen the session.
+
+    Each check is a 400 for a combination whose only coherent reading is "the caller wanted a
+    protection turned off"; silently winning either way is what this refuses to do."""
+    requested = [name for name in _AUTHENTICATED_SITE_FIELDS if name in req.model_fields_set]
+    if requested and auth.actor_type != "agent":
+        raise HTTPException(status_code=403, detail="authenticated-site sessions require the service token")
+    if not req.authenticated_site:
+        if req.confine_origins is not None:
+            raise HTTPException(status_code=400, detail="confine_origins requires authenticated_site")
+        if req.credential_alias is not None:
+            raise HTTPException(status_code=400, detail="credential_alias requires authenticated_site")
+        return
+    if req.allow_exec:
+        raise HTTPException(status_code=400, detail="allow_exec cannot be combined with authenticated_site")
+    if req.confine_navigation is False:
+        raise HTTPException(
+            status_code=400, detail="confine_navigation cannot be disabled for an authenticated_site session"
+        )
+    if req.jar_id is None and not req.confine_origins:
+        raise HTTPException(
+            status_code=400,
+            detail="a jarless authenticated_site session must supply a non-empty confine_origins",
+        )
 
 
 @app.get("/v1/sessions/{session_id}", dependencies=[Depends(require_service_auth)])

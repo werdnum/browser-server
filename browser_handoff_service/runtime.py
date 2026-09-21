@@ -268,7 +268,16 @@ _WALKER_HELPERS_JS = r"""
   const REF_ATTR = 'data-fa-ref';
   const ROLE_ATTR = 'data-fa-role';
   const NAME_ATTR = 'data-fa-name';
+  // A control whose value must never be copied into a snapshot: every password
+  // input, plus any element an autofill has touched (which keeps the stamp when
+  // a "show password" toggle changes the input's type).
+  const PROTECTED_ATTR = 'data-fa-protected';
   const REF_PATTERN = /^e[0-9]+$/;
+
+  function isProtected(el) {
+    if (el.hasAttribute && el.hasAttribute(PROTECTED_ATTR)) return true;
+    return el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password';
+  }
 
   const ROLE_MAP = {
     A: 'link', BUTTON: 'button', SELECT: 'combobox',
@@ -419,8 +428,16 @@ SNAPSHOT_JS = (
       const node = { ref, role, name };
       const href = el.getAttribute('href');
       if (href) node.href = href;
-      const value = el.value;
-      if (typeof value === 'string' && value) node.value = value;
+      if (isProtected(el)) {
+        // Stamp on sight so the control stays protected after a type change, and
+        // report only whether it holds something — never what.
+        if (!el.hasAttribute(PROTECTED_ATTR)) el.setAttribute(PROTECTED_ATTR, '1');
+        node.value_masked = true;
+        node.has_value = typeof el.value === 'string' && el.value.length > 0;
+      } else {
+        const value = el.value;
+        if (typeof value === 'string' && value) node.value = value;
+      }
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
         node.tag = el.tagName.toLowerCase();
         const t = el.getAttribute('type');
@@ -468,6 +485,185 @@ CHECK_REF_JS = (
 }
 """
 )
+
+
+# Autofill target selection and filling, in the page. Both scripts run in the MAIN FRAME only —
+# V1 does not fill inside an iframe, and an out-of-frame target is reported as such rather than
+# guessed at.
+#
+# The nonce pins the document: ``prepare`` stamps it on documentElement and ``apply`` refuses
+# unless the same document, at the same origin, is still there with the same elements attached.
+# A navigation replaces documentElement and takes the nonce with it.
+_AUTOFILL_HELPERS_JS = r"""
+  const TARGET_ATTR = 'data-fa-autofill-target';
+  const PROTECTED_ATTR = 'data-fa-protected';
+  const NONCE_KEY = 'faAutofillNonce';
+  const IDENTIFIER_TYPES = new Set(['text', 'email', 'tel']);
+
+  function visible(el) {
+    if (!el.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return false;
+    const style = window.getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.display !== 'none';
+  }
+
+  function inputType(el) {
+    return (el.getAttribute('type') || 'text').toLowerCase();
+  }
+
+  function autocompleteOf(el) {
+    return (el.getAttribute('autocomplete') || '').trim().toLowerCase();
+  }
+
+  function isPasswordField(el) {
+    return el.tagName === 'INPUT' && (inputType(el) === 'password' || el.hasAttribute(PROTECTED_ATTR));
+  }
+
+  function isNewPassword(el) {
+    const hint = autocompleteOf(el);
+    return hint === 'new-password' || hint.split(/\s+/).includes('new-password');
+  }
+
+  function isIdentifierField(el) {
+    return el.tagName === 'INPUT' && IDENTIFIER_TYPES.has(inputType(el));
+  }
+
+  // Why this element cannot take a fill of ``kind``, or null when it can.
+  function unfillable(el, kind) {
+    if (!el || el.nodeType !== 1) return 'no_eligible_field';
+    if (!el.isConnected || !visible(el)) return 'no_eligible_field';
+    if (el.disabled || el.readOnly) return 'no_eligible_field';
+    if (kind === 'password') {
+      if (!isPasswordField(el)) return 'no_eligible_field';
+      if (isNewPassword(el)) return 'new_password_field';
+      return null;
+    }
+    if (!isIdentifierField(el)) return 'no_eligible_field';
+    return null;
+  }
+
+  function describe(el, kind) {
+    const ref = el.getAttribute('data-fa-ref');
+    return { ref: ref && /^e[0-9]+$/.test(ref) ? ref : null, kind };
+  }
+"""
+
+# ``({fields, nonce}) => {ok, origin, targets} | {error}``. ``fields`` is a list of
+# ``{ref, kind}`` or null for auto-detection.
+AUTOFILL_PREPARE_JS = (
+    "(args) => {"
+    + _AUTOFILL_HELPERS_JS
+    + r"""
+  const fail = (reason) => ({ error: true, reason, origin: location.origin, url: location.href });
+  for (const stale of document.querySelectorAll('[' + TARGET_ATTR + ']')) stale.removeAttribute(TARGET_ATTR);
+
+  const chosen = [];
+  if (args.fields && args.fields.length) {
+    for (const field of args.fields) {
+      let el = null;
+      if (field.ref) {
+        const carriers = document.querySelectorAll('[data-fa-ref="' + field.ref + '"]');
+        if (carriers.length !== 1) return fail('stale_ref');
+        el = carriers[0];
+      } else {
+        return fail('no_eligible_field');
+      }
+      const why = unfillable(el, field.kind);
+      if (why) return fail(why);
+      chosen.push([el, field.kind]);
+    }
+  } else {
+    const passwords = [];
+    for (const el of document.querySelectorAll('input')) {
+      if (!visible(el) || el.disabled || el.readOnly) continue;
+      if (isPasswordField(el) && !isNewPassword(el)) passwords.push(el);
+    }
+    if (passwords.length > 1) return fail('ambiguous_fields');
+    let identifier = null;
+    const hinted = [];
+    const plain = [];
+    for (const el of document.querySelectorAll('input')) {
+      if (!visible(el) || el.disabled || el.readOnly || !isIdentifierField(el)) continue;
+      if (autocompleteOf(el).split(/\s+/).includes('username')) hinted.push(el);
+      else plain.push(el);
+    }
+    if (hinted.length === 1) identifier = hinted[0];
+    else if (hinted.length === 0 && plain.length === 1) identifier = plain[0];
+    if (passwords.length === 1) {
+      if (identifier) chosen.push([identifier, 'username']);
+      chosen.push([passwords[0], 'password']);
+    } else if (identifier) {
+      chosen.push([identifier, 'username']);
+    } else {
+      return fail('no_eligible_field');
+    }
+  }
+
+  const targets = [];
+  for (let i = 0; i < chosen.length; i++) {
+    const [el, kind] = chosen[i];
+    el.setAttribute(TARGET_ATTR, String(i));
+    targets.push(Object.assign({ slot: String(i) }, describe(el, kind)));
+  }
+  document.documentElement.dataset[NONCE_KEY] = args.nonce;
+  return { ok: true, origin: location.origin, url: location.href, targets };
+}
+"""
+)
+
+# ``({nonce, origin, slots}) => {ok} | {error}``. Re-checks the pinned document and every
+# target, then reports which slots are still fillable. The values themselves never travel
+# through page script: Playwright's ``locator.fill`` places them.
+AUTOFILL_VERIFY_JS = (
+    "(args) => {"
+    + _AUTOFILL_HELPERS_JS
+    + r"""
+  if (document.documentElement.dataset[NONCE_KEY] !== args.nonce) return { error: true, reason: 'target_invalidated' };
+  if (location.origin !== args.origin) return { error: true, reason: 'target_invalidated' };
+  for (const slot of args.slots) {
+    const carriers = document.querySelectorAll('[' + TARGET_ATTR + '="' + slot.slot + '"]');
+    if (carriers.length !== 1) return { error: true, reason: 'target_invalidated' };
+    if (unfillable(carriers[0], slot.kind)) return { error: true, reason: 'target_invalidated' };
+  }
+  return { ok: true };
+}
+"""
+)
+
+# ``(slot) => void``. Stamps a filled control protected so the walker masks it from here on,
+# and drops the transient target marker.
+AUTOFILL_STAMP_JS = (
+    "(slot) => {"
+    + _AUTOFILL_HELPERS_JS
+    + r"""
+  for (const el of document.querySelectorAll('[' + TARGET_ATTR + '="' + slot + '"]')) {
+    el.setAttribute(PROTECTED_ATTR, '1');
+    el.removeAttribute(TARGET_ATTR);
+  }
+}
+"""
+)
+
+# ``(ref) => bool``. Read-only: does THIS frame hold the addressed ref, or (with no ref) a
+# fillable login control? Used only to answer "the target is in an iframe" honestly instead of
+# reporting a main-frame miss.
+AUTOFILL_PROBE_JS = (
+    "(ref) => {"
+    + _AUTOFILL_HELPERS_JS
+    + r"""
+  if (ref) return document.querySelectorAll('[data-fa-ref="' + ref + '"]').length === 1;
+  for (const el of document.querySelectorAll('input')) {
+    if (!visible(el) || el.disabled || el.readOnly) continue;
+    if (isPasswordField(el) && !isNewPassword(el)) return true;
+  }
+  return false;
+}
+"""
+)
+
+# Everything a screenshot must not show in an authenticated-site session.
+PROTECTED_SELECTOR = "[data-fa-protected], input[type=password]"
 
 _REF_PATTERN = re.compile(r"e[0-9]+")
 # The walker increments the counter in JavaScript, which stops advancing exactly past 2**53 - 1.
@@ -548,6 +744,10 @@ class BrowserRuntime(Protocol):
     def set_confinement_active(self, enabled: bool) -> None: ...
     def set_confine_origins(self, origins: list[str]) -> None: ...
     async def evict_off_scope_page(self) -> None: ...
+    async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]: ...
+    async def autofill_fill(
+        self, nonce: str, origin: str, targets: list[dict[str, Any]], values: dict[str, str]
+    ) -> dict[str, Any]: ...
 
 
 class FakeBrowserWorker:
@@ -558,6 +758,7 @@ class FakeBrowserWorker:
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
         timezone_id: str | None = None,
+        mask_protected: bool = False,
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
@@ -592,6 +793,16 @@ class FakeBrowserWorker:
         # caller's counter, and no number is ever issued twice by this worker.
         self._ref: str | None = None
         self._highest_ref = 0
+        # Autofill fixtures. Each entry describes one control the fake "page" holds:
+        # {"ref", "kind" (the kind it can take), "input_type", "autocomplete", "iframe",
+        #  "visible", "name"}. ``filled`` records what a fill placed, so a test can assert both
+        # that the value reached the control AND that it appears in nothing the API returned.
+        self.autofill_fields: list[dict[str, Any]] = []
+        self.filled: list[dict[str, str]] = []
+        self.protected_refs: set[str] = set()
+        self.mask_protected = mask_protected
+        self._autofill_nonce: str | None = None
+        self._autofill_targets: list[dict[str, Any]] = []
 
     async def _ucp_fetch(self, url: str) -> Any:
         return self.ucp_documents.get(url)
@@ -675,6 +886,8 @@ class FakeBrowserWorker:
             self.url = target
             self.title = f"Fixture page at {redact_url(target)[1] or target}"
             self._ref = None
+            # A new document takes the autofill nonce with it, exactly as the real one does.
+            self._autofill_nonce = None
             return {"url": redact_url(target)[0], "title": self.title}
         if request.type in {"click", "type_text", "select", "press_key"}:
             raw_ref = request.args.get("ref") if request.type != "press_key" else None
@@ -696,7 +909,7 @@ class FakeBrowserWorker:
                 "forms": 0,
                 "elements": 1,
                 "next_ref": max(next_ref, int(ref[1:]) + 1),
-                "roots": [{"ref": ref, "role": "document", "name": self.title}],
+                "roots": [{"ref": ref, "role": "document", "name": self.title}, *self._snapshot_fields()],
             }
             hint = await self._ucp.snapshot_hint(self.url)
             if hint is not None:
@@ -740,6 +953,104 @@ class FakeBrowserWorker:
             return {"closed": True, "url": None, "title": self.title}
         raise ValueError(f"unsupported command {request.type}")
 
+    def _snapshot_fields(self) -> list[dict[str, Any]]:
+        """The fake page's controls as the walker would list them: a protected control reports
+        whether it holds a value, never the value."""
+        nodes: list[dict[str, Any]] = []
+        for field in self.autofill_fields:
+            if field.get("iframe") or not field.get("visible", True):
+                continue
+            ref = str(field["ref"])
+            node: dict[str, Any] = {
+                "ref": ref,
+                "role": "textbox",
+                "name": field.get("name", ""),
+                "tag": "input",
+                "input_type": field.get("input_type", "text"),
+            }
+            value = next((entry["value"] for entry in self.filled if entry["ref"] == ref), None)
+            if field.get("input_type") == "password" or ref in self.protected_refs:
+                node["value_masked"] = True
+                node["has_value"] = value is not None
+            elif value is not None:
+                node["value"] = value
+            nodes.append(node)
+        return nodes
+
+    def _autofill_unfillable(self, field: dict[str, Any], kind: str) -> str | None:
+        if not field.get("visible", True):
+            return "no_eligible_field"
+        if kind == "password":
+            if field.get("input_type") != "password" and str(field["ref"]) not in self.protected_refs:
+                return "no_eligible_field"
+            if field.get("autocomplete") == "new-password":
+                return "new_password_field"
+            return None
+        if field.get("input_type") not in {"text", "email", "tel"}:
+            return "no_eligible_field"
+        return None
+
+    async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]:
+        origin = origin_of(self.url)
+        by_ref = {str(f["ref"]): f for f in self.autofill_fields}
+        fail = lambda reason: {"error": True, "reason": reason, "origin": origin, "url": self.url}  # noqa: E731
+        chosen: list[tuple[dict[str, Any], str]] = []
+        if fields:
+            for spec in fields:
+                ref = spec.get("ref")
+                if not ref:
+                    return fail("no_eligible_field")
+                field = by_ref.get(str(ref))
+                if field is None:
+                    return fail("stale_ref")
+                if field.get("iframe"):
+                    return fail("in_iframe")
+                why = self._autofill_unfillable(field, str(spec["kind"]))
+                if why:
+                    return fail(why)
+                chosen.append((field, str(spec["kind"])))
+        else:
+            main = [f for f in self.autofill_fields if not f.get("iframe") and f.get("visible", True)]
+            passwords = [
+                f for f in main if f.get("input_type") == "password" and f.get("autocomplete") != "new-password"
+            ]
+            if len(passwords) > 1:
+                return fail("ambiguous_fields")
+            identifiers = [f for f in main if f.get("input_type") in {"text", "email", "tel"}]
+            hinted = [f for f in identifiers if f.get("autocomplete") == "username"]
+            identifier = hinted[0] if len(hinted) == 1 else (identifiers[0] if len(identifiers) == 1 else None)
+            if len(passwords) == 1:
+                if identifier is not None:
+                    chosen.append((identifier, "username"))
+                chosen.append((passwords[0], "password"))
+            elif identifier is not None:
+                chosen.append((identifier, "username"))
+            else:
+                framed = [f for f in self.autofill_fields if f.get("iframe") and f.get("input_type") == "password"]
+                return fail("in_iframe" if framed else "no_eligible_field")
+        self._autofill_nonce = nonce
+        self._autofill_targets = [
+            {"slot": str(index), "ref": str(field["ref"]), "kind": kind} for index, (field, kind) in enumerate(chosen)
+        ]
+        return {"ok": True, "origin": origin, "url": self.url, "targets": list(self._autofill_targets)}
+
+    async def autofill_fill(
+        self, nonce: str, origin: str, targets: list[dict[str, Any]], values: dict[str, str]
+    ) -> dict[str, Any]:
+        if self._autofill_nonce != nonce or origin_of(self.url) != origin:
+            return {"error": True, "reason": "target_invalidated"}
+        filled: list[dict[str, Any]] = []
+        for target in targets:
+            value = values.get(str(target["kind"]))
+            if value is None:
+                continue
+            ref = str(target["ref"])
+            self.filled = [entry for entry in self.filled if entry["ref"] != ref]
+            self.filled.append({"ref": ref, "kind": str(target["kind"]), "value": value})
+            self.protected_refs.add(ref)
+            filled.append({"ref": ref, "kind": target["kind"]})
+        return {"ok": True, "filled": filled}
+
     async def close(self) -> None:
         self.closed = True
 
@@ -760,6 +1071,7 @@ class PlaywrightBrowserWorker:
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
         timezone_id: str | None = None,
+        mask_protected: bool = False,
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
@@ -776,6 +1088,8 @@ class PlaywrightBrowserWorker:
         # Confinement gates only *agent-driven* navigation; it is disabled while a human holds
         # the control token (a human re-login may bounce through an off-scope IdP/SSO origin).
         self._confinement_active = True
+        # Authenticated-site read-back protection: screenshots mask every protected control.
+        self.mask_protected = mask_protected
         # Set by the route guard to the off-scope origin it aborted during the current navigation, so
         # a goto failure can tell an off-scope-redirect block from an in-scope network outage (both
         # can surface as net::ERR_FAILED). Reset before each navigate.
@@ -1212,7 +1526,12 @@ class PlaywrightBrowserWorker:
                 result["ucp"] = hint
             return result
         if request.type == "screenshot":
-            png = await page.screenshot(type="png", full_page=False)
+            if self.mask_protected:
+                # A revealed ("show password") field is a picture of the secret, so the pixels
+                # are masked at the capture itself rather than after the fact.
+                png = await page.screenshot(type="png", full_page=False, mask=[page.locator(PROTECTED_SELECTOR)])
+            else:
+                png = await page.screenshot(type="png", full_page=False)
             return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}
         if request.type == "extract":
             selector = request.args.get("selector")
@@ -1298,6 +1617,84 @@ class PlaywrightBrowserWorker:
             await page.goto("about:blank")
             return {"closed": True, "url": None, "title": "Blank"}
         raise ValueError(f"unsupported command {request.type}")
+
+    async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]:
+        """Choose the fill targets on the current main-frame document and pin it with ``nonce``.
+
+        Main frame only: a target that exists solely in a child frame is reported ``in_iframe``
+        rather than silently missed, because "not here" and "here but out of scope" are different
+        answers to the agent."""
+        from patchright.async_api import Error as PlaywrightError
+
+        page = self._page
+        if self.closed or page is None:
+            raise RuntimeError("worker is closed")
+        try:
+            result = cast(dict[str, Any], await page.evaluate(AUTOFILL_PREPARE_JS, {"fields": fields, "nonce": nonce}))
+        except PlaywrightError:
+            # The document went away under the check; there is nothing left to bind to.
+            return {"error": True, "reason": "target_invalidated"}
+        if result.get("error") and str(result.get("reason")) in {"no_eligible_field", "stale_ref"}:
+            ref = next((spec.get("ref") for spec in (fields or []) if spec.get("ref")), None)
+            if await self._autofill_in_child_frame(page, ref):
+                return {"error": True, "reason": "in_iframe", "origin": result.get("origin")}
+        return result
+
+    async def _autofill_in_child_frame(self, page: Any, ref: str | None) -> bool:
+        """Whether a child frame holds what the main frame did not. Read-only."""
+        from patchright.async_api import Error as PlaywrightError
+
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            try:
+                if bool(await frame.evaluate(AUTOFILL_PROBE_JS, ref)):
+                    return True
+            except PlaywrightError:
+                continue
+        return False
+
+    async def autofill_fill(
+        self, nonce: str, origin: str, targets: list[dict[str, Any]], values: dict[str, str]
+    ) -> dict[str, Any]:
+        """Re-verify the pinned document and fill. Anything that moved is ``target_invalidated``.
+
+        The values never pass through page script: ``locator.fill`` sets them, and each filled
+        control is stamped protected before this returns, so the very next observation masks it."""
+        from patchright.async_api import Error as PlaywrightError
+
+        page = self._page
+        if self.closed or page is None:
+            raise RuntimeError("worker is closed")
+        slots = [{"slot": str(target["slot"]), "kind": str(target["kind"])} for target in targets]
+        try:
+            verified = cast(
+                dict[str, Any],
+                await page.evaluate(AUTOFILL_VERIFY_JS, {"nonce": nonce, "origin": origin, "slots": slots}),
+            )
+        except PlaywrightError:
+            return {"error": True, "reason": "target_invalidated"}
+        if not verified.get("ok"):
+            return {"error": True, "reason": str(verified.get("reason") or "target_invalidated")}
+        filled: list[dict[str, Any]] = []
+        for target in targets:
+            value = values.get(str(target["kind"]))
+            if value is None:
+                continue
+            slot = str(target["slot"])
+            locator = page.locator(f'[data-fa-autofill-target="{slot}"]')
+            try:
+                await locator.fill(value)
+                await page.evaluate(AUTOFILL_STAMP_JS, slot)
+            except PlaywrightError:
+                # Stamp anyway where we can: a partially applied fill must still be masked.
+                try:
+                    await page.evaluate(AUTOFILL_STAMP_JS, slot)
+                except PlaywrightError:
+                    pass
+                return {"error": True, "reason": "target_invalidated", "filled": filled}
+            filled.append({"ref": target.get("ref"), "kind": target["kind"]})
+        return {"ok": True, "filled": filled}
 
     async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]:
         """Export the context's storage_state (cookies + localStorage + IndexedDB).
@@ -1613,6 +2010,7 @@ def make_worker(
     storage_state: dict[str, Any] | None = None,
     confine_origins: list[str] | None = None,
     timezone_id: str | None = None,
+    mask_protected: bool = False,
 ) -> BrowserRuntime:
     runtime = os.environ.get("BROWSER_RUNTIME", "playwright").lower()
     # Fall back to the operator-level default timezone when the caller did not request
@@ -1624,6 +2022,7 @@ def make_worker(
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=resolved_timezone_id,
+            mask_protected=mask_protected,
         )
     return PlaywrightBrowserWorker(
         worker_id,
@@ -1634,6 +2033,7 @@ def make_worker(
         storage_state=storage_state,
         confine_origins=confine_origins,
         timezone_id=resolved_timezone_id,
+        mask_protected=mask_protected,
     )
 
 
