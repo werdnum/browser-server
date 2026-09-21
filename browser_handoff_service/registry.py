@@ -747,7 +747,9 @@ class SessionRegistry:
         if session.autofill_bad_password:
             return autofill_refused("bad_password_recorded", "a bad password was reported for this session")
         if session.autofill_fill_count >= AUTOFILL_FILL_CAP:
-            return autofill_refused("fill_cap_reached", f"this session has already filled {AUTOFILL_FILL_CAP} times")
+            return autofill_refused(
+                "fill_cap_reached", f"this session has already consumed {AUTOFILL_FILL_CAP} credential grants"
+            )
         worker = self.workers.get(session.worker_id or "")
         if worker is None or worker.closed:
             raise ConflictError("worker is not available")

@@ -185,9 +185,8 @@ async def test_a_filled_username_is_masked_but_is_still_not_a_password_field(wor
     Deriving "this is a password field" from the masking stamp makes an autofilled username look
     like a second password on the next auto-detect."""
     await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{page_server}/login"}))
-    await worker._page.set_content(
-        '<input type="email" autocomplete="username" data-fa-ref="e1"><input type="password" data-fa-ref="e2">'
-    )
+    await worker._page.set_content('<input type="email" autocomplete="username"><input type="password">')
+    await _snapshot(worker)
     await _fill_username(worker, "e1", "nonce-u1")
 
     prepared = await worker.autofill_prepare(None, "nonce-u2")
@@ -203,7 +202,8 @@ async def test_a_filled_username_is_masked_but_is_still_not_a_password_field(wor
 @pytest.mark.asyncio
 async def test_a_username_only_form_does_not_become_its_own_password_field(worker, page_server):
     await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{page_server}/login"}))
-    await worker._page.set_content('<input type="email" autocomplete="username" data-fa-ref="e1">')
+    await worker._page.set_content('<input type="email" autocomplete="username">')
+    await _snapshot(worker)
     await _fill_username(worker, "e1", "nonce-s1")
 
     prepared = await worker.autofill_prepare(None, "nonce-s2")
@@ -216,7 +216,8 @@ async def test_a_password_fill_survives_a_show_password_toggle_as_a_password_fie
     """The converse mark: a filled password stays a password field when the page flips its type,
     and does not become an identifier candidate."""
     await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{page_server}/login"}))
-    await worker._page.set_content('<input type="password" data-fa-ref="e1">')
+    await worker._page.set_content('<input type="password">')
+    await _snapshot(worker)
     prepared = await worker.autofill_prepare([{"ref": "e1", "kind": "password"}], "nonce-p1")
     assert prepared.get("ok"), prepared
     assert (await worker.autofill_fill("nonce-p1", prepared["origin"], prepared["targets"], {"password": SECRET})).get(
@@ -227,3 +228,32 @@ async def test_a_password_fill_survives_a_show_password_toggle_as_a_password_fie
     again = await worker.autofill_prepare(None, "nonce-p2")
     assert again.get("ok"), again
     assert [(target["ref"], target["kind"]) for target in again["targets"]] == [("e1", "password")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "() => document.querySelector('label[for=pw]').textContent = 'New password'",
+        "() => document.querySelector('#pw').setAttribute('role', 'searchbox')",
+    ],
+)
+@pytest.mark.parametrize("when", ["before_prepare", "before_verify"])
+async def test_autofill_rejects_a_repurposed_snapshot_ref(worker, page_server, mutation, when):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{page_server}/login"}))
+    snapshot = await _snapshot(worker)
+    password_ref = _by_name(snapshot["roots"], "Password")["ref"]
+    fields = [{"ref": password_ref, "kind": "password"}]
+    if when == "before_prepare":
+        await worker._page.evaluate(mutation)
+        result = await worker.autofill_prepare(fields, "changed-field")
+        assert result.get("reason") == "stale_ref", result
+    else:
+        prepared = await worker.autofill_prepare(fields, "changed-field")
+        assert prepared.get("ok"), prepared
+        await worker._page.evaluate(mutation)
+        result = await worker.autofill_fill(
+            "changed-field", prepared["origin"], prepared["targets"], {"password": "replacement-secret"}
+        )
+        assert result.get("reason") == "target_invalidated", result
+        assert await worker._page.locator("#pw").input_value() == SECRET

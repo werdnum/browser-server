@@ -208,7 +208,8 @@ second visible password field is `ambiguous_fields`, not a guess). Refusal reaso
 `invalid_ref`.
 
 `POST /v1/sessions/{id}/autofill/outcome` with `{"outcome": "bad_password"}` latches the session:
-every later fill is refused. A per-session cap of 6 fills is the deterministic backstop behind it.
+every later fill is refused. A per-session cap of 6 credential reads is the deterministic backstop behind it, including reads
+whose subsequent fill fails.
 
 ### Handing out to a human and back
 

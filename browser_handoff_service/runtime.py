@@ -566,6 +566,9 @@ _AUTOFILL_HELPERS_JS = r"""
 AUTOFILL_PREPARE_JS = (
     "(args) => {"
     + _AUTOFILL_HELPERS_JS
+    + "const checkRef = "
+    + CHECK_REF_JS
+    + ";"
     + r"""
   const fail = (reason) => ({ error: true, reason, origin: location.origin, url: location.href });
   for (const stale of document.querySelectorAll('[' + TARGET_ATTR + ']')) stale.removeAttribute(TARGET_ATTR);
@@ -575,6 +578,7 @@ AUTOFILL_PREPARE_JS = (
     for (const field of args.fields) {
       let el = null;
       if (field.ref) {
+        if (!checkRef(field.ref).ok) return fail('stale_ref');
         const carriers = document.querySelectorAll('[data-fa-ref="' + field.ref + '"]');
         if (carriers.length !== 1) return fail('stale_ref');
         el = carriers[0];
@@ -630,12 +634,18 @@ AUTOFILL_PREPARE_JS = (
 AUTOFILL_VERIFY_JS = (
     "(args) => {"
     + _AUTOFILL_HELPERS_JS
+    + "const checkRef = "
+    + CHECK_REF_JS
+    + ";"
     + r"""
   if (document.documentElement.dataset[NONCE_KEY] !== args.nonce) return { error: true, reason: 'target_invalidated' };
   if (location.origin !== args.origin) return { error: true, reason: 'target_invalidated' };
   for (const slot of args.slots) {
     const carriers = document.querySelectorAll('[' + TARGET_ATTR + '="' + slot.slot + '"]');
     if (carriers.length !== 1) return { error: true, reason: 'target_invalidated' };
+    if (slot.ref && (carriers[0].getAttribute('data-fa-ref') !== slot.ref || !checkRef(slot.ref).ok)) {
+      return { error: true, reason: 'target_invalidated' };
+    }
     if (unfillable(carriers[0], slot.kind)) return { error: true, reason: 'target_invalidated' };
   }
   return { ok: true };
@@ -1690,7 +1700,9 @@ class PlaywrightBrowserWorker:
         page = self._page
         if self.closed or page is None:
             raise RuntimeError("worker is closed")
-        slots = [{"slot": str(target["slot"]), "kind": str(target["kind"])} for target in targets]
+        slots = [
+            {"slot": str(target["slot"]), "kind": str(target["kind"]), "ref": target.get("ref")} for target in targets
+        ]
         try:
             verified = cast(
                 dict[str, Any],
