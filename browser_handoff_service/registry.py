@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from .jars import (
@@ -15,15 +16,22 @@ from .jars import (
     normalize_origin,
     validate_jar_id,
 )
+from .keychute import KeychuteClient, KeychuteError, KeychuteNotConfigured
+from .keychute import zero as zero_secret
 from .models import (
     AGENT_COMMAND_STATES,
+    AUTOFILL_FILL_CAP,
     OBSERVATION_COMMANDS,
     TERMINAL_STATES,
     AgentCommandRequest,
     AgentCommandResponse,
+    AutofillRefusal,
+    AutofillRequest,
+    AutofillResponse,
     BrowserSession,
     CookieJarMeta,
     CreateSessionRequest,
+    FilledField,
     HandoffRequest,
     JarProbeConfig,
     LeaseOwner,
@@ -32,6 +40,7 @@ from .models import (
     SaveJarRequest,
     SessionEvent,
     SessionState,
+    autofill_refused,
     form_factor_profile,
     new_session,
     now_utc,
@@ -115,6 +124,51 @@ def _is_transfer_chord(req: AgentCommandRequest) -> bool:
     return base == "insert" and "shift" in modifiers
 
 
+# Every access request's TTL. Long enough for a human approval to land inside the park window,
+# short enough that an approved-but-unused grant is not a standing capability.
+AUTOFILL_REQUEST_TTL_SECONDS = 600
+
+# What each page-side refusal means, in words the agent can act on.
+_AUTOFILL_DETAILS = {
+    "no_eligible_field": "no visible login field on this page can take that fill",
+    "ambiguous_fields": "more than one password field is visible; address one by ref",
+    "new_password_field": "that field is a new-password/confirm field",
+    "in_iframe": "the field is inside an iframe; only the main frame can be filled",
+    "stale_ref": "that ref no longer names a field on this page",
+    "invalid_ref": "a ref looks like e12",
+    "target_invalidated": "the page changed under the request",
+}
+
+
+def _origin_host_port(origin: str) -> tuple[str, int | None]:
+    """Split a normalized origin into the host and explicit port Keychute constrains on."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(origin)
+    return (parts.hostname or "").lower(), parts.port
+
+
+def _parse_secret(secret: bytearray) -> dict[str, str]:
+    """Interpret a released payload: a JSON object with username/password, or a bare password.
+
+    The plaintext only becomes a str here, at the point of the fill, and the caller drops it
+    immediately afterwards."""
+    try:
+        decoded = json.loads(bytes(secret))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        decoded = None
+    if isinstance(decoded, dict):
+        values: dict[str, str] = {}
+        for kind in ("username", "password"):
+            value = decoded.get(kind)
+            if isinstance(value, str) and value:
+                values[kind] = value
+        if values:
+            return values
+    text = bytes(secret).decode("utf-8", errors="replace").strip()
+    return {"password": text} if text else {}
+
+
 def _normalized_confine_origins(values: list[str] | None) -> list[str] | None:
     """Normalize an explicit confinement set with the canonical origin normalizer.
 
@@ -154,6 +208,8 @@ class SessionRegistry:
         # Per-jar locks serialize load against invalidate/delete so a load cannot race a
         # concurrent revocation (see create_session's post-registration recheck).
         self.jar_locks: dict[str, asyncio.Lock] = {}
+        # Credential broker for autofill. Unconfigured => autofill refuses; injectable for tests.
+        self.keychute = KeychuteClient()
 
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
@@ -580,6 +636,178 @@ class SessionRegistry:
             session.updated_at = now_utc()
             self._event(session, "session_closed", "service")
             return session
+
+    # -- autofill -----------------------------------------------------------
+
+    async def record_autofill_outcome(self, session_id: str, outcome: str) -> BrowserSession:
+        """Latch a reported bad password. Every later fill in this session is refused.
+
+        One fill per grant read, and a read is not a login submission: without this latch a model
+        that misreads a failed login would keep asking for releases against a password that is
+        already known not to work."""
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if outcome == "bad_password":
+                session.autofill_bad_password = True
+                session.updated_at = now_utc()
+                self._event(session, "autofill_bad_password", "agent")
+            return session
+
+    async def autofill(self, session_id: str, req: AutofillRequest) -> AutofillResponse:
+        """Fill the session's pinned credential into the login form on the current document.
+
+        The whole resolve -> request -> wait -> verify -> read -> fill sequence holds the session
+        command lock, so nothing the agent does can move the page underneath it; the page itself
+        still can, which is what the document nonce catches."""
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if session.state in TERMINAL_STATES:
+                raise SessionInactiveError(f"session is no longer active ({session.state})")
+            if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+                raise AuthorizationError("autofill is denied unless the agent owns the lease")
+            await self._enforce_jar_not_revoked_locked(session)
+            response = await self._autofill_locked(session, req)
+            session.updated_at = now_utc()
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
+            self._event(
+                session,
+                "autofill",
+                "agent",
+                metadata={"status": response.status, "reason": response.reason, "step_key": req.step_key},
+            )
+            return response
+
+    async def _autofill_locked(self, session: BrowserSession, req: AutofillRequest) -> AutofillResponse:
+        if not session.authenticated_site:
+            return autofill_refused("not_authenticated_site", "autofill exists only in an authenticated-site session")
+        alias = session.credential_alias
+        if not alias:
+            return autofill_refused("no_alias", "this session has no credential pinned to it")
+        if session.autofill_bad_password:
+            return autofill_refused("bad_password_recorded", "a bad password was reported for this session")
+        if session.autofill_fill_count >= AUTOFILL_FILL_CAP:
+            return autofill_refused("fill_cap_reached", f"this session has already filled {AUTOFILL_FILL_CAP} times")
+        worker = self.workers.get(session.worker_id or "")
+        if worker is None or worker.closed:
+            raise ConflictError("worker is not available")
+
+        # 1. Pin the document and choose the targets. The origin is the document's own, never
+        #    anything the caller supplied.
+        nonce = uuid4().hex
+        fields = [field.model_dump() for field in req.fields] if req.fields else None
+        prepared = await worker.autofill_prepare(fields, nonce)
+        if prepared.get("error"):
+            reason = str(prepared.get("reason") or "no_eligible_field")
+            return autofill_refused(
+                cast(AutofillRefusal, reason),
+                _AUTOFILL_DETAILS.get(reason, "the requested field cannot take a fill"),
+                origin=prepared.get("origin"),
+            )
+        origin = _normalize_origin(str(prepared.get("origin") or ""))
+        targets = list(prepared.get("targets") or [])
+        if origin is None or origin not in set(session.confine_origins):
+            # Cannot happen while the route guard holds, so it is a fail-closed backstop rather
+            # than a routine outcome — about:blank reaches it too.
+            return autofill_refused(
+                "wrong_origin", "the current document is not inside this session's confinement set", origin=origin
+            )
+
+        if not self.keychute.configured:
+            return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
+
+        idempotency_key = f"{session.session_id}:{req.step_key}"
+        host, port = _origin_host_port(origin)
+        site = str((req.context or {}).get("site") or alias)
+        acting_user = str((req.context or {}).get("acting_user") or "the configured user")
+        try:
+            status = await self.keychute.create_access_request(
+                idempotency_key=idempotency_key,
+                secret_name=alias,
+                origin_host=host,
+                origin_port=port,
+                ttl_seconds=AUTOFILL_REQUEST_TTL_SECONDS,
+                # Deterministic for a given (session, step): the reason is part of Keychute's
+                # idempotency MAC, so a retry that reworded it would be a different request.
+                reason=f"Autofill {site} login on {origin} for {acting_user} (step {req.step_key})",
+                structured={
+                    **(req.context or {}),
+                    "session_id": session.session_id,
+                    "step_key": req.step_key,
+                    "origin": origin,
+                },
+            )
+            if status.state == "pending" and req.wait_seconds > 0:
+                status = await self.keychute.wait(status.request_id, req.wait_seconds)
+            if status.state == "pending":
+                session.autofill_pending[req.step_key] = status.request_id
+                approval_url = self.keychute.approval_url(status.request_id)
+                return AutofillResponse(
+                    status="approval_pending",
+                    request_id=status.request_id,
+                    origin=origin,
+                    detail=f"awaiting a release decision at {approval_url}"
+                    if approval_url
+                    else "awaiting a release decision",
+                )
+            session.autofill_pending.pop(req.step_key, None)
+            if status.state == "denied":
+                return autofill_refused("policy_denied", "the release was denied", origin=origin)
+            if status.state == "expired":
+                return autofill_refused("request_expired", "the release request expired", origin=origin)
+            if status.grant_id is None:
+                return autofill_refused("grant_invalid", "the release was approved without a grant", origin=origin)
+
+            # 2. Check the destination against what was GRANTED, which an approval may have
+            #    narrowed below what was asked for.
+            info = await self.keychute.grant_info(status.grant_id)
+            reference_now = info.server_time or now_utc()
+            if info.mechanism != "autofill" or info.revoked or info.not_after <= reference_now:
+                return autofill_refused("grant_invalid", "the grant is not usable", origin=origin)
+            if not any(granted.matches(host, port) for granted in info.origins):
+                return autofill_refused(
+                    "wrong_origin", "the granted capability does not cover this document's origin", origin=origin
+                )
+
+            # 3. Re-verify the pinned document BEFORE spending the grant's single read: a site
+            #    can navigate itself while an approval is outstanding.
+            verified = await worker.autofill_fill(nonce, origin, targets, {})
+            if verified.get("error"):
+                return autofill_refused(
+                    "target_invalidated", "the page changed while the release was decided", origin=origin
+                )
+
+            secret = await self.keychute.read_grant(status.grant_id, idempotency_key)
+        except KeychuteNotConfigured:
+            return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
+        except KeychuteError as exc:
+            # str(exc) is built only from Keychute's non-secret error envelope and status codes.
+            return autofill_refused("keychute_unavailable", str(exc), origin=origin)
+
+        values: dict[str, str] = {}
+        try:
+            values = _parse_secret(secret)
+            missing = [str(target["kind"]) for target in targets if str(target["kind"]) not in values]
+            if missing:
+                return autofill_refused(
+                    "grant_invalid",
+                    f"the released secret carries no {missing[0]}",
+                    origin=origin,
+                )
+            result = await worker.autofill_fill(nonce, origin, targets, values)
+        finally:
+            zero_secret(secret)
+            values.clear()
+            del secret
+
+        if result.get("error"):
+            return autofill_refused("target_invalidated", "the page changed before the fill landed", origin=origin)
+        session.autofill_fill_count += 1
+        filled = [
+            FilledField(ref=entry.get("ref"), kind=entry["kind"]) for entry in cast(list, result.get("filled") or [])
+        ]
+        return AutofillResponse(status="filled", filled=filled, origin=origin)
 
     # -- cookie jars --------------------------------------------------------
     def _require_jars_enabled(self) -> None:

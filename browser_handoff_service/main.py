@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -32,7 +33,11 @@ from .jars import (
     validate_jar_id,
 )
 from .models import (
+    AUTOFILL_MAX_CONTEXT_BYTES,
     AgentCommandRequest,
+    AutofillOutcomeRequest,
+    AutofillRequest,
+    AutofillResponse,
     ClaimRequest,
     CookieJarMeta,
     CreateSessionRequest,
@@ -979,6 +984,34 @@ async def agent_command(session_id: str, req: AgentCommandRequest):
         return await registry.agent_command(session_id, req)
     except Exception as exc:
         raise map_errors(exc) from exc
+
+
+@app.post(
+    "/v1/sessions/{session_id}/autofill",
+    response_model=AutofillResponse,
+    dependencies=[Depends(require_agent_auth)],
+)
+async def autofill(session_id: str, req: AutofillRequest):
+    """Fill the session's pinned credential into the login form on the current page.
+
+    Policy outcomes are a 200 with a typed status, not an HTTP code: "the operator has not
+    decided yet" and "that field is a new-password field" are answers the agent acts on, while
+    only infrastructure failures (unknown session, lost lease, dead worker) are errors."""
+    if req.context is not None and len(json.dumps(req.context).encode("utf-8")) > AUTOFILL_MAX_CONTEXT_BYTES:
+        raise HTTPException(status_code=400, detail=f"context exceeds {AUTOFILL_MAX_CONTEXT_BYTES} bytes")
+    try:
+        return await registry.autofill(session_id, req)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/sessions/{session_id}/autofill/outcome", dependencies=[Depends(require_agent_auth)])
+async def autofill_outcome(session_id: str, req: AutofillOutcomeRequest):
+    try:
+        session = await registry.record_autofill_outcome(session_id, req.outcome)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+    return {"session_id": session.session_id, "autofill_bad_password": session.autofill_bad_password}
 
 
 @app.post(
