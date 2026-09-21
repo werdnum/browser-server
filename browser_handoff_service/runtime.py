@@ -1364,6 +1364,11 @@ class PlaywrightBrowserWorker:
         page = self._page
         from patchright.async_api import Error as PlaywrightError
 
+        if self.mask_protected:
+            await page.locator("input[type=password]").evaluate_all(
+                "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
+            )
+
         # Any action (a click on a link, Enter submitting a form, go_back to an off-scope page) can
         # trigger a navigation the route guard aborts. Reset the flag and, if such an abort escapes
         # a non-navigate action as a Playwright error, return a controlled block instead of a 500.

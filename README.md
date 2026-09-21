@@ -174,7 +174,7 @@ POST /v1/sessions
 What the session type fixes, deterministically and regardless of what else the caller asked for:
 
 - `exec` and `extract` are denied outright, and clipboard/transfer chords (`Control`/`Meta` with
-  `c`/`x`/`v`/`Insert`, and `Shift+Insert`) are refused. Typing *into* a protected control is
+  `c`/`x`/`v`/`Insert`, and `Shift+Insert/Delete`) are refused. Typing *into* a protected control is
   still fine — writing is not leaking.
 - Navigation confinement is always on (`confine_navigation: false` is a 400, as is `allow_exec`),
   and a **jarless** session supplies the set explicitly and is confined by the same route guard a

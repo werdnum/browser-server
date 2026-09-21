@@ -267,6 +267,7 @@ async def test_exec_and_extract_are_denied_before_any_fill():
         ("Control+x", True),
         ("Control+Insert", True),
         ("Shift+Insert", True),
+        ("Shift+Delete", True),
         # Playwright resolves this per platform; it is the same chord under a third spelling.
         ("ControlOrMeta+c", True),
         ("controlormeta+V", True),

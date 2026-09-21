@@ -102,7 +102,7 @@ AUTHENTICATED_SITE_DENIED_COMMANDS = {"exec", "extract"}
 
 # Key-chord fences for an authenticated-site session. Writing into a protected control is fine;
 # what is denied is every chord that MOVES a value out of one into somewhere observable.
-_TRANSFER_KEYS = {"c", "x", "v", "insert"}
+_TRANSFER_KEYS = {"c", "x", "v", "insert", "delete"}
 # Playwright resolves ControlOrMeta per platform, so it is a third spelling of the same chord.
 _TRANSFER_MODIFIERS = {"control", "meta", "controlormeta"}
 
@@ -124,7 +124,7 @@ def _pressed_key(req: AgentCommandRequest) -> str | None:
 
 
 def _is_transfer_chord(req: AgentCommandRequest) -> bool:
-    """Whether a key command is a copy/cut/paste chord (Ctrl/Cmd+C/X/V/Insert, Shift+Insert)."""
+    """Whether a key command is a copy/cut/paste chord (Ctrl/Cmd+C/X/V/Insert, Shift+Insert/Delete)."""
     raw = _pressed_key(req)
     if raw is None:
         return False
@@ -138,7 +138,7 @@ def _is_transfer_chord(req: AgentCommandRequest) -> bool:
         return False
     if modifiers & _TRANSFER_MODIFIERS:
         return True
-    return base == "insert" and "shift" in modifiers
+    return base in {"insert", "delete"} and "shift" in modifiers
 
 
 # Every access request's TTL. Long enough for a human approval to land inside the park window,

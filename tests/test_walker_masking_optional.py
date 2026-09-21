@@ -272,3 +272,18 @@ async def test_close_page_discards_human_history(worker, page_server):
     snapshot = await worker.command(AgentCommandRequest(type="snapshot"))
     assert "human-only-otp" not in str(snapshot)
     assert worker._page.url == "about:blank"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_first", [False, True])
+async def test_reveal_before_first_snapshot_stays_protected(worker, page_server, capture_first):
+    worker.mask_protected = True
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    if capture_first:
+        await worker.command(AgentCommandRequest(type="screenshot"))
+    await worker.command(AgentCommandRequest(type="click", args={"selector": "#reveal"}))
+    snapshot = await _snapshot(worker)
+    assert SECRET not in repr(snapshot)
+    password = _by_name(snapshot["roots"], "Password")
+    assert password["input_type"] == "text"
+    assert password["value_masked"] is True
