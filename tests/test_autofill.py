@@ -574,3 +574,25 @@ async def test_a_consumed_grant_is_rejected_before_another_read(keychute):
         assert response.json()["reason"] == "grant_invalid"
         assert keychute.reads == 1
         assert worker.filled == []
+
+
+@pytest.mark.asyncio
+async def test_spent_grants_count_toward_the_cap_even_when_the_payload_cannot_fill(keychute):
+    keychute.secret = PASSWORD
+    async with client() as ac:
+        session, worker = await _session(ac)
+        for index in range(AUTOFILL_FILL_CAP):
+            keychute.reads = 0
+            keychute.grant_id = str(uuid.uuid4())
+            response = await _autofill(
+                ac,
+                session["session_id"],
+                step_key=f"attempt-{index}",
+                fields=[{"ref": "e10", "kind": "username"}],
+            )
+            assert response.json()["reason"] == "grant_invalid"
+            assert keychute.reads == 1
+        response = await _autofill(ac, session["session_id"], step_key="another")
+        assert response.json()["reason"] == "fill_cap_reached"
+        assert len(keychute.requests) == AUTOFILL_FILL_CAP
+        assert worker.filled == []

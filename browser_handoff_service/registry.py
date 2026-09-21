@@ -843,6 +843,7 @@ class SessionRegistry:
                 )
 
             secret = await self.keychute.read_grant(status.grant_id, idempotency_key)
+            session.autofill_fill_count += 1
         except KeychuteNotConfigured:
             return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
         except KeychuteError as exc:
@@ -867,7 +868,6 @@ class SessionRegistry:
 
         if result.get("error"):
             return autofill_refused("target_invalidated", "the page changed before the fill landed", origin=origin)
-        session.autofill_fill_count += 1
         filled = [
             FilledField(ref=entry.get("ref"), kind=entry["kind"]) for entry in cast(list, result.get("filled") or [])
         ]
