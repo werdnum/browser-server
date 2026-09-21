@@ -574,7 +574,7 @@ AUTOFILL_PREPARE_JS = (
   for (const stale of document.querySelectorAll('[' + TARGET_ATTR + ']')) stale.removeAttribute(TARGET_ATTR);
 
   const chosen = [];
-  if (args.fields && args.fields.length) {
+  if (args.fields && args.fields.some(field => field.ref)) {
     for (const field of args.fields) {
       let el = null;
       if (field.ref) {
@@ -616,9 +616,14 @@ AUTOFILL_PREPARE_JS = (
     }
   }
 
+  const wanted = args.fields && args.fields.length ? new Set(args.fields.map(field => field.kind)) : null;
+  const selected = wanted ? chosen.filter(([, kind]) => wanted.has(kind)) : chosen;
+  if (wanted && [...wanted].some(kind => !selected.some(([, selectedKind]) => selectedKind === kind))) {
+    return fail('no_eligible_field');
+  }
   const targets = [];
-  for (let i = 0; i < chosen.length; i++) {
-    const [el, kind] = chosen[i];
+  for (let i = 0; i < selected.length; i++) {
+    const [el, kind] = selected[i];
     const ref = el.getAttribute('data-fa-ref');
     if (!ref || !checkRef(ref).ok) return fail('no_eligible_field');
     el.setAttribute(TARGET_ATTR, String(i));
@@ -1027,7 +1032,7 @@ class FakeBrowserWorker:
         by_ref = {str(f["ref"]): f for f in self.autofill_fields}
         fail = lambda reason: {"error": True, "reason": reason, "origin": origin, "url": self.url}  # noqa: E731
         chosen: list[tuple[dict[str, Any], str]] = []
-        if fields:
+        if fields and any(spec.get("ref") for spec in fields):
             for spec in fields:
                 ref = spec.get("ref")
                 if not ref:
@@ -1063,6 +1068,11 @@ class FakeBrowserWorker:
             else:
                 framed = [f for f in self.autofill_fields if f.get("iframe") and f.get("input_type") == "password"]
                 return fail("in_iframe" if framed else "no_eligible_field")
+        if fields:
+            wanted = {str(spec["kind"]) for spec in fields}
+            chosen = [(field, kind) for field, kind in chosen if kind in wanted]
+            if wanted - {kind for _, kind in chosen}:
+                return fail("no_eligible_field")
         self._autofill_nonce = nonce
         self._autofill_targets = [
             {"slot": str(index), "ref": str(field["ref"]), "kind": kind} for index, (field, kind) in enumerate(chosen)
@@ -1674,7 +1684,7 @@ class PlaywrightBrowserWorker:
         if self.closed or page is None:
             raise RuntimeError("worker is closed")
         try:
-            if not fields:
+            if not fields or not any(spec.get("ref") for spec in fields):
                 await page.evaluate(SNAPSHOT_JS, 1)
             result = cast(dict[str, Any], await page.evaluate(AUTOFILL_PREPARE_JS, {"fields": fields, "nonce": nonce}))
         except PlaywrightError:

@@ -639,3 +639,14 @@ async def test_jar_revoked_during_approval_wait_is_not_filled(keychute, monkeypa
         assert keychute.reads == 0
         assert worker.closed
         assert registry.get(session["session_id"]).state.value == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["username", "password"])
+async def test_kind_only_request_uses_auto_detection(keychute, kind):
+    async with client() as ac:
+        session, worker = await _session(ac)
+        response = await _autofill(ac, session["session_id"], fields=[{"kind": kind}])
+        assert response.json()["status"] == "filled", response.text
+        assert [field["kind"] for field in response.json()["filled"]] == [kind]
+        assert len(worker.filled) == 1

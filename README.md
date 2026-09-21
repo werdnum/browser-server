@@ -187,7 +187,8 @@ What the session type fixes, deterministically and regardless of what else the c
   password" toggle cannot turn a protected control back into a readable one.
 
 `POST /v1/sessions/{id}/autofill` then fills the pinned credential into the login form on the
-current page. Policy outcomes are a 200 with a typed status, not an HTTP code:
+current HTTPS page. Plaintext HTTP documents are refused before a credential request is made.
+Policy outcomes are a 200 with a typed status, not an HTTP code:
 
 ```jsonc
 // request
@@ -201,7 +202,8 @@ current page. Policy outcomes are a 200 with a typed status, not an HTTP code:
 ```
 
 `fields` may be omitted, in which case browser-server auto-detects on the main-frame document (a
-second visible password field is `ambiguous_fields`, not a guess). Refusal reasons:
+second visible password field is `ambiguous_fields`, not a guess). A kind-only entry such as
+`{"kind": "password"}` auto-detects just that kind. Refusal reasons:
 `not_authenticated_site`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
 `new_password_field`, `in_iframe`, `target_invalidated`, `policy_denied`, `request_expired`,
 `grant_invalid`, `bad_password_recorded`, `fill_cap_reached`, `keychute_unavailable`, `stale_ref`,

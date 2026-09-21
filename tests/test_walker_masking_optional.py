@@ -319,3 +319,19 @@ async def test_auto_detected_target_keeps_identity_without_prior_snapshot(worker
     result = await worker.autofill_fill("auto-identity", prepared["origin"], prepared["targets"], {"password": SECRET})
     assert result.get("reason") == "target_invalidated", result
     assert await worker._page.locator("#pw").input_value() == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["username", "password"])
+async def test_kind_only_fill_auto_detects_only_the_requested_field(worker, page_server, kind):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content(
+        '<input type="email" autocomplete="username" id="user"><input type="password" id="pw">'
+    )
+    prepared = await worker.autofill_prepare([{"kind": kind}], "kind-only")
+    assert prepared.get("ok"), prepared
+    assert [target["kind"] for target in prepared["targets"]] == [kind]
+    result = await worker.autofill_fill("kind-only", prepared["origin"], prepared["targets"], {kind: SECRET})
+    assert result.get("ok"), result
+    assert await worker._page.locator("#user").input_value() == (SECRET if kind == "username" else "")
+    assert await worker._page.locator("#pw").input_value() == (SECRET if kind == "password" else "")
