@@ -155,12 +155,14 @@ _AUTOFILL_DETAILS = {
 }
 
 
-def _origin_host_port(origin: str) -> tuple[str, int | None]:
-    """Split a normalized origin into the host and explicit port Keychute constrains on."""
+def _origin_host_port(origin: str) -> tuple[str, int]:
+    """Split a normalized origin into the host and effective port Keychute constrains on."""
     from urllib.parse import urlsplit
 
     parts = urlsplit(origin)
-    return (parts.hostname or "").lower(), parts.port
+    return (parts.hostname or "").lower(), parts.port if parts.port is not None else (
+        80 if parts.scheme == "http" else 443
+    )
 
 
 def _parse_secret(secret: bytearray) -> dict[str, str]:
@@ -492,7 +494,7 @@ class SessionRegistry:
             self._event(session, "handoff_cancelled", "human", metadata={"outcome": outcome or "cancelled"})
             return session
 
-    async def handover(self, session_id: str, token: str, handoff_note: str) -> tuple[BrowserSession, str]:
+    async def handover(self, session_id: str, token: str, handoff_note: str) -> tuple[BrowserSession, str | None]:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
@@ -518,8 +520,6 @@ class SessionRegistry:
                 raise ConflictError(
                     "a jar-loaded session cannot be handed to an agent; start a fresh jar-loaded session"
                 )
-            session.lease_owner = transition(session.state, session.lease_owner, SessionState.HANDOVER_REQUESTED)
-            session.state = SessionState.HANDOVER_REQUESTED
             session.handoff_reason = None
             session.allowed_resume = "never"
             session.handoff_note = handoff_note
@@ -531,15 +531,19 @@ class SessionRegistry:
                 session.allowed_resume = "after_sanitize"
                 await self._sanitize_for_resume_locked(session)
                 await self._reopen_confined_page_locked(session)
+            session.lease_owner = transition(session.state, session.lease_owner, SessionState.HANDOVER_REQUESTED)
+            session.state = SessionState.HANDOVER_REQUESTED
             session.idle_expires_at = min(now_utc() + timedelta(minutes=10), session.expires_at)
             session.updated_at = now_utc()
-            handover_token = mint_token()
-            self.tokens[hash_token(handover_token)] = TokenRecord(
-                session_id=session_id,
-                token_hash=hash_token(handover_token),
-                token_type="handover",
-                expires_at=session.idle_expires_at,
-            )
+            handover_token = None
+            if not session.authenticated_site:
+                handover_token = mint_token()
+                self.tokens[hash_token(handover_token)] = TokenRecord(
+                    session_id=session_id,
+                    token_hash=hash_token(handover_token),
+                    token_type="handover",
+                    expires_at=session.idle_expires_at,
+                )
             self._event(session, "handover_requested", "human")
             return session, handover_token
 
@@ -549,10 +553,8 @@ class SessionRegistry:
         Ordinarily the one-time handover token is the authority, minted for the human and relayed
         by them. An authenticated-site session cannot work that way: the token is minted for the
         human and the design forbids routing it through the conversation, so trusted orchestration
-        would have no way to present it. There the human's handover POST is the signal that they
-        are finished and the service token is the authority — which is no weaker, because the
-        service token already creates and drives these sessions. The handover token is still
-        accepted when supplied, and is revoked either way so it cannot be replayed."""
+        would have no way to present it. There the human's handover POST is the signal
+        and the service token is the authority, so no handover token is minted."""
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
@@ -820,7 +822,12 @@ class SessionRegistry:
             #    narrowed below what was asked for.
             info = await self.keychute.grant_info(status.grant_id)
             reference_now = info.server_time or now_utc()
-            if info.mechanism != "autofill" or info.revoked or info.not_after <= reference_now:
+            if (
+                info.mechanism != "autofill"
+                or info.revoked
+                or info.not_after <= reference_now
+                or (info.max_uses is not None and info.use_count >= info.max_uses)
+            ):
                 return autofill_refused("grant_invalid", "the grant is not usable", origin=origin)
             if not any(granted.matches(host, port) for granted in info.origins):
                 return autofill_refused(

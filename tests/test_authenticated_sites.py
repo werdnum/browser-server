@@ -461,7 +461,7 @@ async def test_the_human_page_is_sanitized_before_the_agent_sees_it():
 
 
 @pytest.mark.asyncio
-async def test_the_control_token_and_handover_token_do_not_survive_the_claim():
+async def test_authenticated_handback_mints_no_token_and_revokes_human_control():
     async with client() as ac:
         session = await _authenticated_session(ac)
         control_token = await _park_with_human(ac, session)
@@ -470,15 +470,14 @@ async def test_the_control_token_and_handover_token_do_not_survive_the_claim():
             json={"token": control_token},
             headers=agent_headers(),
         )
-        handover_token = handover.json()["handover_token"]
+        assert handover.json()["handover_token"] is None
         assert (
             await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
         ).status_code == 200
 
-        # Replaying either token after the claim is refused.
+        # A repeated claim and reuse of the human control token are refused.
         replay = await ac.post(
             f"/v1/sessions/{session['session_id']}/agent-claim",
-            json={"token": handover_token},
             headers=agent_headers(),
         )
         assert replay.status_code == 409
@@ -546,3 +545,42 @@ async def test_an_ordinary_jar_loaded_session_still_cannot_be_handed_to_an_agent
         )
         assert handover.status_code == 409
         assert "jar-loaded session cannot be handed to an agent" in handover.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_type", ["close_page", "navigate"])
+async def test_failed_sanitization_never_publishes_claimable_state(monkeypatch, command_type):
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        control_token = await _park_with_human(ac, session)
+        worker = registry.workers[session["worker_id"]]
+        original = worker.command
+
+        async def failing_command(req):
+            if req.type == command_type:
+                raise RuntimeError("browser disconnected")
+            return await original(req)
+
+        monkeypatch.setattr(worker, "command", failing_command)
+        with pytest.raises(RuntimeError, match="browser disconnected"):
+            await registry.handover(session["session_id"], control_token, "")
+        response = await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
+        assert response.status_code == 409
+        assert registry.get(session["session_id"]).state.value == "human_active"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_handoff_page_uses_resume_instructions():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        html = main.SESSION_DETAIL_TEMPLATE.render(
+            session=registry.get(session["session_id"]),
+            token="control",
+            base_path="",
+            viewport_width=1280,
+            viewport_height=720,
+            save_jar_available=False,
+        )
+    assert "Tell your assistant to continue the website task" in html
+    assert 'id="handover-token"' not in html
+    assert "Copy the message below" not in html

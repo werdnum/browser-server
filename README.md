@@ -222,12 +222,11 @@ resume: the human-controlled page is closed and a fresh one opened inside the co
 the authenticated cookies survive but the exact page and any in-progress form state do not.
 
 Trusted orchestration then takes the lease back with `POST .../agent-claim` **and no body**. The
-one-time handover token is minted for the human and must not travel through the conversation, so it
-cannot be the authority here: the human's handover POST is the signal and the service token is the
-authority (it already creates and drives these sessions). The token is still accepted if supplied,
-and is revoked either way, as is the human's control token. Ordinary sessions are unchanged — they
-still require the token, and a jar-loaded session that is *not* an authenticated-site session still
-cannot be handed to an agent at all.
+human's handover POST is the signal and the service token is the authority (it already creates
+and drives these sessions). No handover token is minted for an authenticated-site session; the
+page asks the human to tell their assistant to resume the task. Claiming revokes the human's
+control token. Ordinary sessions still require a one-time handover token, and a jar-loaded
+session that is *not* an authenticated-site session cannot be handed to an agent at all.
 
 Poll `GET /v1/sessions/{id}` for `state` and `lease_owner`; the handback is ready when `state` is
 `handover_requested`. A token-less claim in any other state is a 409, and in a non-authenticated-site

@@ -449,6 +449,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           <button id="complete" class="btn">Complete</button>
           <button id="cancel" class="btn btn-danger">Cancel</button>
         </div>
+        {% if not session.authenticated_site %}
         <div id="handover-result" class="notice" hidden>
           <p><strong>Ready to hand back to your agent.</strong></p>
           <p class="muted">Copy the message below and send it to your agent — it has everything needed to take over.</p>
@@ -477,6 +478,9 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           </details>
         </div>
         <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and can't be shown again. Click Cancel to stop and start over.</p>
+        {% else %}
+        <p id="handover-pending" class="notice" hidden>Ready to resume. Tell your assistant to continue the website task.</p>
+        {% endif %}
         <p id="action-error" class="notice error" role="alert" hidden></p>
       </div>
     </main>
@@ -583,6 +587,10 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     document.querySelector("#sensitive").onclick = action(() => post(`/v1/sessions/${sid}/mark-sensitive`, {token}));
     document.querySelector("#handover").onclick = action(async () => {
       const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
+      if (!result.handover_token) {
+        document.querySelector("#handover-pending").hidden = false;
+        return;
+      }
       document.querySelector("#handover-token").textContent = result.handover_token;
       document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
       document.querySelector("#agent-instruction").textContent =

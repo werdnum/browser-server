@@ -117,7 +117,7 @@ class FakeKeychute:
                     .isoformat()
                     .replace("+00:00", "Z"),
                     "max_uses": 1,
-                    "use_count": 0,
+                    "use_count": self.reads,
                     "revoked": self.revoked,
                     "server_time": now.isoformat().replace("+00:00", "Z"),
                 },
@@ -221,7 +221,7 @@ async def test_a_fill_places_the_secret_and_reports_only_metadata(keychute, capl
         assert request["idempotency_key"] == f"{session['session_id']}:password"
         assert request["secret_name"] == "shop-login"
         assert request["mechanism"] == "autofill"
-        assert request["constraints"]["origins"] == [{"host": "shop.example.com"}]
+        assert request["constraints"]["origins"] == [{"host": "shop.example.com", "port": 443}]
         # An empty list subsets only an empty list, which is what lets a standing row match.
         assert request["constraints"]["methods"] == []
         assert request["constraints"]["path_prefixes"] == []
@@ -549,3 +549,28 @@ async def test_an_oversized_context_is_rejected(keychute):
         session, _ = await _session(ac)
         resp = await _autofill(ac, session["session_id"], context={"objective": "x" * 3000})
         assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("grant_port", "expected"), [(None, "refused"), (80, "filled")])
+async def test_http_requires_a_grant_for_port_80(keychute, grant_port, expected):
+    keychute.granted_port = grant_port
+    async with client() as ac:
+        session, worker = await _session(ac, confine_origins=["http://shop.example.com"])
+        worker.url = "http://shop.example.com/login"
+        response = await _autofill(ac, session["session_id"])
+        assert response.json()["status"] == expected
+        assert keychute.requests[0]["constraints"]["origins"] == [{"host": "shop.example.com", "port": 80}]
+        assert keychute.reads == (1 if expected == "filled" else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_grant_is_rejected_before_another_read(keychute):
+    async with client() as ac:
+        session, worker = await _session(ac)
+        assert (await _autofill(ac, session["session_id"])).json()["status"] == "filled"
+        worker.filled.clear()
+        response = await _autofill(ac, session["session_id"])
+        assert response.json()["reason"] == "grant_invalid"
+        assert keychute.reads == 1
+        assert worker.filled == []
