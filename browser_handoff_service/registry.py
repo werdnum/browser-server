@@ -710,6 +710,8 @@ class SessionRegistry:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
+            if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+                raise AuthorizationError("autofill outcomes are denied unless the agent owns the lease")
             if outcome == "bad_password":
                 session.autofill_bad_password = True
                 session.updated_at = now_utc()
@@ -1082,6 +1084,7 @@ class SessionRegistry:
                 session.jar_generation = meta.generation
                 session.jar_origins = list(meta.origins)
                 session.jar_nav_allowlist = list(meta.nav_allowlist)
+                session.confine_origins = [*meta.origins, *meta.nav_allowlist]
                 session.jar_registrable_domains = list(meta.registrable_domains)
                 # Apply the (possibly NARROWED) scope to the live worker's route guard too, so the
                 # running context stops trusting origins the refreshed jar dropped — otherwise the

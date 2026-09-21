@@ -2505,6 +2505,7 @@ async def test_self_refresh_narrowing_evicts_off_scope_page(tmp_path):
         actor="agent",
     )
     assert worker.url == "about:blank"  # off-scope current page evicted
+    assert loaded.confine_origins == ["https://shop.example.com"]
 
 
 # --- regression tests for Codex review round 21 ---------------------------

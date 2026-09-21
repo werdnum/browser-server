@@ -20,7 +20,7 @@ from browser_handoff_service import main
 from browser_handoff_service.jars import JarStore, load_jar_keys
 from browser_handoff_service.keychute import KeychuteClient
 from browser_handoff_service.main import app, registry
-from browser_handoff_service.models import AUTOFILL_FILL_CAP
+from browser_handoff_service.models import AUTOFILL_FILL_CAP, LeaseOwner, SessionState
 from browser_handoff_service.runtime import FakeBrowserWorker
 from httpx import ASGITransport, AsyncClient
 
@@ -688,3 +688,26 @@ async def test_expiry_during_approval_prevents_the_grant_read(keychute, deadline
         assert response.status_code == 410
         assert keychute.reads == 0
         assert not worker.filled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state,owner",
+    [
+        (SessionState.HUMAN_ACTIVE, LeaseOwner.HUMAN),
+        (SessionState.HANDOVER_REQUESTED, LeaseOwner.HUMAN),
+        (SessionState.AGENT_ACTIVE, LeaseOwner.NONE),
+    ],
+)
+async def test_bad_password_report_requires_agent_lease(keychute, state, owner):
+    async with client() as ac:
+        session, _ = await _session(ac)
+        live = registry.sessions[session["session_id"]]
+        live.state, live.lease_owner = state, owner
+        response = await ac.post(
+            f"/v1/sessions/{live.session_id}/autofill/outcome",
+            json={"outcome": "bad_password"},
+            headers=agent_headers(),
+        )
+        assert response.status_code == 403
+        assert not live.autofill_bad_password
