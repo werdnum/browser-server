@@ -132,6 +132,8 @@ def _is_transfer_chord(req: AgentCommandRequest) -> bool:
     if not parts:
         return False
     base, modifiers = parts[-1], set(parts[:-1])
+    if base in {"keyc", "keyx", "keyv"}:
+        base = base[-1]
     if base not in _TRANSFER_KEYS:
         return False
     if modifiers & _TRANSFER_MODIFIERS:

@@ -258,6 +258,11 @@ async def test_exec_and_extract_are_denied_before_any_fill():
     ("keys", "denied"),
     [
         ("Control+c", True),
+        ("Control+KeyC", True),
+        ("Control+KeyX", True),
+        ("Control+KeyV", True),
+        ("Meta+KeyC", True),
+        ("ControlOrMeta+KeyV", True),
         ("Meta+V", True),
         ("Control+x", True),
         ("Control+Insert", True),
@@ -584,3 +589,21 @@ async def test_authenticated_handoff_page_uses_resume_instructions():
     assert "Tell your assistant to continue the website task" in html
     assert 'id="handover-token"' not in html
     assert "Copy the message below" not in html
+
+
+@pytest.mark.asyncio
+async def test_oidc_human_can_serialize_inactive_authenticated_site_defaults(monkeypatch):
+    async with client() as ac:
+        response = await ac.post(
+            "/v1/sessions",
+            json={
+                "conversation_id": "ordinary-human",
+                "authenticated_site": False,
+                "confine_origins": None,
+                "credential_alias": None,
+            },
+            headers=oidc_headers(monkeypatch),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == "human_active"
+        assert response.json()["authenticated_site"] is False
