@@ -1121,6 +1121,7 @@ class PlaywrightBrowserWorker:
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
+        self._next_ref = 1
         self.headed = headed
         self.stealth = stealth_enabled()
         self.width = width
@@ -1550,7 +1551,7 @@ class PlaywrightBrowserWorker:
             next_ref = coerce_next_ref(request.args.get("next_ref"))
 
             async def _walk() -> dict[str, Any]:
-                return cast(dict[str, Any], await page.evaluate(SNAPSHOT_JS, next_ref))
+                return await self._snapshot_document(page, next_ref)
 
             async def _degraded_snapshot() -> dict[str, Any]:
                 # The walker could not complete because the document it was
@@ -1672,6 +1673,11 @@ class PlaywrightBrowserWorker:
             return {"closed": True, "url": None, "title": "Blank"}
         raise ValueError(f"unsupported command {request.type}")
 
+    async def _snapshot_document(self, page: Any, next_ref: int = 1) -> dict[str, Any]:
+        result = cast(dict[str, Any], await page.evaluate(SNAPSHOT_JS, max(next_ref, self._next_ref)))
+        self._next_ref = max(self._next_ref, coerce_next_ref(result["next_ref"]))
+        return result
+
     async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]:
         """Choose the fill targets on the current main-frame document and pin it with ``nonce``.
 
@@ -1685,7 +1691,7 @@ class PlaywrightBrowserWorker:
             raise RuntimeError("worker is closed")
         try:
             if not fields or not any(spec.get("ref") for spec in fields):
-                await page.evaluate(SNAPSHOT_JS, 1)
+                await self._snapshot_document(page)
             result = cast(dict[str, Any], await page.evaluate(AUTOFILL_PREPARE_JS, {"fields": fields, "nonce": nonce}))
         except PlaywrightError:
             # The document went away under the check; there is nothing left to bind to.

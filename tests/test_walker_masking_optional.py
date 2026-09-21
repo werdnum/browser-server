@@ -335,3 +335,22 @@ async def test_kind_only_fill_auto_detects_only_the_requested_field(worker, page
     assert result.get("ok"), result
     assert await worker._page.locator("#user").input_value() == (SECRET if kind == "username" else "")
     assert await worker._page.locator("#pw").input_value() == (SECRET if kind == "password" else "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields", [None, [{"kind": "password"}]])
+async def test_auto_detection_preserves_refs_across_navigation(worker, page_server, fields):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/first"}))
+    first = await worker.command(AgentCommandRequest(type="snapshot", args={"next_ref": 100}))
+    old_refs = {node["ref"] for node in _flatten(first["roots"]) if node.get("ref")}
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/second"}))
+    await worker._page.locator("#empty").evaluate("el => el.remove()")
+    prepared = await worker.autofill_prepare(fields, "new-document")
+    assert prepared.get("ok"), prepared
+    assert all(int(target["ref"][1:]) >= first["next_ref"] for target in prepared["targets"])
+    second = await worker.command(AgentCommandRequest(type="snapshot", args={"next_ref": 1}))
+    new_refs = {node["ref"] for node in _flatten(second["roots"]) if node.get("ref")}
+    assert old_refs.isdisjoint(new_refs)
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/third"}))
+    third = await worker.command(AgentCommandRequest(type="snapshot", args={"next_ref": 1}))
+    assert all(int(node["ref"][1:]) >= second["next_ref"] for node in _flatten(third["roots"]) if node.get("ref"))
