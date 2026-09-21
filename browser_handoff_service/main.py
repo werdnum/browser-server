@@ -34,6 +34,7 @@ from .jars import (
 )
 from .models import (
     AUTOFILL_MAX_CONTEXT_BYTES,
+    AgentClaimRequest,
     AgentCommandRequest,
     AutofillOutcomeRequest,
     AutofillRequest,
@@ -1243,9 +1244,9 @@ async def handover(session_id: str, req: HandoverRequest, request: Request):
 
 
 @app.post("/v1/sessions/{session_id}/agent-claim", dependencies=[Depends(require_agent_auth)])
-async def agent_claim(session_id: str, req: ClaimRequest):
+async def agent_claim(session_id: str, req: AgentClaimRequest | None = None):
     try:
-        return await registry.agent_claim(session_id, req.token)
+        return await registry.agent_claim(session_id, req.token if req is not None else None)
     except Exception as exc:
         raise map_errors(exc) from exc
 

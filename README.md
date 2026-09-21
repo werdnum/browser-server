@@ -210,6 +210,29 @@ second visible password field is `ambiguous_fields`, not a guess). Refusal reaso
 `POST /v1/sessions/{id}/autofill/outcome` with `{"outcome": "bad_password"}` latches the session:
 every later fill is refused. A per-session cap of 6 fills is the deterministic backstop behind it.
 
+### Handing out to a human and back
+
+A challenge a human can finish in the live session — an MFA code, a captcha, a "verify it's you"
+click — is a detour, not an ending, so the handoff has to be a round trip. `POST .../handoff` parks
+the session under human control as usual (it stays origin-confined and fail-closed for agent
+commands throughout; confinement is **never** lifted for an authenticated-site session, which is
+why the agent may inherit the context afterwards — the human cannot have widened it). When the
+human is done they `POST .../handover`, which for an authenticated-site session forces sanitized
+resume: the human-controlled page is closed and a fresh one opened inside the confinement set, so
+the authenticated cookies survive but the exact page and any in-progress form state do not.
+
+Trusted orchestration then takes the lease back with `POST .../agent-claim` **and no body**. The
+one-time handover token is minted for the human and must not travel through the conversation, so it
+cannot be the authority here: the human's handover POST is the signal and the service token is the
+authority (it already creates and drives these sessions). The token is still accepted if supplied,
+and is revoked either way, as is the human's control token. Ordinary sessions are unchanged — they
+still require the token, and a jar-loaded session that is *not* an authenticated-site session still
+cannot be handed to an agent at all.
+
+Poll `GET /v1/sessions/{id}` for `state` and `lease_owner`; the handback is ready when `state` is
+`handover_requested`. A token-less claim in any other state is a 409, and in a non-authenticated-site
+session it is a 403.
+
 Each call is one [Keychute](https://github.com/werdnum/keychute) access request and one single-use
 grant read, and the destination is decided here rather than taken on trust:
 

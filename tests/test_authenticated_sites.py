@@ -377,3 +377,172 @@ async def test_a_password_field_is_masked_in_every_snapshot():
         assert "value" not in nodes["e41"]
         # An ordinary field is untouched: blanket masking buys nothing and costs the task.
         assert nodes["e40"]["value"] == "someone@example.com"
+
+
+# --- handoff and handback -------------------------------------------------
+
+
+async def _park_with_human(ac, session: dict) -> str:
+    """Hand the session to a human and claim it, as an MFA/captcha detour does."""
+    handoff = await ac.post(
+        f"/v1/sessions/{session['session_id']}/handoff",
+        json={"reason": "otp", "allowed_resume": "never"},
+        headers=agent_headers(),
+    )
+    assert handoff.status_code == 200, handoff.text
+    token = handoff.json()["handoff_url"].split("token=")[1]
+    claim = await ac.post(f"/v1/sessions/{session['session_id']}/claim", json={"token": token})
+    assert claim.status_code == 200, claim.text
+    return claim.json()["control_token"]
+
+
+@pytest.mark.asyncio
+async def test_a_parked_authenticated_site_session_can_be_handed_back():
+    """The detour has to be a round trip: a run that parks for an MFA code and can never come
+    back has not parked, it has ended."""
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        control_token = await _park_with_human(ac, session)
+        worker.url = f"{SITE}/verify-its-you"
+
+        handover = await ac.post(
+            f"/v1/sessions/{session['session_id']}/handover",
+            json={"token": control_token, "handoff_note": "code entered"},
+            headers=agent_headers(),
+        )
+        assert handover.status_code == 200, handover.text
+
+        state = await ac.get(f"/v1/sessions/{session['session_id']}", headers=agent_headers())
+        # state and lease_owner are what trusted orchestration polls on; both are on the record,
+        # and "the human has handed back" reads as state == handover_requested.
+        assert state.json()["state"] == "handover_requested"
+        assert state.json()["lease_owner"] == "service"
+        assert state.json()["allowed_resume"] == "after_sanitize"
+
+        # The human's page is gone and a fresh one is open inside the confinement set.
+        assert worker.url == SITE
+
+        claimed = await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["state"] == "agent_active"
+        assert claimed.json()["lease_owner"] == "agent"
+        # Confinement is never lifted for these sessions, and the claim re-asserts it.
+        assert worker._confinement_active is True
+        resumed = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "navigate", "args": {"url": "https://evil.example.com/"}},
+            headers=agent_headers(),
+        )
+        assert resumed.json()["result"]["blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_human_page_is_sanitized_before_the_agent_sees_it():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        worker = cast(FakeBrowserWorker, registry.workers[session["worker_id"]])
+        control_token = await _park_with_human(ac, session)
+        worker.url = f"{SITE}/mid-form?step=2"
+        worker.nav_error_urls = {SITE}
+
+        handover = await ac.post(
+            f"/v1/sessions/{session['session_id']}/handover",
+            json={"token": control_token},
+            headers=agent_headers(),
+        )
+        assert handover.status_code == 200, handover.text
+        # The reopen failed (site down); the page stays blank rather than keeping the human's.
+        assert worker.url is None
+        state = await ac.get(f"/v1/sessions/{session['session_id']}", headers=agent_headers())
+        # Nothing about the human's page survives onto the record the agent can read.
+        assert state.json()["current_url_redacted"] is None
+        assert state.json()["current_origin"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_control_token_and_handover_token_do_not_survive_the_claim():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        control_token = await _park_with_human(ac, session)
+        handover = await ac.post(
+            f"/v1/sessions/{session['session_id']}/handover",
+            json={"token": control_token},
+            headers=agent_headers(),
+        )
+        handover_token = handover.json()["handover_token"]
+        assert (
+            await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
+        ).status_code == 200
+
+        # Replaying either token after the claim is refused.
+        replay = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-claim",
+            json={"token": handover_token},
+            headers=agent_headers(),
+        )
+        assert replay.status_code == 409
+        cancel = await ac.post(f"/v1/sessions/{session['session_id']}/cancel", json={"token": control_token})
+        assert cancel.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_a_tokenless_claim_is_refused_outside_an_authenticated_site_session():
+    async with client() as ac:
+        create = await ac.post(
+            "/v1/sessions", json={"conversation_id": "c1", "initial_owner": "human"}, headers=agent_headers()
+        )
+        session = create.json()
+        handover = await ac.post(
+            f"/v1/sessions/{session['session_id']}/handover",
+            json={"token": session["control_token"]},
+            headers=agent_headers(),
+        )
+        assert handover.status_code == 200, handover.text
+        # An ordinary session still requires the one-time handover token.
+        assert (
+            await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
+        ).status_code == 403
+        assert (
+            await ac.post(
+                f"/v1/sessions/{session['session_id']}/agent-claim",
+                json={"token": handover.json()["handover_token"]},
+                headers=agent_headers(),
+            )
+        ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_tokenless_claim_only_works_while_a_handover_is_pending():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        # Agent-owned, no handover outstanding: nothing to claim.
+        assert (
+            await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
+        ).status_code == 409
+        await _park_with_human(ac, session)
+        # Human-owned but the human has not handed back: still nothing to claim.
+        assert (
+            await ac.post(f"/v1/sessions/{session['session_id']}/agent-claim", headers=agent_headers())
+        ).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_jar_loaded_session_still_cannot_be_handed_to_an_agent(tmp_path, monkeypatch):
+    """The widening premise still holds where confinement can be lifted, so the refusal stands."""
+    enable_jars(tmp_path)
+    async with client() as ac:
+        meta = await _save_jar(ac, monkeypatch)
+        create = await ac.post(
+            "/v1/sessions",
+            json={"conversation_id": "c1", "jar_id": meta["jar_id"], "initial_owner": "human"},
+            headers=agent_headers(),
+        )
+        session = create.json()
+        handover = await ac.post(
+            f"/v1/sessions/{session['session_id']}/handover",
+            json={"token": session["control_token"]},
+            headers=agent_headers(),
+        )
+        assert handover.status_code == 409
+        assert "jar-loaded session cannot be handed to an agent" in handover.json()["detail"]

@@ -508,7 +508,13 @@ class SessionRegistry:
             # login/payment/SSO origins and accumulate credentials broader than the jar's
             # immutable jar_origins. The agent resumes authenticated browsing only by starting a
             # fresh, re-filtered jar-loaded session — never by inheriting the human-widened one.
-            if session.jar_id is not None:
+            #
+            # An authenticated-site session is the exception, and only because the premise does
+            # not hold for it: confinement is never lifted, not even under human control, so the
+            # human cannot have widened it. Without this the handoff is one-way — a run that
+            # parks for an MFA code or a captcha could never come back, which is the whole point
+            # of parking it.
+            if session.jar_id is not None and not session.authenticated_site:
                 raise ConflictError(
                     "a jar-loaded session cannot be handed to an agent; start a fresh jar-loaded session"
                 )
@@ -517,6 +523,14 @@ class SessionRegistry:
             session.handoff_reason = None
             session.allowed_resume = "never"
             session.handoff_note = handoff_note
+            if session.authenticated_site:
+                # Sanitized resume is not an option here, it is the terms: the human-controlled
+                # page is closed and a fresh one opened inside the confinement set before the
+                # agent can observe anything. Exact page and in-progress form state do not
+                # survive; the authenticated cookies do, which is what the handback is for.
+                session.allowed_resume = "after_sanitize"
+                await self._sanitize_for_resume_locked(session)
+                await self._reopen_confined_page_locked(session)
             session.idle_expires_at = min(now_utc() + timedelta(minutes=10), session.expires_at)
             session.updated_at = now_utc()
             handover_token = mint_token()
@@ -529,19 +543,40 @@ class SessionRegistry:
             self._event(session, "handover_requested", "human")
             return session, handover_token
 
-    async def agent_claim(self, session_id: str, token: str) -> BrowserSession:
+    async def agent_claim(self, session_id: str, token: str | None) -> BrowserSession:
+        """Take the lease back after a human handover.
+
+        Ordinarily the one-time handover token is the authority, minted for the human and relayed
+        by them. An authenticated-site session cannot work that way: the token is minted for the
+        human and the design forbids routing it through the conversation, so trusted orchestration
+        would have no way to present it. There the human's handover POST is the signal that they
+        are finished and the service token is the authority — which is no weaker, because the
+        service token already creates and drives these sessions. The handover token is still
+        accepted when supplied, and is revoked either way so it cannot be replayed."""
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
             if session.state != SessionState.HANDOVER_REQUESTED:
                 raise ConflictError("session is not awaiting an agent handover")
-            handover_record = self._authorize_token_locked(session, token, token_type="handover")
+            await self._enforce_jar_not_revoked_locked(session)
+            handover_record = None
+            if token or not session.authenticated_site:
+                handover_record = self._authorize_token_locked(session, token or "", token_type="handover")
             session.lease_owner = transition(session.state, session.lease_owner, SessionState.AGENT_ACTIVE)
             session.state = SessionState.AGENT_ACTIVE
             session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
             session.updated_at = now_utc()
-            handover_record.consumed_at = now_utc()
+            if handover_record is not None:
+                handover_record.consumed_at = now_utc()
+            else:
+                self._revoke_session_tokens_locked(session, token_type="handover")
             self._revoke_session_tokens_locked(session, token_type="control")
+            if session.authenticated_site:
+                # Confinement is never lifted for these sessions; re-asserting it here means a
+                # future change to the human path cannot hand the agent a widened context.
+                worker = self.workers.get(session.worker_id or "")
+                if worker is not None:
+                    worker.set_confinement_active(True)
             self._event(session, "handover_claimed", "agent")
             return session
 
@@ -1363,6 +1398,23 @@ class SessionRegistry:
         session.current_url_redacted = None
         session.current_title_redacted = None
         self._event(session, "browser_sanitized", "service")
+
+    async def _reopen_confined_page_locked(self, session: BrowserSession) -> None:
+        """Open a fresh page inside the confinement set after sanitization.
+
+        The agent navigates for itself anyway, so a site that is down leaves the page at
+        about:blank rather than wedging the handback — a visible, ordinary starting state, not a
+        swallowed error."""
+        if not session.confine_origins:
+            return
+        worker = self.workers.get(session.worker_id or "")
+        if worker is None or worker.closed:
+            return
+        result = await worker.command(AgentCommandRequest(type="navigate", args={"url": session.confine_origins[0]}))
+        if result.get("blocked") or result.get("error"):
+            self._event(session, "resume_page_unavailable", "service", metadata={"reason": "navigation_failed"})
+            return
+        self._update_page_metadata(session, result)
 
     def _update_page_metadata(self, session: BrowserSession, result: dict[str, Any]) -> None:
         url = result.get("url")

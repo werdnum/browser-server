@@ -181,6 +181,13 @@ class ClaimRequest(BaseModel):
     token: str
 
 
+class AgentClaimRequest(BaseModel):
+    """Agent handback. ``token`` is the human's one-time handover token where one can be relayed;
+    an authenticated-site session claims without it, on the service token's authority."""
+
+    token: str | None = None
+
+
 class HandoverRequest(BaseModel):
     token: str
     handoff_note: str = Field(default="", max_length=1000)
