@@ -257,3 +257,18 @@ async def test_autofill_rejects_a_repurposed_snapshot_ref(worker, page_server, m
         )
         assert result.get("reason") == "target_invalidated", result
         assert await worker._page.locator("#pw").input_value() == SECRET
+
+
+@pytest.mark.asyncio
+async def test_close_page_discards_human_history(worker, page_server):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/human"}))
+    human_page = worker._page
+    await human_page.locator("#user").fill("human-only-otp")
+    await worker.command(AgentCommandRequest(type="close_page"))
+    assert human_page.is_closed()
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/resumed"}))
+    for _ in range(2):
+        await worker.command(AgentCommandRequest(type="navigate_back"))
+    snapshot = await worker.command(AgentCommandRequest(type="snapshot"))
+    assert "human-only-otp" not in str(snapshot)
+    assert worker._page.url == "about:blank"

@@ -6,8 +6,10 @@ single-use read — without a second implementation of the flow to drift from th
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -15,6 +17,7 @@ from typing import Any, cast
 import httpx
 import pytest
 from browser_handoff_service import main
+from browser_handoff_service.jars import JarStore, load_jar_keys
 from browser_handoff_service.keychute import KeychuteClient
 from browser_handoff_service.main import app, registry
 from browser_handoff_service.models import AUTOFILL_FILL_CAP
@@ -596,3 +599,44 @@ async def test_spent_grants_count_toward_the_cap_even_when_the_payload_cannot_fi
         assert response.json()["reason"] == "fill_cap_reached"
         assert len(keychute.requests) == AUTOFILL_FILL_CAP
         assert worker.filled == []
+
+
+@pytest.mark.asyncio
+async def test_jar_revoked_during_approval_wait_is_not_filled(keychute, monkeypatch, tmp_path):
+    monkeypatch.setenv("BROWSER_JAR_KEY", base64.urlsafe_b64encode(os.urandom(32)).decode())
+    store = JarStore(tmp_path / "jars", keys=load_jar_keys())
+    monkeypatch.setattr(registry, "jar_store", store)
+    meta = store.save(
+        jar_id=None,
+        label="Shop",
+        origins=[SITE],
+        nav_allowlist=[],
+        storage_mode="all",
+        raw_storage_state={
+            "cookies": [{"name": "sid", "value": "session", "domain": "shop.example.com", "path": "/", "expires": -1}],
+            "origins": [],
+        },
+        probe_spec_url=None,
+        probe_selector=None,
+        probe_logged_out_prefix=None,
+        saved_by="human",
+        owner_subject="user123",
+        form_factor="desktop",
+        created_session_id="provisioning",
+        conversation_id="c1",
+        agent_supplied_probe=False,
+    )
+    keychute.state = "pending"
+
+    def approve_after_revocation():
+        store.invalidate(meta.jar_id, actor="human")
+        keychute.state = "approved"
+
+    keychute.on_wait = approve_after_revocation
+    async with client() as ac:
+        session, worker = await _session(ac, jar_id=meta.jar_id)
+        response = await _autofill(ac, session["session_id"], wait_seconds=1)
+        assert response.status_code == 410
+        assert keychute.reads == 0
+        assert worker.closed
+        assert registry.get(session["session_id"]).state.value == "cancelled"

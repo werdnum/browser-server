@@ -846,6 +846,7 @@ class SessionRegistry:
                     "target_invalidated", "the page changed while the release was decided", origin=origin
                 )
 
+            await self._enforce_jar_not_revoked_locked(session)
             secret = await self.keychute.read_grant(status.grant_id, idempotency_key)
             session.autofill_fill_count += 1
         except KeychuteNotConfigured:

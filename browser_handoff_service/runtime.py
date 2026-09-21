@@ -1648,7 +1648,10 @@ class PlaywrightBrowserWorker:
             await page.go_forward()
             return await self._current_page_result({"accepted": True})
         if request.type == "close_page":
-            await page.goto("about:blank")
+            assert self._context is not None
+            replacement = await self._context.new_page()
+            await page.close()
+            self._page = replacement
             return {"closed": True, "url": None, "title": "Blank"}
         raise ValueError(f"unsupported command {request.type}")
 
