@@ -103,15 +103,30 @@ AUTHENTICATED_SITE_DENIED_COMMANDS = {"exec", "extract"}
 # Key-chord fences for an authenticated-site session. Writing into a protected control is fine;
 # what is denied is every chord that MOVES a value out of one into somewhere observable.
 _TRANSFER_KEYS = {"c", "x", "v", "insert"}
-_TRANSFER_MODIFIERS = {"control", "meta"}
+# Playwright resolves ControlOrMeta per platform, so it is a third spelling of the same chord.
+_TRANSFER_MODIFIERS = {"control", "meta", "controlormeta"}
+
+
+def _pressed_key(req: AgentCommandRequest) -> str | None:
+    """The key string the runtime will actually press, or None for a non-key command.
+
+    Read exactly as ``_dispatch_command`` reads it — ``press_key`` presses ``key`` and ignores
+    ``keys``, ``keyboard_press`` prefers ``keys``. A guard that inspected the other argument
+    would be a fence around a key the browser never receives, and the key it does receive would
+    go unchecked."""
+    if req.type == "press_key":
+        raw = req.args.get("key")
+    elif req.type == "keyboard_press":
+        raw = req.args.get("keys", req.args.get("key"))
+    else:
+        return None
+    return raw if isinstance(raw, str) else None
 
 
 def _is_transfer_chord(req: AgentCommandRequest) -> bool:
     """Whether a key command is a copy/cut/paste chord (Ctrl/Cmd+C/X/V/Insert, Shift+Insert)."""
-    if req.type not in {"press_key", "keyboard_press"}:
-        return False
-    raw = req.args.get("keys", req.args.get("key"))
-    if not isinstance(raw, str):
+    raw = _pressed_key(req)
+    if raw is None:
         return False
     parts = [part.strip().lower() for part in raw.split("+") if part.strip()]
     if not parts:
@@ -151,6 +166,11 @@ def _origin_host_port(origin: str) -> tuple[str, int | None]:
 def _parse_secret(secret: bytearray) -> dict[str, str]:
     """Interpret a released payload: a JSON object with username/password, or a bare password.
 
+    Anything that is not a JSON object carrying those keys IS the password, verbatim — not
+    trimmed, not normalized. A stored password may legitimately begin or end with whitespace, and
+    a fill that quietly altered it would look like a wrong password at the site rather than like
+    the bug it is.
+
     The plaintext only becomes a str here, at the point of the fill, and the caller drops it
     immediately afterwards."""
     try:
@@ -165,8 +185,10 @@ def _parse_secret(secret: bytearray) -> dict[str, str]:
                 values[kind] = value
         if values:
             return values
-    text = bytes(secret).decode("utf-8", errors="replace").strip()
-    return {"password": text} if text else {}
+    if not secret:
+        # An empty release is a broken secret, not a password; the caller refuses it.
+        return {}
+    return {"password": bytes(secret).decode("utf-8", errors="replace")}
 
 
 def _normalized_confine_origins(values: list[str] | None) -> list[str] | None:

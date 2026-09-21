@@ -262,6 +262,9 @@ async def test_exec_and_extract_are_denied_before_any_fill():
         ("Control+x", True),
         ("Control+Insert", True),
         ("Shift+Insert", True),
+        # Playwright resolves this per platform; it is the same chord under a third spelling.
+        ("ControlOrMeta+c", True),
+        ("controlormeta+V", True),
         ("Enter", False),
         ("Control+a", False),
         ("Tab", False),
@@ -278,6 +281,43 @@ async def test_transfer_chords_are_denied(keys, denied):
                 headers=agent_headers(),
             )
             assert (resp.status_code == 403) is denied, resp.text
+
+
+@pytest.mark.parametrize(
+    ("command_type", "args"),
+    [
+        # press_key presses args["key"] and ignores args["keys"], so a decoy in the argument the
+        # runtime does not read must not make the chord look innocent.
+        ("press_key", {"key": "Control+c", "keys": "Tab"}),
+        ("keyboard_press", {"keys": "Control+c", "key": "Tab"}),
+        # keyboard_press falls back to args["key"] when "keys" is absent.
+        ("keyboard_press", {"key": "Control+v"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_chord_guard_reads_the_key_the_runtime_presses(command_type, args):
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        resp = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": command_type, "args": args},
+            headers=agent_headers(),
+        )
+        assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_decoy_in_an_unread_argument_does_not_deny_an_innocent_press():
+    """The mirror runs both ways: press_key ignores "keys", so a chord there is not the key the
+    browser receives and must not block an ordinary Tab."""
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        resp = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "press_key", "args": {"key": "Tab", "keys": "Control+c"}},
+            headers=agent_headers(),
+        )
+        assert resp.status_code == 200, resp.text
 
 
 @pytest.mark.asyncio

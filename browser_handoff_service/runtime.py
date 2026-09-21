@@ -496,7 +496,12 @@ CHECK_REF_JS = (
 # A navigation replaces documentElement and takes the nonce with it.
 _AUTOFILL_HELPERS_JS = r"""
   const TARGET_ATTR = 'data-fa-autofill-target';
+  // Masking and field identity are two different questions about a control, so they get two
+  // different marks. PROTECTED_ATTR says "never show this value" and is stamped on every fill;
+  // FILL_KIND_ATTR records WHICH kind was filled. Deriving identity from the mask is what makes
+  // an autofilled username look like a password field on the next auto-detect.
   const PROTECTED_ATTR = 'data-fa-protected';
+  const FILL_KIND_ATTR = 'data-fa-autofill-kind';
   const NONCE_KEY = 'faAutofillNonce';
   const IDENTIFIER_TYPES = new Set(['text', 'email', 'tel']);
 
@@ -516,8 +521,14 @@ _AUTOFILL_HELPERS_JS = r"""
     return (el.getAttribute('autocomplete') || '').trim().toLowerCase();
   }
 
+  function filledAs(el) {
+    return (el.getAttribute(FILL_KIND_ATTR) || '').toLowerCase();
+  }
+
+  // A password field is one the page declares as such, or one a PASSWORD fill already landed in
+  // (which survives a "show password" toggle flipping the type away from password).
   function isPasswordField(el) {
-    return el.tagName === 'INPUT' && (inputType(el) === 'password' || el.hasAttribute(PROTECTED_ATTR));
+    return el.tagName === 'INPUT' && (inputType(el) === 'password' || filledAs(el) === 'password');
   }
 
   function isNewPassword(el) {
@@ -526,7 +537,8 @@ _AUTOFILL_HELPERS_JS = r"""
   }
 
   function isIdentifierField(el) {
-    return el.tagName === 'INPUT' && IDENTIFIER_TYPES.has(inputType(el));
+    if (el.tagName !== 'INPUT' || filledAs(el) === 'password') return false;
+    return IDENTIFIER_TYPES.has(inputType(el));
   }
 
   // Why this element cannot take a fill of ``kind``, or null when it can.
@@ -631,14 +643,15 @@ AUTOFILL_VERIFY_JS = (
 """
 )
 
-# ``(slot) => void``. Stamps a filled control protected so the walker masks it from here on,
-# and drops the transient target marker.
+# ``({slot, kind}) => void``. Stamps a filled control protected so the walker masks it from here
+# on, records which kind was filled, and drops the transient target marker.
 AUTOFILL_STAMP_JS = (
-    "(slot) => {"
+    "(args) => {"
     + _AUTOFILL_HELPERS_JS
     + r"""
-  for (const el of document.querySelectorAll('[' + TARGET_ATTR + '="' + slot + '"]')) {
+  for (const el of document.querySelectorAll('[' + TARGET_ATTR + '="' + args.slot + '"]')) {
     el.setAttribute(PROTECTED_ATTR, '1');
+    el.setAttribute(FILL_KIND_ATTR, args.kind);
     el.removeAttribute(TARGET_ATTR);
   }
 }
@@ -799,7 +812,10 @@ class FakeBrowserWorker:
         # that the value reached the control AND that it appears in nothing the API returned.
         self.autofill_fields: list[dict[str, Any]] = []
         self.filled: list[dict[str, str]] = []
+        # Masking (protected_refs) and field identity (filled_kinds) are tracked separately, as
+        # they are in the page: a username fill must not make a control look like a password field.
         self.protected_refs: set[str] = set()
+        self.filled_kinds: dict[str, str] = {}
         self.mask_protected = mask_protected
         self._autofill_nonce: str | None = None
         self._autofill_targets: list[dict[str, Any]] = []
@@ -980,15 +996,19 @@ class FakeBrowserWorker:
     def _autofill_unfillable(self, field: dict[str, Any], kind: str) -> str | None:
         if not field.get("visible", True):
             return "no_eligible_field"
+        ref = str(field["ref"])
         if kind == "password":
-            if field.get("input_type") != "password" and str(field["ref"]) not in self.protected_refs:
+            if not self._is_password_field(field):
                 return "no_eligible_field"
             if field.get("autocomplete") == "new-password":
                 return "new_password_field"
             return None
-        if field.get("input_type") not in {"text", "email", "tel"}:
+        if self.filled_kinds.get(ref) == "password" or field.get("input_type") not in {"text", "email", "tel"}:
             return "no_eligible_field"
         return None
+
+    def _is_password_field(self, field: dict[str, Any]) -> bool:
+        return field.get("input_type") == "password" or self.filled_kinds.get(str(field["ref"])) == "password"
 
     async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]:
         origin = origin_of(self.url)
@@ -1011,12 +1031,15 @@ class FakeBrowserWorker:
                 chosen.append((field, str(spec["kind"])))
         else:
             main = [f for f in self.autofill_fields if not f.get("iframe") and f.get("visible", True)]
-            passwords = [
-                f for f in main if f.get("input_type") == "password" and f.get("autocomplete") != "new-password"
-            ]
+            passwords = [f for f in main if self._is_password_field(f) and f.get("autocomplete") != "new-password"]
             if len(passwords) > 1:
                 return fail("ambiguous_fields")
-            identifiers = [f for f in main if f.get("input_type") in {"text", "email", "tel"}]
+            identifiers = [
+                f
+                for f in main
+                if f.get("input_type") in {"text", "email", "tel"}
+                and self.filled_kinds.get(str(f["ref"])) != "password"
+            ]
             hinted = [f for f in identifiers if f.get("autocomplete") == "username"]
             identifier = hinted[0] if len(hinted) == 1 else (identifiers[0] if len(identifiers) == 1 else None)
             if len(passwords) == 1:
@@ -1048,6 +1071,7 @@ class FakeBrowserWorker:
             self.filled = [entry for entry in self.filled if entry["ref"] != ref]
             self.filled.append({"ref": ref, "kind": str(target["kind"]), "value": value})
             self.protected_refs.add(ref)
+            self.filled_kinds[ref] = str(target["kind"])
             filled.append({"ref": ref, "kind": target["kind"]})
         return {"ok": True, "filled": filled}
 
@@ -1685,11 +1709,11 @@ class PlaywrightBrowserWorker:
             locator = page.locator(f'[data-fa-autofill-target="{slot}"]')
             try:
                 await locator.fill(value)
-                await page.evaluate(AUTOFILL_STAMP_JS, slot)
+                await page.evaluate(AUTOFILL_STAMP_JS, {"slot": slot, "kind": str(target["kind"])})
             except PlaywrightError:
                 # Stamp anyway where we can: a partially applied fill must still be masked.
                 try:
-                    await page.evaluate(AUTOFILL_STAMP_JS, slot)
+                    await page.evaluate(AUTOFILL_STAMP_JS, {"slot": slot, "kind": str(target["kind"])})
                 except PlaywrightError:
                     pass
                 return {"error": True, "reason": "target_invalidated", "filled": filled}

@@ -240,6 +240,76 @@ async def test_a_bare_string_secret_fills_the_password(keychute):
 
 
 @pytest.mark.asyncio
+async def test_a_password_keeps_its_exact_bytes(keychute):
+    """A stored password may begin or end with whitespace. Trimming it would look like a wrong
+    password at the site rather than like the bug it is."""
+    keychute.secret = "  spaced out\t"
+    async with client() as ac:
+        session, worker = await _session(ac)
+        resp = await _autofill(ac, session["session_id"], fields=[{"ref": "e11", "kind": "password"}])
+        assert resp.json()["status"] == "filled", resp.text
+        assert worker.filled == [{"ref": "e11", "kind": "password", "value": "  spaced out\t"}]
+
+
+@pytest.mark.asyncio
+async def test_an_all_whitespace_password_is_still_a_password(keychute):
+    keychute.secret = "   "
+    async with client() as ac:
+        session, worker = await _session(ac)
+        resp = await _autofill(ac, session["session_id"], fields=[{"ref": "e11", "kind": "password"}])
+        assert resp.json()["status"] == "filled", resp.text
+        assert worker.filled == [{"ref": "e11", "kind": "password", "value": "   "}]
+
+
+@pytest.mark.asyncio
+async def test_a_json_looking_string_that_is_not_an_object_is_the_password(keychute):
+    keychute.secret = "[1, 2, 3]"
+    async with client() as ac:
+        session, worker = await _session(ac)
+        resp = await _autofill(ac, session["session_id"], fields=[{"ref": "e11", "kind": "password"}])
+        assert resp.json()["status"] == "filled", resp.text
+        assert worker.filled == [{"ref": "e11", "kind": "password", "value": "[1, 2, 3]"}]
+
+
+@pytest.mark.asyncio
+async def test_a_username_fill_does_not_make_the_control_look_like_a_password_field(keychute):
+    """Masking and field identity are separate questions. A filled username is masked, but it is
+    still not a password field — otherwise the next auto-detect sees two of them."""
+    async with client() as ac:
+        session, worker = await _session(ac)
+        first = await _autofill(
+            ac, session["session_id"], step_key="username", fields=[{"ref": "e10", "kind": "username"}]
+        )
+        assert first.json()["status"] == "filled", first.text
+        assert "e10" in worker.protected_refs
+
+        keychute.reads = 0
+        keychute.grant_id = str(uuid.uuid4())
+        second = await _autofill(ac, session["session_id"], step_key="password")
+        assert second.json()["status"] == "filled", second.text
+        # Auto-detect still names exactly one password, and it is the password input.
+        assert [entry["kind"] for entry in second.json()["filled"] if entry["ref"] == "e11"] == ["password"]
+        assert not any(entry["ref"] == "e10" and entry["kind"] == "password" for entry in second.json()["filled"])
+
+
+@pytest.mark.asyncio
+async def test_a_username_only_form_is_not_mistaken_for_a_password_form(keychute):
+    async with client() as ac:
+        session, worker = await _session(ac)
+        worker.autofill_fields = [{"ref": "e10", "input_type": "email", "autocomplete": "username"}]
+        first = await _autofill(
+            ac, session["session_id"], step_key="username", fields=[{"ref": "e10", "kind": "username"}]
+        )
+        assert first.json()["status"] == "filled", first.text
+
+        keychute.reads = 0
+        keychute.grant_id = str(uuid.uuid4())
+        second = await _autofill(ac, session["session_id"], step_key="password")
+        # The one control on the page is a filled username; it is not also the password field.
+        assert [entry["kind"] for entry in second.json()["filled"]] == ["username"], second.text
+
+
+@pytest.mark.asyncio
 async def test_a_secret_without_the_requested_kind_is_refused(keychute):
     keychute.secret = PASSWORD
     async with client() as ac:
