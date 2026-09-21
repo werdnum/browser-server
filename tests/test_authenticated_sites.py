@@ -6,6 +6,7 @@ registry: every protection has to hold for a caller who asks for the opposite.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from typing import cast
@@ -16,6 +17,7 @@ from browser_handoff_service.jars import JarStore, load_jar_keys
 from browser_handoff_service.main import app, registry
 from browser_handoff_service.runtime import FakeBrowserWorker
 from httpx import ASGITransport, AsyncClient
+from starlette.websockets import WebSocket
 
 TEST_SERVICE_TOKEN = "test-service-token"
 
@@ -608,3 +610,44 @@ async def test_oidc_human_can_serialize_inactive_authenticated_site_defaults(mon
         assert response.status_code == 200, response.text
         assert response.json()["state"] == "human_active"
         assert response.json()["authenticated_site"] is False
+
+
+@pytest.mark.asyncio
+async def test_live_novnc_bridge_stops_forwarding_after_handback():
+    async with client() as ac:
+        session = await _authenticated_session(ac)
+        token = await _park_with_human(ac, session)
+        session_id = session["session_id"]
+        sent = []
+        closed = asyncio.Event()
+
+        class Upstream:
+            async def send(self, data):
+                sent.append(data)
+
+            async def close(self, code=1000):
+                assert code == 1008
+                closed.set()
+
+            def __aiter__(self):
+                return self.messages()
+
+            async def messages(self):
+                await closed.wait()
+                yield b"late-screen-frame"
+
+        class Client:
+            count = 0
+
+            async def receive(self):
+                self.count += 1
+                if self.count == 2:
+                    await registry.handover(session_id, token, "done")
+                    await registry.agent_claim(session_id, None)
+                return {"type": "websocket.receive", "bytes": b"human-input"}
+
+        await main._bridge_websockets(cast(WebSocket, Client()), Upstream(), session_id=session_id, token=token)
+        assert sent == [b"human-input"]
+        assert closed.is_set()
+        assert registry.get(session_id).state.value == "agent_active"
+        assert not registry.workers[session["worker_id"]].closed

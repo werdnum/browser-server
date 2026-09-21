@@ -1349,12 +1349,10 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
     try:
         async with websockets.connect(upstream_url, subprotocols=subprotocols, max_size=None) as upstream:
             await websocket.accept(subprotocol=upstream.subprotocol)
-            # Authorization is checked once at connect, but a jar-backed session can be revoked
-            # mid-stream by another process; poll the shared tombstone and tear the context down so
-            # the kill-switch reaches a live human-driven browser, not just future loads.
-            watchdog = asyncio.create_task(_novnc_revocation_watchdog(session_id))
+            token = websocket.query_params.get("token") or websocket.cookies.get(_novnc_cookie_name(session_id)) or ""
+            watchdog = asyncio.create_task(_novnc_revocation_watchdog(session_id, token, upstream))
             try:
-                await _bridge_websockets(websocket, upstream)
+                await _bridge_websockets(websocket, upstream, session_id=session_id, token=token)
             finally:
                 watchdog.cancel()
     except WebSocketDisconnect:
@@ -1366,16 +1364,20 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
             pass
 
 
-async def _novnc_revocation_watchdog(session_id: str) -> None:
-    """Close the session (and its worker/noVNC display) if a jar backing it is revoked while a
-    noVNC connection is live. Closing the worker drops the upstream websocket, ending the bridge."""
+async def _novnc_stream_authorized(session_id: str, token: str, upstream) -> bool:
+    try:
+        await registry.authorize_remote(session_id, token)
+    except (AuthorizationError, SessionInactiveError, NotFoundError):
+        await upstream.close(code=1008)
+        return False
+    return True
+
+
+async def _novnc_revocation_watchdog(session_id: str, token: str, upstream) -> None:
+    """Recheck idle streams as well as traffic, including shared jar revocation."""
     while True:
         await asyncio.sleep(5)
-        if registry.session_jar_revoked(session_id):
-            try:
-                await registry.close(session_id)
-            except Exception:
-                logger.warning("failed to close revoked noVNC session %s", session_id, exc_info=True)
+        if not await _novnc_stream_authorized(session_id, token, upstream):
             return
 
 
@@ -1497,12 +1499,14 @@ def _novnc_upstream_websocket_url(remote_url: str) -> str:
     return urlunsplit((scheme, remote.netloc, "/websockify", "", ""))
 
 
-async def _bridge_websockets(client: WebSocket, upstream) -> None:
+async def _bridge_websockets(client: WebSocket, upstream, *, session_id: str, token: str) -> None:
     async def client_to_upstream() -> None:
         while True:
             message = await client.receive()
             if message["type"] == "websocket.disconnect":
                 await upstream.close()
+                return
+            if not await _novnc_stream_authorized(session_id, token, upstream):
                 return
             if message.get("bytes") is not None:
                 await upstream.send(message["bytes"])
@@ -1511,6 +1515,8 @@ async def _bridge_websockets(client: WebSocket, upstream) -> None:
 
     async def upstream_to_client() -> None:
         async for message in upstream:
+            if not await _novnc_stream_authorized(session_id, token, upstream):
+                return
             if isinstance(message, bytes):
                 await client.send_bytes(message)
             else:
