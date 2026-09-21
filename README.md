@@ -153,6 +153,102 @@ process. The one bound to know about today is a whole-filesystem rollback that a
 tombstone log — set an external monotonic anchor (`jar-anchor.json`, or a KMS/DB/WORM export) to
 close it.
 
+## Authenticated-site sessions and credential autofill
+
+A jar is one way to reach a logged-in page; the other is to let the operator's stored password be
+**filled** into a login form without it ever passing through the agent. Both live inside the same
+session type, created with `authenticated_site: true` on `create_session` (service token only,
+like `jar_id`):
+
+```jsonc
+POST /v1/sessions
+{
+  "conversation_id": "…",
+  "authenticated_site": true,
+  "jar_id": "jar_…",                                   // optional
+  "confine_origins": ["https://shop.example.com"],     // required when there is no jar
+  "credential_alias": "shop-login"                     // optional; no alias, no autofill
+}
+```
+
+What the session type fixes, deterministically and regardless of what else the caller asked for:
+
+- `exec` and `extract` are denied outright, and clipboard/transfer chords (`Control`/`Meta` with
+  `c`/`x`/`v`/`Insert`, and `Shift+Insert`) are refused. Typing *into* a protected control is
+  still fine — writing is not leaking.
+- Navigation confinement is always on (`confine_navigation: false` is a 400, as is `allow_exec`),
+  and a **jarless** session supplies the set explicitly and is confined by the same route guard a
+  jar-loaded one uses. Stating both a `jar_id` and `confine_origins` requires the two to be equal;
+  otherwise the call is a 400, so a caller can never verify one set while the session enforces
+  another. The session record echoes `confine_origins` as actually enforced.
+- Every `input[type=password]`, plus every control a fill touched, is **protected**: the snapshot
+  walker stamps `data-fa-protected`, omits the value, and reports `value_masked` with
+  `has_value` instead; screenshots mask the same selector. Tracking is per element, so a "show
+  password" toggle cannot turn a protected control back into a readable one.
+
+`POST /v1/sessions/{id}/autofill` then fills the pinned credential into the login form on the
+current page. Policy outcomes are a 200 with a typed status, not an HTTP code:
+
+```jsonc
+// request
+{"step_key": "password", "fields": [{"ref": "e12", "kind": "password"}], "wait_seconds": 25,
+ "context": {"site": "shop", "acting_user": "andrew"}}
+
+// responses
+{"status": "filled", "filled": [{"ref": "e12", "kind": "password"}], "origin": "https://shop.example.com"}
+{"status": "approval_pending", "request_id": "…", "origin": "…"}
+{"status": "refused", "reason": "new_password_field", "detail": "…"}
+```
+
+`fields` may be omitted, in which case browser-server auto-detects on the main-frame document (a
+second visible password field is `ambiguous_fields`, not a guess). Refusal reasons:
+`not_authenticated_site`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
+`new_password_field`, `in_iframe`, `target_invalidated`, `policy_denied`, `request_expired`,
+`grant_invalid`, `bad_password_recorded`, `fill_cap_reached`, `keychute_unavailable`, `stale_ref`,
+`invalid_ref`.
+
+`POST /v1/sessions/{id}/autofill/outcome` with `{"outcome": "bad_password"}` latches the session:
+every later fill is refused. A per-session cap of 6 fills is the deterministic backstop behind it.
+
+Each call is one [Keychute](https://github.com/werdnum/keychute) access request and one single-use
+grant read, and the destination is decided here rather than taken on trust:
+
+1. The request's origin constraint is the origin of the **document actually on screen**, never
+   anything the caller supplied, and the idempotency key is `"{session_id}:{step_key}"` — so an
+   `approval_pending` retry of the same step resumes the same decision instead of opening a second
+   one.
+2. The fill-time check is against the **granted** constraints, which an approval may have narrowed
+   below what was asked for. An origin the session may *navigate* is not thereby an origin a fill
+   may *target*.
+3. Resolve, verify and fill are one serialized operation under the session lock, and the target
+   document is pinned with a nonce; a navigation in between — including one the site starts while
+   an approval is pending — is `target_invalidated` rather than a fill into whatever is there now.
+4. Element checks refuse rather than guess: a password only into `input[type=password]` (or an
+   already-protected control), never into an `autocomplete=new-password` field, an identifier only
+   into text/email/tel, and main frame only.
+
+browser-server **stores no credential**: it holds the released plaintext only long enough to place
+it in the field, zeroes the buffer, and puts it in no response, event, log or exception. Configure
+the broker (unconfigured ⇒ autofill returns `refused(keychute_unavailable)`):
+
+```bash
+export BROWSER_KEYCHUTE_URL="https://keychute.keychute.svc.cluster.local"
+export BROWSER_KEYCHUTE_TOKEN_FILE="/var/run/secrets/keychute/token"   # re-read per request
+export BROWSER_KEYCHUTE_TOKEN="<secret>"                               # alternative to the file
+export BROWSER_KEYCHUTE_CA_BUNDLE="/etc/ssl/internal-ca/ca.crt"        # internal CA, optional
+export BROWSER_KEYCHUTE_EXTERNAL_URL="https://keychute.example.com"    # approval links, optional
+```
+
+Release authority lives in Keychute's policy rows, not here: which secret may be released to
+client `browser-server` for mechanism `autofill`, for which page origins, with which outcome. The
+alias on the session is routing — it decides *which* secret this run may ask for — and authorizes
+nothing on its own.
+
+Read-back protection is best-effort by design, and the design says so: a browser is an open-ended
+rendering surface, and once a value is in the field the approved origin's own JavaScript can read
+it, exactly as with any password manager. What is mechanical is the destination check, the
+serialized target binding, and the absence of `exec`/`extract`.
+
 ## Setup
 
 ```bash
