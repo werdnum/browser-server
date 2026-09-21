@@ -1728,6 +1728,19 @@ class PlaywrightBrowserWorker:
             slot = str(target["slot"])
             locator = page.locator(f'[data-fa-autofill-target="{slot}"]')
             try:
+                verified = cast(
+                    dict[str, Any],
+                    await page.evaluate(
+                        AUTOFILL_VERIFY_JS,
+                        {
+                            "nonce": nonce,
+                            "origin": origin,
+                            "slots": [{"slot": slot, "kind": str(target["kind"]), "ref": target.get("ref")}],
+                        },
+                    ),
+                )
+                if not verified.get("ok"):
+                    return {"error": True, "reason": "target_invalidated", "filled": filled}
                 await locator.fill(value)
                 await page.evaluate(AUTOFILL_STAMP_JS, {"slot": slot, "kind": str(target["kind"])})
             except PlaywrightError:

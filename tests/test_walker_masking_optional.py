@@ -287,3 +287,22 @@ async def test_reveal_before_first_snapshot_stays_protected(worker, page_server,
     password = _by_name(snapshot["roots"], "Password")
     assert password["input_type"] == "text"
     assert password["value_masked"] is True
+
+
+@pytest.mark.asyncio
+async def test_username_handler_cannot_repurpose_password_target(worker, page_server):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content(
+        '<input type="email" autocomplete="username" id="user">'
+        '<input type="password" id="pw">'
+        '<script>document.querySelector("#user").addEventListener("input", () => '
+        'document.querySelector("#pw").setAttribute("autocomplete", "new-password"))</script>'
+    )
+    prepared = await worker.autofill_prepare(None, "multi-field")
+    assert prepared.get("ok"), prepared
+    result = await worker.autofill_fill(
+        "multi-field", prepared["origin"], prepared["targets"], {"username": "user", "password": SECRET}
+    )
+    assert result.get("reason") == "target_invalidated", result
+    assert await worker._page.locator("#pw").input_value() == ""
+    assert await worker._page.locator("#user").input_value() == "user"
