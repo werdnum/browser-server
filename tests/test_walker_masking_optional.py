@@ -306,3 +306,16 @@ async def test_username_handler_cannot_repurpose_password_target(worker, page_se
     assert result.get("reason") == "target_invalidated", result
     assert await worker._page.locator("#pw").input_value() == ""
     assert await worker._page.locator("#user").input_value() == "user"
+
+
+@pytest.mark.asyncio
+async def test_auto_detected_target_keeps_identity_without_prior_snapshot(worker, page_server):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content('<label for="pw">Current password</label><input type="password" id="pw">')
+    prepared = await worker.autofill_prepare(None, "auto-identity")
+    assert prepared.get("ok"), prepared
+    assert prepared["targets"][0]["ref"] is not None
+    await worker._page.locator("label").evaluate("el => el.textContent = 'Replacement password'")
+    result = await worker.autofill_fill("auto-identity", prepared["origin"], prepared["targets"], {"password": SECRET})
+    assert result.get("reason") == "target_invalidated", result
+    assert await worker._page.locator("#pw").input_value() == ""

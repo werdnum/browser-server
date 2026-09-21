@@ -777,6 +777,9 @@ class SessionRegistry:
                 "wrong_origin", "the current document is not inside this session's confinement set", origin=origin
             )
 
+        if not origin.startswith("https://"):
+            return autofill_refused("wrong_origin", "credential autofill requires HTTPS", origin=origin)
+
         if not self.keychute.configured:
             return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
 

@@ -619,6 +619,8 @@ AUTOFILL_PREPARE_JS = (
   const targets = [];
   for (let i = 0; i < chosen.length; i++) {
     const [el, kind] = chosen[i];
+    const ref = el.getAttribute('data-fa-ref');
+    if (!ref || !checkRef(ref).ok) return fail('no_eligible_field');
     el.setAttribute(TARGET_ATTR, String(i));
     targets.push(Object.assign({ slot: String(i) }, describe(el, kind)));
   }
@@ -1672,6 +1674,8 @@ class PlaywrightBrowserWorker:
         if self.closed or page is None:
             raise RuntimeError("worker is closed")
         try:
+            if not fields:
+                await page.evaluate(SNAPSHOT_JS, 1)
             result = cast(dict[str, Any], await page.evaluate(AUTOFILL_PREPARE_JS, {"fields": fields, "nonce": nonce}))
         except PlaywrightError:
             # The document went away under the check; there is nothing left to bind to.

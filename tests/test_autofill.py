@@ -555,16 +555,15 @@ async def test_an_oversized_context_is_rejected(keychute):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("grant_port", "expected"), [(None, "refused"), (80, "filled")])
-async def test_http_requires_a_grant_for_port_80(keychute, grant_port, expected):
-    keychute.granted_port = grant_port
+@pytest.mark.parametrize("origin", ["http://shop.example.com", "http://shop.example.com:443"])
+async def test_http_autofill_is_refused_even_with_a_matching_host_and_port(keychute, origin):
     async with client() as ac:
-        session, worker = await _session(ac, confine_origins=["http://shop.example.com"])
-        worker.url = "http://shop.example.com/login"
+        session, worker = await _session(ac, confine_origins=[origin])
+        worker.url = origin + "/login"
         response = await _autofill(ac, session["session_id"])
-        assert response.json()["status"] == expected
-        assert keychute.requests[0]["constraints"]["origins"] == [{"host": "shop.example.com", "port": 80}]
-        assert keychute.reads == (1 if expected == "filled" else 0)
+        assert response.json()["reason"] == "wrong_origin"
+        assert not keychute.requests
+        assert keychute.reads == 0
 
 
 @pytest.mark.asyncio
