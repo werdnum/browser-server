@@ -354,3 +354,22 @@ async def test_auto_detection_preserves_refs_across_navigation(worker, page_serv
     await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/third"}))
     third = await worker.command(AgentCommandRequest(type="snapshot", args={"next_ref": 1}))
     assert all(int(node["ref"][1:]) >= second["next_ref"] for node in _flatten(third["roots"]) if node.get("ref"))
+
+
+@pytest.mark.asyncio
+async def test_fill_handler_cannot_remove_post_fill_masking_target(worker, page_server):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content(
+        '<input type="password" id="pw">'
+        '<script>document.querySelector("#pw").addEventListener("input", event => {'
+        'event.target.type = "text"; event.target.removeAttribute("data-fa-autofill-target");'
+        "})</script>"
+    )
+    prepared = await worker.autofill_prepare(None, "mask-before-input")
+    result = await worker.autofill_fill(
+        "mask-before-input", prepared["origin"], prepared["targets"], {"password": SECRET}
+    )
+    assert result.get("ok"), result
+    snapshot = await worker.command(AgentCommandRequest(type="snapshot", args={}))
+    assert SECRET not in str(snapshot)
+    assert await worker._page.locator("#pw").get_attribute("data-fa-protected") is not None

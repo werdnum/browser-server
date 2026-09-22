@@ -669,7 +669,6 @@ AUTOFILL_STAMP_JS = (
   for (const el of document.querySelectorAll('[' + TARGET_ATTR + '="' + args.slot + '"]')) {
     el.setAttribute(PROTECTED_ATTR, '1');
     el.setAttribute(FILL_KIND_ATTR, args.kind);
-    el.removeAttribute(TARGET_ATTR);
   }
 }
 """
@@ -1761,8 +1760,8 @@ class PlaywrightBrowserWorker:
                 )
                 if not verified.get("ok"):
                     return {"error": True, "reason": "target_invalidated", "filled": filled}
-                await locator.fill(value)
                 await page.evaluate(AUTOFILL_STAMP_JS, {"slot": slot, "kind": str(target["kind"])})
+                await locator.fill(value)
             except PlaywrightError:
                 # Stamp anyway where we can: a partially applied fill must still be masked.
                 try:

@@ -65,6 +65,7 @@ class FakeKeychute:
         self.granted_host: str | None = None
         self.granted_port: int | None = None
         self.revoked = False
+        self.grant_info_unavailable = False
         self.mechanism = "autofill"
         self.expired = False
         self.reads = 0
@@ -100,6 +101,8 @@ class FakeKeychute:
                 200, json={"secret": secret, "encoding": "utf8", "secret_version_id": str(uuid.uuid4())}
             )
         if path.startswith("/v1/grants/"):
+            if self.grant_info_unavailable:
+                return httpx.Response(503, json={"error": {"code": "unavailable", "message": "retry later"}})
             now = datetime.now(UTC)
             origin: dict[str, Any] = {"host": self.granted_host or "shop.example.com"}
             if self.granted_port is not None:
@@ -711,3 +714,17 @@ async def test_bad_password_report_requires_agent_lease(keychute, state, owner):
         )
         assert response.status_code == 403
         assert not live.autofill_bad_password
+
+
+@pytest.mark.asyncio
+async def test_approved_retry_retains_target_after_broker_failure(keychute):
+    async with client() as ac:
+        session, worker = await _session(ac)
+        keychute.grant_info_unavailable = True
+        first = await _autofill(ac, session["session_id"])
+        assert first.json()["reason"] == "keychute_unavailable"
+        await worker.autofill_prepare(None, "replacement-document")
+        keychute.grant_info_unavailable = False
+        second = await _autofill(ac, session["session_id"])
+        assert second.json()["reason"] == "target_invalidated"
+        assert keychute.reads == 0

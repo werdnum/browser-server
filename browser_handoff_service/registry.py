@@ -733,6 +733,8 @@ class SessionRegistry:
                 raise AuthorizationError("autofill is denied unless the agent owns the lease")
             await self._enforce_jar_not_revoked_locked(session)
             response = await self._autofill_locked(session, req)
+            if response.status != "approval_pending" and response.reason != "keychute_unavailable":
+                session.autofill_pending.pop(req.step_key, None)
             session.updated_at = now_utc()
             session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
             self._event(
@@ -811,12 +813,12 @@ class SessionRegistry:
                     "origin": origin,
                 },
             )
+            session.autofill_pending[req.step_key] = PendingAutofill(
+                request_id=status.request_id, nonce=nonce, origin=origin, targets=targets
+            )
             if status.state == "pending" and req.wait_seconds > 0:
                 status = await self.keychute.wait(status.request_id, req.wait_seconds)
             if status.state == "pending":
-                session.autofill_pending[req.step_key] = PendingAutofill(
-                    request_id=status.request_id, nonce=nonce, origin=origin, targets=targets
-                )
                 approval_url = self.keychute.approval_url(status.request_id)
                 return AutofillResponse(
                     status="approval_pending",
@@ -826,7 +828,6 @@ class SessionRegistry:
                     if approval_url
                     else "awaiting a release decision",
                 )
-            session.autofill_pending.pop(req.step_key, None)
             if status.state == "denied":
                 return autofill_refused("policy_denied", "the release was denied", origin=origin)
             if status.state == "expired":
