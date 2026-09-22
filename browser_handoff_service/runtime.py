@@ -1378,9 +1378,13 @@ class PlaywrightBrowserWorker:
 
         if self.mask_protected:
             for frame in page.frames:
-                await frame.locator("input[type=password]").evaluate_all(
-                    "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
-                )
+                try:
+                    await frame.locator("input[type=password]").evaluate_all(
+                        "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
+                    )
+                except PlaywrightError:
+                    if not frame.is_detached():
+                        raise
 
         # Any action (a click on a link, Enter submitting a form, go_back to an off-scope page) can
         # trigger a navigation the route guard aborts. Reset the flag and, if such an abort escapes

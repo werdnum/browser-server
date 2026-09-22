@@ -396,3 +396,24 @@ async def test_child_frame_password_is_stamped_and_masked(worker, page_server, m
     await worker.command(AgentCommandRequest(type="screenshot", args={}))
     assert len(masked) == 2
     assert masked[1] >= 1
+
+
+@pytest.mark.asyncio
+async def test_detaching_child_does_not_break_password_preflight(worker, page_server, monkeypatch):
+    from patchright.async_api import Error as PlaywrightError
+
+    worker.mask_protected = True
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content('<iframe src="/child"></iframe><input type="password" id="main">')
+    frame = worker._page.frames[1]
+    await frame.wait_for_selector("#pw")
+
+    class DetachingLocator:
+        async def evaluate_all(self, expression):
+            await worker._page.locator("iframe").evaluate("el => el.remove()")
+            raise PlaywrightError("Frame was detached")
+
+    monkeypatch.setattr(frame, "locator", lambda selector: DetachingLocator())
+    result = await worker.command(AgentCommandRequest(type="press_key", args={"key": "Tab"}))
+    assert result["accepted"]
+    assert await worker._page.locator("#main").get_attribute("data-fa-protected") is not None
