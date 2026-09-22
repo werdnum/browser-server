@@ -954,6 +954,11 @@ def _validate_authenticated_site_request(req: CreateSessionRequest, auth: AuthCo
     requested = req.authenticated_site or req.confine_origins is not None or req.credential_alias is not None
     if requested and auth.actor_type != "agent":
         raise HTTPException(status_code=403, detail="authenticated-site sessions require the service token")
+    if req.autofill_enabled:
+        if auth.actor_type != "agent":
+            raise HTTPException(status_code=403, detail="autofill sessions require the service token")
+        if req.allow_exec:
+            raise HTTPException(status_code=400, detail="allow_exec cannot be combined with autofill_enabled")
     if not req.authenticated_site:
         if req.confine_origins is not None:
             raise HTTPException(status_code=400, detail="confine_origins requires authenticated_site")

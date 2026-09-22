@@ -413,3 +413,27 @@ make check
 .venv/bin/pre-commit install
 make pre-commit
 ```
+
+
+### On-demand Keychute autofill
+
+Create a service-token browser session with `autofill_enabled: true` to allow
+credential requests during ordinary browsing. No `authenticated_site`, origin
+configuration or pinned alias is needed. The session masks credential controls
+and denies `exec`, raw `extract` and protected-value transfer commands from
+creation; it can navigate across sites normally.
+
+At a login form, POST to `/v1/sessions/{session_id}/autofill` with
+`{"secret_name": "amazon-password", "step_key": "login-1"}`. The existing optional
+`fields`, `wait_seconds` and `context` arguments still apply. This **requests**
+access: browser-server obtains the actual HTTPS document origin and Keychute
+approves, denies, or waits for a human decision. Standing grants are optional and
+should constrain origins when appropriate. Browser-server verifies the granted
+origin before reading or filling the credential; plaintext never goes to FA.
+
+Retry an `approval_pending` response with the same secret and step key, without
+navigating the page. After a terminal result, use a new step key for another fill.
+A configured authenticated-site session still uses its pinned alias and rejects
+requests for another account. An ordinary on-demand session intentionally has no
+per-site account allowlist: access is governed by Keychute's browser-server client
+policy. Its acting-user context is audit information, not separate user identity.

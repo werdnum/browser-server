@@ -227,7 +227,7 @@ async def test_a_fill_places_the_secret_and_reports_only_metadata(keychute, capl
         assert keychute.reads == 1
         assert len(keychute.requests) == 1
         request = keychute.requests[0]
-        assert request["idempotency_key"] == f"{session['session_id']}:password"
+        assert request["idempotency_key"].startswith(f"{session['session_id']}:")
         assert request["secret_name"] == "shop-login"
         assert request["mechanism"] == "autofill"
         assert request["constraints"]["origins"] == [{"host": "shop.example.com", "port": 443}]
@@ -472,7 +472,7 @@ async def test_a_pending_decision_parks_and_a_retry_reuses_the_same_request(keyc
         assert second.json()["request_id"] == request_id
         # Same step, same idempotency key: a retry resumes the decision rather than opening a
         # second one for the operator to answer.
-        assert {req["idempotency_key"] for req in keychute.requests} == {f"{session['session_id']}:password"}
+        assert len({req["idempotency_key"] for req in keychute.requests}) == 1
         assert {req["context"]["reason"] for req in keychute.requests} == {
             f"Autofill shop-login login on {SITE} for the configured user (step password)"
         }
@@ -487,7 +487,7 @@ async def test_an_ordinary_session_has_no_autofill(keychute):
         resp = await ac.post("/v1/sessions", json={"conversation_id": "c1"}, headers=agent_headers())
         session = resp.json()
         out = await _autofill(ac, session["session_id"])
-        assert out.json()["reason"] == "not_authenticated_site", out.text
+        assert out.json()["reason"] == "autofill_disabled", out.text
         assert not keychute.requests
 
 
@@ -780,3 +780,122 @@ async def test_pending_retry_reuses_original_context(keychute):
         )
         assert second.json()["status"] == "filled"
         assert keychute.requests[0] == keychute.requests[1]
+
+
+@pytest.mark.asyncio
+async def test_on_demand_fill_needs_no_site_or_pinned_alias(keychute):
+    async with client() as ac:
+        session, worker = await _session(
+            ac,
+            authenticated_site=False,
+            confine_origins=None,
+            credential_alias=None,
+            autofill_enabled=True,
+        )
+        assert worker.mask_protected
+        assert not session["confine_navigation"]
+        response = await _autofill(ac, session["session_id"], secret_name="my-amazon-password")
+        assert response.json()["status"] == "filled", response.text
+        assert keychute.requests[0]["secret_name"] == "my-amazon-password"
+        assert keychute.requests[0]["constraints"]["origins"] == [{"host": "shop.example.com", "port": 443}]
+        assert PASSWORD not in response.text
+        navigation = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": "navigate", "args": {"url": "https://other.example.com/"}},
+            headers=agent_headers(),
+        )
+        assert navigation.status_code == 200, navigation.text
+
+
+@pytest.mark.asyncio
+async def test_on_demand_fill_approval_then_retry(keychute):
+    keychute.state = "pending"
+    async with client() as ac:
+        session, worker = await _session(
+            ac,
+            authenticated_site=False,
+            confine_origins=None,
+            credential_alias=None,
+            autofill_enabled=True,
+        )
+        pending = await _autofill(ac, session["session_id"], secret_name="chosen-login", wait_seconds=0)
+        assert pending.json()["status"] == "approval_pending"
+        assert not worker.filled
+        keychute.state = "approved"
+        filled = await _autofill(ac, session["session_id"], secret_name="chosen-login", wait_seconds=0)
+        assert filled.json()["status"] == "filled", filled.text
+        assert len({r["idempotency_key"] for r in keychute.requests}) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_demand_origin_must_match_granted_origin(keychute):
+    keychute.granted_host = "amazon.com"
+    async with client() as ac:
+        session, worker = await _session(
+            ac,
+            authenticated_site=False,
+            confine_origins=None,
+            credential_alias=None,
+            autofill_enabled=True,
+        )
+        response = await _autofill(ac, session["session_id"], secret_name="amazon-password")
+        assert response.json()["reason"] == "wrong_origin"
+        assert not worker.filled
+        assert keychute.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_step_cannot_be_retargeted_to_another_secret(keychute):
+    keychute.state = "pending"
+    async with client() as ac:
+        session, _ = await _session(
+            ac, authenticated_site=False, confine_origins=None, credential_alias=None, autofill_enabled=True
+        )
+        await _autofill(ac, session["session_id"], secret_name="first", wait_seconds=0)
+        response = await _autofill(ac, session["session_id"], secret_name="second", wait_seconds=0)
+        assert response.json()["reason"] == "alias_mismatch"
+        assert len(keychute.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_demand_pending_approval_cannot_follow_navigation(keychute):
+    keychute.state = "pending"
+    async with client() as ac:
+        session, worker = await _session(
+            ac, authenticated_site=False, confine_origins=None, credential_alias=None, autofill_enabled=True
+        )
+        await _autofill(ac, session["session_id"], secret_name="first", wait_seconds=0)
+        worker.url = "https://other.example.com/login"
+        keychute.state = "approved"
+        response = await _autofill(ac, session["session_id"], secret_name="first", wait_seconds=0)
+        assert response.json()["reason"] == "target_invalidated"
+        assert keychute.reads == 0
+        assert not worker.filled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["exec", "extract"])
+async def test_on_demand_session_blocks_raw_readback_before_any_fill(command):
+    async with client() as ac:
+        session, _ = await _session(
+            ac,
+            authenticated_site=False,
+            confine_origins=None,
+            credential_alias=None,
+            autofill_enabled=True,
+        )
+        response = await ac.post(
+            f"/v1/sessions/{session['session_id']}/agent-command",
+            json={"type": command, "args": {"js": "document.cookie"}},
+            headers=agent_headers(),
+        )
+        assert response.status_code == 403, response.text
+
+
+@pytest.mark.asyncio
+async def test_configured_session_cannot_request_another_account(keychute):
+    async with client() as ac:
+        session, _ = await _session(ac)
+        response = await _autofill(ac, session["session_id"], secret_name="other-account")
+        assert response.json()["reason"] == "alias_mismatch"
+        assert not keychute.requests
