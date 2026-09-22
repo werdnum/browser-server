@@ -186,7 +186,9 @@ The session type enforces these command and navigation restrictions:
 
 Read-back masking is best-effort. Password inputs and autofilled controls receive a
 `data-fa-protected` attribute; snapshots omit marked values and screenshots mask those controls,
-including in child frames. Ordinary show-password toggles preserve this protection. Page code can
+including in child frames. Native drag starts from those controls are cancelled; ordinary
+drag-and-drop elsewhere remains available, even on a page containing password fields. Ordinary
+show-password toggles preserve this protection. Page code can
 remove the marker, replace the element, or render the credential elsewhere, so this is not a
 confidentiality boundary against a malicious or compromised approved origin. The approved origin
 already receives the credential, as with other password managers.

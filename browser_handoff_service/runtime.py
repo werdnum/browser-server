@@ -693,6 +693,19 @@ AUTOFILL_PROBE_JS = (
 # Everything a screenshot must not show in an authenticated-site session.
 PROTECTED_SELECTOR = "[data-fa-protected], input[type=password]"
 
+# Cancel native transfers at their source, including after a show-password type change.
+# This shares masking's best-effort DOM boundary; ordinary page drags remain available.
+_PROTECTED_DRAG_JS = r"""selector => {
+  const installed = Symbol.for('fa.protectedDragGuard');
+  if (document[installed]) return;
+  document.addEventListener('dragstart', event => {
+    if (event.composedPath().some(node => node instanceof Element && node.matches(selector))) {
+      event.preventDefault();
+    }
+  }, true);
+  document[installed] = true;
+}"""
+
 _REF_PATTERN = re.compile(r"e[0-9]+")
 # The walker increments the counter in JavaScript, which stops advancing exactly past 2**53 - 1.
 # Capping the starting point 2**32 below that leaves any real walk room to allocate.
@@ -1378,6 +1391,7 @@ class PlaywrightBrowserWorker:
         if self.mask_protected:
             for frame in page.frames:
                 try:
+                    await frame.evaluate(_PROTECTED_DRAG_JS, PROTECTED_SELECTOR)
                     await frame.locator("input[type=password]").evaluate_all(
                         "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
                     )

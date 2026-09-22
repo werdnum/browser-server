@@ -429,3 +429,31 @@ async def test_child_frame_identifier_respects_requested_kind(worker, page_serve
     await frame.evaluate("document.querySelectorAll('input[type=password]').forEach(el => el.remove())")
     result = await worker.autofill_prepare([{"kind": kind}], "child-identifier")
     assert result["reason"] == ("in_iframe" if kind == "username" else "no_eligible_field")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_frame", [False, True])
+async def test_drag_guard_only_cancels_protected_sources(worker, page_server, child_frame):
+    worker.mask_protected = True
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server}))
+    page = worker._page
+    if child_frame:
+        await page.set_content('<iframe src="/child"></iframe>')
+    frame = page.frames[-1]
+    await frame.wait_for_selector("#pw")
+    await _snapshot(worker)
+    await frame.locator("#pw").evaluate("el => el.type = 'text'")
+    await frame.locator("#user").evaluate("el => el.setAttribute('data-fa-protected', 'true')")
+    await frame.evaluate("""() => {
+        const ordinary = document.createElement('div');
+        ordinary.id = 'ordinary';
+        ordinary.draggable = true;
+        document.body.append(ordinary);
+    }""")
+    for selector, allowed in [("#pw", False), ("#empty", False), ("#user", False), ("#ordinary", True)]:
+        assert (
+            await frame.locator(selector).evaluate("""el => el.dispatchEvent(
+            new DragEvent('dragstart', {bubbles: true, cancelable: true, composed: true})
+        )""")
+            is allowed
+        )
