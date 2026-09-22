@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import threading
 from time import monotonic
@@ -20,6 +21,8 @@ def _chromium_available() -> bool:
             browser.close()
             return True
     except PlaywrightError:
+        if os.environ.get("REQUIRE_CHROMIUM") == "1":
+            raise
         return False
 
 
