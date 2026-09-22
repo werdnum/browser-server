@@ -745,3 +745,23 @@ async def test_lost_creation_response_retains_original_target(keychute):
         second = await _autofill(ac, session["session_id"])
         assert second.json()["reason"] == "target_invalidated"
         assert keychute.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_retry_reuses_original_context(keychute):
+    keychute.state = "pending"
+    async with client() as ac:
+        session, _ = await _session(ac)
+        path = f"/v1/sessions/{session['session_id']}/autofill"
+        first = await ac.post(
+            path,
+            json={"step_key": "context", "context": {"site": "original", "acting_user": "alice"}},
+            headers=agent_headers(),
+        )
+        assert first.json()["status"] == "approval_pending"
+        keychute.state = "approved"
+        second = await ac.post(
+            path, json={"step_key": "context", "context": {"site": "changed"}}, headers=agent_headers()
+        )
+        assert second.json()["status"] == "filled"
+        assert keychute.requests[0] == keychute.requests[1]

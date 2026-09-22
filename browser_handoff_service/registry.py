@@ -792,16 +792,18 @@ class SessionRegistry:
         if not self.keychute.configured:
             return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
 
+        context = pending.context if pending else dict(req.context or {})
         session.autofill_pending[req.step_key] = PendingAutofill(
             request_id=pending.request_id if pending else None,
+            context=context,
             nonce=nonce,
             origin=origin,
             targets=targets,
         )
         idempotency_key = f"{session.session_id}:{req.step_key}"
         host, port = _origin_host_port(origin)
-        site = str((req.context or {}).get("site") or alias)
-        acting_user = str((req.context or {}).get("acting_user") or "the configured user")
+        site = str(context.get("site") or alias)
+        acting_user = str(context.get("acting_user") or "the configured user")
         try:
             status = await self.keychute.create_access_request(
                 idempotency_key=idempotency_key,
@@ -813,14 +815,14 @@ class SessionRegistry:
                 # idempotency MAC, so a retry that reworded it would be a different request.
                 reason=f"Autofill {site} login on {origin} for {acting_user} (step {req.step_key})",
                 structured={
-                    **(req.context or {}),
+                    **context,
                     "session_id": session.session_id,
                     "step_key": req.step_key,
                     "origin": origin,
                 },
             )
             session.autofill_pending[req.step_key] = PendingAutofill(
-                request_id=status.request_id, nonce=nonce, origin=origin, targets=targets
+                request_id=status.request_id, context=context, nonce=nonce, origin=origin, targets=targets
             )
             if status.state == "pending" and req.wait_seconds > 0:
                 status = await self.keychute.wait(status.request_id, req.wait_seconds)

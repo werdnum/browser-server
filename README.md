@@ -173,7 +173,7 @@ POST /v1/sessions
 }
 ```
 
-What the session type fixes, deterministically and regardless of what else the caller asked for:
+The session type enforces these command and navigation restrictions:
 
 - `exec` and `extract` are denied outright, and clipboard/transfer chords (`Control`/`Meta` with
   `c`/`x`/`v`/`Insert`, and `Shift+Insert/Delete`) are refused. Typing *into* a protected control is
@@ -183,10 +183,14 @@ What the session type fixes, deterministically and regardless of what else the c
   jar-loaded one uses. Stating both a `jar_id` and `confine_origins` requires the two to be equal;
   otherwise the call is a 400, so a caller can never verify one set while the session enforces
   another. The session record echoes `confine_origins` as actually enforced.
-- Every `input[type=password]`, plus every control a fill touched, is **protected**: the snapshot
-  walker stamps `data-fa-protected`, omits the value, and reports `value_masked` with
-  `has_value` instead; screenshots mask the same selector. Tracking is per element, so a "show
-  password" toggle cannot turn a protected control back into a readable one.
+
+Read-back masking is best-effort. Password inputs and autofilled controls receive a
+`data-fa-protected` attribute; snapshots omit marked values and screenshots mask those controls,
+including in child frames. Ordinary show-password toggles preserve this protection. Page code can
+remove the marker, replace the element, or render the credential elsewhere, so this is not a
+confidentiality boundary against a malicious or compromised approved origin. The approved origin
+already receives the credential, as with other password managers.
+
 
 `POST /v1/sessions/{id}/autofill` then fills the pinned credential into the login form on the
 current HTTPS page. Plaintext HTTP documents are refused before a credential request is made.
