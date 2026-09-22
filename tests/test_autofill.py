@@ -239,6 +239,18 @@ async def test_a_fill_places_the_secret_and_reports_only_metadata(keychute, capl
 
 
 @pytest.mark.asyncio
+async def test_empty_fields_are_rejected_before_requesting_a_credential(keychute):
+    async with client() as ac:
+        session, worker = await _session(ac)
+        response = await _autofill(ac, session["session_id"], fields=[])
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "fields"]
+        assert keychute.requests == []
+        assert keychute.reads == 0
+        assert worker.filled == []
+
+
+@pytest.mark.asyncio
 async def test_a_bare_string_secret_fills_the_password(keychute):
     keychute.secret = PASSWORD
     async with client() as ac:

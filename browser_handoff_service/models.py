@@ -317,7 +317,7 @@ class AutofillRequest(BaseModel):
     # it is what makes the Keychute access request idempotent.
     step_key: str = Field(min_length=1, max_length=64)
     # Omitted => auto-detect on the current main-frame document.
-    fields: list[AutofillField] | None = Field(default=None, max_length=4)
+    fields: list[AutofillField] | None = Field(default=None, min_length=1, max_length=4)
     wait_seconds: int = Field(default=25, ge=0, le=AUTOFILL_MAX_WAIT_SECONDS)
     context: dict[str, Any] | None = None
 
