@@ -252,9 +252,10 @@ Each call is one [Keychute](https://github.com/werdnum/keychute) access request 
 grant read, and the destination is decided here rather than taken on trust:
 
 1. The request's origin constraint is the origin of the **document actually on screen**, never
-   anything the caller supplied, and the idempotency key is `"{session_id}:{step_key}"` — so an
-   `approval_pending` retry of the same step resumes the same decision instead of opening a second
-   one.
+   anything the caller supplied. The idempotency key binds the session, secret, origin and fill
+   step, so an `approval_pending` retry resumes the same decision instead of opening a second
+   one. Use the structured `session_id` and `step_key` context fields to correlate requests; the
+   key itself is opaque.
 2. The fill-time check is against the **granted** constraints, which an approval may have narrowed
    below what was asked for. An origin the session may *navigate* is not thereby an origin a fill
    may *target*.
