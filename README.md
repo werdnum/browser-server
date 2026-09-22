@@ -217,7 +217,7 @@ Policy outcomes are a 200 with a typed status, not an HTTP code:
 second visible password field is `ambiguous_fields`, not a guess). A kind-only entry such as
 `{"kind": "password"}` auto-detects just that kind. An explicit empty list (`"fields": []`)
 is rejected with HTTP 422 before any credential request. Refusal reasons:
-`not_authenticated_site`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
+`autofill_disabled`, `alias_mismatch`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
 `new_password_field`, `in_iframe`, `target_invalidated`, `policy_denied`, `request_expired`,
 `grant_invalid`, `bad_password_recorded`, `fill_cap_reached`, `keychute_unavailable`, `stale_ref`,
 `invalid_ref`.
