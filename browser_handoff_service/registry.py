@@ -1,36 +1,47 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from .jars import (
     JarRevokedError,
     JarStore,
+    JarValidationError,
     jar_store_from_env,
     normalize_origin,
     validate_jar_id,
 )
+from .keychute import KeychuteClient, KeychuteError, KeychuteNotConfigured
+from .keychute import zero as zero_secret
 from .models import (
     AGENT_COMMAND_STATES,
+    AUTOFILL_FILL_CAP,
     OBSERVATION_COMMANDS,
     TERMINAL_STATES,
     AgentCommandRequest,
     AgentCommandResponse,
+    AutofillRefusal,
+    AutofillRequest,
+    AutofillResponse,
     BrowserSession,
     CookieJarMeta,
     CreateSessionRequest,
+    FilledField,
     HandoffRequest,
     JarProbeConfig,
     LeaseOwner,
+    PendingAutofill,
     ProbeResult,
     ProbeResultName,
     SaveJarRequest,
     SessionEvent,
     SessionState,
+    autofill_refused,
     form_factor_profile,
     new_session,
     now_utc,
@@ -87,6 +98,121 @@ PAGE_STATE_COMMANDS = {
 }
 
 
+# Denied outright in an authenticated-site session: both read page content as raw values.
+AUTHENTICATED_SITE_DENIED_COMMANDS = {"exec", "extract"}
+
+# Key-chord fences for an authenticated-site session. Writing into a protected control is fine;
+# what is denied is every chord that MOVES a value out of one into somewhere observable.
+_TRANSFER_KEYS = {"c", "x", "v", "insert", "delete"}
+# Playwright resolves ControlOrMeta per platform, so it is a third spelling of the same chord.
+_TRANSFER_MODIFIERS = {"control", "meta", "controlormeta"}
+
+
+def _pressed_key(req: AgentCommandRequest) -> str | None:
+    """The key string the runtime will actually press, or None for a non-key command.
+
+    Read exactly as ``_dispatch_command`` reads it — ``press_key`` presses ``key`` and ignores
+    ``keys``, ``keyboard_press`` prefers ``keys``. A guard that inspected the other argument
+    would be a fence around a key the browser never receives, and the key it does receive would
+    go unchecked."""
+    if req.type == "press_key":
+        raw = req.args.get("key")
+    elif req.type == "keyboard_press":
+        raw = req.args.get("keys", req.args.get("key"))
+    else:
+        return None
+    return raw if isinstance(raw, str) else None
+
+
+def _is_transfer_chord(req: AgentCommandRequest) -> bool:
+    """Whether a key command is a copy/cut/paste chord (Ctrl/Cmd+C/X/V/Insert, Shift+Insert/Delete)."""
+    raw = _pressed_key(req)
+    if raw is None:
+        return False
+    parts = [part.strip().lower() for part in raw.split("+") if part.strip()]
+    if not parts:
+        return False
+    base, modifiers = parts[-1], set(parts[:-1])
+    if base in {"keyc", "keyx", "keyv"}:
+        base = base[-1]
+    if base not in _TRANSFER_KEYS:
+        return False
+    if modifiers & _TRANSFER_MODIFIERS:
+        return True
+    return base in {"insert", "delete"} and "shift" in modifiers
+
+
+# Every access request's TTL. Long enough for a human approval to land inside the park window,
+# short enough that an approved-but-unused grant is not a standing capability.
+AUTOFILL_REQUEST_TTL_SECONDS = 600
+
+# What each page-side refusal means, in words the agent can act on.
+_AUTOFILL_DETAILS = {
+    "no_eligible_field": "no visible login field on this page can take that fill",
+    "ambiguous_fields": "more than one password field is visible; address one by ref",
+    "new_password_field": "that field is a new-password/confirm field",
+    "in_iframe": "the field is inside an iframe; only the main frame can be filled",
+    "stale_ref": "that ref no longer names a field on this page",
+    "invalid_ref": "a ref looks like e12",
+    "target_invalidated": "the page changed under the request",
+}
+
+
+def _origin_host_port(origin: str) -> tuple[str, int]:
+    """Split a normalized origin into the host and effective port Keychute constrains on."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(origin)
+    return (parts.hostname or "").lower(), parts.port if parts.port is not None else (
+        80 if parts.scheme == "http" else 443
+    )
+
+
+def _parse_secret(secret: bytearray) -> dict[str, str]:
+    """Interpret a released payload: a JSON object with username/password, or a bare password.
+
+    Anything that is not a JSON object carrying those keys IS the password, verbatim — not
+    trimmed, not normalized. A stored password may legitimately begin or end with whitespace, and
+    a fill that quietly altered it would look like a wrong password at the site rather than like
+    the bug it is.
+
+    The plaintext only becomes a str here, at the point of the fill, and the caller drops it
+    immediately afterwards."""
+    try:
+        decoded = json.loads(bytes(secret))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        decoded = None
+    if isinstance(decoded, dict):
+        values: dict[str, str] = {}
+        for kind in ("username", "password"):
+            value = decoded.get(kind)
+            if isinstance(value, str) and value:
+                values[kind] = value
+        if values:
+            return values
+    if not secret:
+        # An empty release is a broken secret, not a password; the caller refuses it.
+        return {}
+    return {"password": bytes(secret).decode("utf-8", errors="replace")}
+
+
+def _normalized_confine_origins(values: list[str] | None) -> list[str] | None:
+    """Normalize an explicit confinement set with the canonical origin normalizer.
+
+    Uses the same function the route guard compares against, so an accepted set cannot mean
+    one thing at validation and another at enforcement."""
+    if values is None:
+        return None
+    normalized: list[str] = []
+    for value in values:
+        origin = normalize_origin(value)
+        if origin is None:
+            raise JarValidationError(f"confine_origins entry is not an exact origin: {value!r}")
+        if origin not in normalized:
+            normalized.append(origin)
+    return normalized
+
+
 @dataclass
 class TokenRecord:
     session_id: str
@@ -109,6 +235,8 @@ class SessionRegistry:
         # Per-jar locks serialize load against invalidate/delete so a load cannot race a
         # concurrent revocation (see create_session's post-registration recheck).
         self.jar_locks: dict[str, asyncio.Lock] = {}
+        # Credential broker for autofill. Unconfigured => autofill refuses; injectable for tests.
+        self.keychute = KeychuteClient()
 
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
@@ -132,6 +260,8 @@ class SessionRegistry:
 
         storage_state: dict | None = None
         confine_origins: list[str] | None = None
+        jar_scope: list[str] = []
+        explicit_origins = _normalized_confine_origins(req.confine_origins)
         loaded = None
         if req.jar_id is not None:
             # Validate the id BEFORE allocating a per-jar lock, so a caller passing malformed/random
@@ -150,16 +280,38 @@ class SessionRegistry:
             # call explicitly overrode it (storage_state does not carry the device profile).
             if req.form_factor == "auto" and req.client_viewport is None:
                 session.form_factor = loaded.meta.form_factor
-            confine = req.confine_navigation if req.confine_navigation is not None else True
+            # An authenticated-site session is confined unconditionally; the opt-out is a 400
+            # at the HTTP layer, and honouring it here would be the silent widening that layer
+            # exists to prevent.
+            confine = True if req.authenticated_site else (req.confine_navigation is not False)
+            jar_scope = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
             if confine:
-                confine_origins = [*loaded.meta.origins, *loaded.meta.nav_allowlist]
+                confine_origins = list(jar_scope)
             session.jar_id = loaded.meta.jar_id
             session.jar_generation = loaded.meta.generation
             session.jar_origins = list(loaded.meta.origins)
             session.jar_nav_allowlist = list(loaded.meta.nav_allowlist)
             session.jar_registrable_domains = list(loaded.meta.registrable_domains)
-            session.allow_exec = req.allow_exec
+            session.allow_exec = False if req.authenticated_site else req.allow_exec
             session.confine_navigation = confine
+
+        if req.authenticated_site:
+            if loaded is not None:
+                # The session-creation chokepoint: when the caller states the confinement set AND
+                # loads a jar, the two must agree exactly. A silent preference for either one is
+                # how a session ends up confined to something other than what the caller verified.
+                if explicit_origins is not None and set(explicit_origins) != set(jar_scope):
+                    raise JarValidationError(
+                        "confinement mismatch: confine_origins does not equal the jar's effective origin set"
+                    )
+            else:
+                # Jarless: the explicit set IS the confinement, enforced by the same route guard.
+                confine_origins = list(explicit_origins or [])
+            session.authenticated_site = True
+            session.credential_alias = req.credential_alias
+            session.allow_exec = False
+            session.confine_navigation = True
+        session.confine_origins = list(confine_origins or [])
 
         self.sessions[session.session_id] = session
         self.locks[session.session_id] = asyncio.Lock()
@@ -173,6 +325,7 @@ class SessionRegistry:
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=session.timezone_id,
+            mask_protected=session.authenticated_site,
         )
         self.workers[session.worker_id or ""] = worker
         try:
@@ -210,7 +363,9 @@ class SessionRegistry:
             # human-owned session (service token + initial_owner="human"), the human drives via
             # noVNC and the handoff toggle never runs, so disable confinement now — otherwise the
             # route guard would block the human's off-scope SSO/re-login navigation.
-            if session.lease_owner == LeaseOwner.HUMAN:
+            # An authenticated-site session stays confined even under human control: the design
+            # parks it origin-confined, and dropping the guard here would widen it silently.
+            if session.lease_owner == LeaseOwner.HUMAN and not session.authenticated_site:
                 worker.set_confinement_active(False)
             self._event(
                 session,
@@ -265,7 +420,7 @@ class SessionRegistry:
             # session is handed to a human, drop confinement so the human is not trapped (e.g. an
             # off-scope SSO/IdP bounce during re-login). The context is torn down at completion
             # and never resumed by the agent (handover and resumable handoff are both refused).
-            if session.jar_id is not None:
+            if session.jar_id is not None and not session.authenticated_site:
                 worker = self.workers.get(session.worker_id or "")
                 if worker is not None:
                     worker.set_confinement_active(False)
@@ -342,7 +497,7 @@ class SessionRegistry:
             self._event(session, "handoff_cancelled", "human", metadata={"outcome": outcome or "cancelled"})
             return session
 
-    async def handover(self, session_id: str, token: str, handoff_note: str) -> tuple[BrowserSession, str]:
+    async def handover(self, session_id: str, token: str, handoff_note: str) -> tuple[BrowserSession, str | None]:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
@@ -358,40 +513,75 @@ class SessionRegistry:
             # login/payment/SSO origins and accumulate credentials broader than the jar's
             # immutable jar_origins. The agent resumes authenticated browsing only by starting a
             # fresh, re-filtered jar-loaded session — never by inheriting the human-widened one.
-            if session.jar_id is not None:
+            #
+            # An authenticated-site session is the exception, and only because the premise does
+            # not hold for it: confinement is never lifted, not even under human control, so the
+            # human cannot have widened it. Without this the handoff is one-way — a run that
+            # parks for an MFA code or a captcha could never come back, which is the whole point
+            # of parking it.
+            if session.jar_id is not None and not session.authenticated_site:
                 raise ConflictError(
                     "a jar-loaded session cannot be handed to an agent; start a fresh jar-loaded session"
                 )
-            session.lease_owner = transition(session.state, session.lease_owner, SessionState.HANDOVER_REQUESTED)
-            session.state = SessionState.HANDOVER_REQUESTED
             session.handoff_reason = None
             session.allowed_resume = "never"
             session.handoff_note = handoff_note
+            if session.authenticated_site:
+                # Sanitized resume is not an option here, it is the terms: the human-controlled
+                # page is closed and a fresh one opened inside the confinement set before the
+                # agent can observe anything. Exact page and in-progress form state do not
+                # survive; the authenticated cookies do, which is what the handback is for.
+                session.allowed_resume = "after_sanitize"
+                await self._sanitize_for_resume_locked(session)
+                await self._reopen_confined_page_locked(session)
+            session.lease_owner = transition(session.state, session.lease_owner, SessionState.HANDOVER_REQUESTED)
+            session.state = SessionState.HANDOVER_REQUESTED
             session.idle_expires_at = min(now_utc() + timedelta(minutes=10), session.expires_at)
             session.updated_at = now_utc()
-            handover_token = mint_token()
-            self.tokens[hash_token(handover_token)] = TokenRecord(
-                session_id=session_id,
-                token_hash=hash_token(handover_token),
-                token_type="handover",
-                expires_at=session.idle_expires_at,
-            )
+            handover_token = None
+            if not session.authenticated_site:
+                handover_token = mint_token()
+                self.tokens[hash_token(handover_token)] = TokenRecord(
+                    session_id=session_id,
+                    token_hash=hash_token(handover_token),
+                    token_type="handover",
+                    expires_at=session.idle_expires_at,
+                )
             self._event(session, "handover_requested", "human")
             return session, handover_token
 
-    async def agent_claim(self, session_id: str, token: str) -> BrowserSession:
+    async def agent_claim(self, session_id: str, token: str | None) -> BrowserSession:
+        """Take the lease back after a human handover.
+
+        Ordinarily the one-time handover token is the authority, minted for the human and relayed
+        by them. An authenticated-site session cannot work that way: the token is minted for the
+        human and the design forbids routing it through the conversation, so trusted orchestration
+        would have no way to present it. There the human's handover POST is the signal
+        and the service token is the authority, so no handover token is minted."""
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
             if session.state != SessionState.HANDOVER_REQUESTED:
                 raise ConflictError("session is not awaiting an agent handover")
-            handover_record = self._authorize_token_locked(session, token, token_type="handover")
+            await self._enforce_jar_not_revoked_locked(session)
+            handover_record = None
+            if token or not session.authenticated_site:
+                handover_record = self._authorize_token_locked(session, token or "", token_type="handover")
             session.lease_owner = transition(session.state, session.lease_owner, SessionState.AGENT_ACTIVE)
             session.state = SessionState.AGENT_ACTIVE
             session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
             session.updated_at = now_utc()
-            handover_record.consumed_at = now_utc()
+            if handover_record is not None:
+                handover_record.consumed_at = now_utc()
+            else:
+                self._revoke_session_tokens_locked(session, token_type="handover")
             self._revoke_session_tokens_locked(session, token_type="control")
+            if session.authenticated_site:
+                # Confinement is never lifted for these sessions; re-asserting it here means a
+                # future change to the human path cannot hand the agent a widened context.
+                worker = self.workers.get(session.worker_id or "")
+                if worker is not None:
+                    worker.set_confinement_active(True)
             self._event(session, "handover_claimed", "agent")
             return session
 
@@ -457,6 +647,15 @@ class SessionRegistry:
             # credential". Default-deny it in a jar-loaded session unless the creator opted in.
             if req.type == "exec" and session.jar_id is not None and not session.allow_exec:
                 raise AuthorizationError("exec is denied in a jar-loaded session unless allow_exec was set")
+            # Read-back protection. exec and extract both hand the raw DOM (a filled password
+            # field included) straight to the model, so neither exists in an authenticated-site
+            # session — jar or no jar, and with no opt-in.
+            if session.authenticated_site and req.type in AUTHENTICATED_SITE_DENIED_COMMANDS:
+                raise AuthorizationError(f"{req.type} is denied in an authenticated-site session")
+            if session.authenticated_site and _is_transfer_chord(req):
+                raise AuthorizationError(
+                    "clipboard and transfer key chords are denied in an authenticated-site session"
+                )
             # Per-command revocation recheck. In a multi-process deployment sharing the jar
             # directory, a revoke in another process cannot reach into this registry's in-memory
             # session set, so a jar-loaded (or jar-producing) session would keep serving an
@@ -499,6 +698,208 @@ class SessionRegistry:
             session.updated_at = now_utc()
             self._event(session, "session_closed", "service")
             return session
+
+    # -- autofill -----------------------------------------------------------
+
+    async def record_autofill_outcome(self, session_id: str, outcome: str) -> BrowserSession:
+        """Latch a reported bad password. Every later fill in this session is refused.
+
+        One fill per grant read, and a read is not a login submission: without this latch a model
+        that misreads a failed login would keep asking for releases against a password that is
+        already known not to work."""
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+                raise AuthorizationError("autofill outcomes are denied unless the agent owns the lease")
+            if outcome == "bad_password":
+                session.autofill_bad_password = True
+                session.updated_at = now_utc()
+                self._event(session, "autofill_bad_password", "agent")
+            return session
+
+    async def autofill(self, session_id: str, req: AutofillRequest) -> AutofillResponse:
+        """Fill the session's pinned credential into the login form on the current document.
+
+        The whole resolve -> request -> wait -> verify -> read -> fill sequence holds the session
+        command lock, so nothing the agent does can move the page underneath it; the page itself
+        still can, which is what the document nonce catches."""
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if session.state in TERMINAL_STATES:
+                raise SessionInactiveError(f"session is no longer active ({session.state})")
+            if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+                raise AuthorizationError("autofill is denied unless the agent owns the lease")
+            await self._enforce_jar_not_revoked_locked(session)
+            response = await self._autofill_locked(session, req)
+            session.updated_at = now_utc()
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
+            self._event(
+                session,
+                "autofill",
+                "agent",
+                metadata={"status": response.status, "reason": response.reason, "step_key": req.step_key},
+            )
+            return response
+
+    async def _autofill_locked(self, session: BrowserSession, req: AutofillRequest) -> AutofillResponse:
+        if not session.authenticated_site:
+            return autofill_refused("not_authenticated_site", "autofill exists only in an authenticated-site session")
+        alias = session.credential_alias
+        if not alias:
+            return autofill_refused("no_alias", "this session has no credential pinned to it")
+        if session.autofill_bad_password:
+            return autofill_refused("bad_password_recorded", "a bad password was reported for this session")
+        if session.autofill_fill_count >= AUTOFILL_FILL_CAP:
+            return autofill_refused(
+                "fill_cap_reached", f"this session has already consumed {AUTOFILL_FILL_CAP} credential grants"
+            )
+        worker = self.workers.get(session.worker_id or "")
+        if worker is None or worker.closed:
+            raise ConflictError("worker is not available")
+
+        # 1. Pin the document and choose the targets. The origin is the document's own, never
+        #    anything the caller supplied.
+        pending = session.autofill_pending.get(req.step_key)
+        if pending is not None:
+            nonce, origin, targets = pending.nonce, pending.origin, pending.targets
+        else:
+            nonce = uuid4().hex
+            fields = [field.model_dump() for field in req.fields] if req.fields else None
+            prepared = await worker.autofill_prepare(fields, nonce)
+            if prepared.get("error"):
+                reason = str(prepared.get("reason") or "no_eligible_field")
+                return autofill_refused(
+                    cast(AutofillRefusal, reason),
+                    _AUTOFILL_DETAILS.get(reason, "the requested field cannot take a fill"),
+                    origin=prepared.get("origin"),
+                )
+            origin = _normalize_origin(str(prepared.get("origin") or ""))
+            targets = list(prepared.get("targets") or [])
+        if origin is None or origin not in set(session.confine_origins):
+            # Cannot happen while the route guard holds, so it is a fail-closed backstop rather
+            # than a routine outcome — about:blank reaches it too.
+            return autofill_refused(
+                "wrong_origin", "the current document is not inside this session's confinement set", origin=origin
+            )
+
+        if not origin.startswith("https://"):
+            return autofill_refused("wrong_origin", "credential autofill requires HTTPS", origin=origin)
+
+        if not self.keychute.configured:
+            return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
+
+        context = pending.context if pending else dict(req.context or {})
+        session.autofill_pending[req.step_key] = PendingAutofill(
+            request_id=pending.request_id if pending else None,
+            context=context,
+            nonce=nonce,
+            origin=origin,
+            targets=targets,
+        )
+        idempotency_key = f"{session.session_id}:{req.step_key}"
+        host, port = _origin_host_port(origin)
+        site = str(context.get("site") or alias)
+        acting_user = str(context.get("acting_user") or "the configured user")
+        try:
+            status = await self.keychute.create_access_request(
+                idempotency_key=idempotency_key,
+                secret_name=alias,
+                origin_host=host,
+                origin_port=port,
+                ttl_seconds=AUTOFILL_REQUEST_TTL_SECONDS,
+                # Deterministic for a given (session, step): the reason is part of Keychute's
+                # idempotency MAC, so a retry that reworded it would be a different request.
+                reason=f"Autofill {site} login on {origin} for {acting_user} (step {req.step_key})",
+                structured={
+                    **context,
+                    "session_id": session.session_id,
+                    "step_key": req.step_key,
+                    "origin": origin,
+                },
+            )
+            session.autofill_pending[req.step_key] = PendingAutofill(
+                request_id=status.request_id, context=context, nonce=nonce, origin=origin, targets=targets
+            )
+            if status.state == "pending" and req.wait_seconds > 0:
+                status = await self.keychute.wait(status.request_id, req.wait_seconds)
+            if status.state == "pending":
+                approval_url = self.keychute.approval_url(status.request_id)
+                return AutofillResponse(
+                    status="approval_pending",
+                    request_id=status.request_id,
+                    origin=origin,
+                    detail=f"awaiting a release decision at {approval_url}"
+                    if approval_url
+                    else "awaiting a release decision",
+                )
+            if status.state == "denied":
+                return autofill_refused("policy_denied", "the release was denied", origin=origin)
+            if status.state == "expired":
+                return autofill_refused("request_expired", "the release request expired", origin=origin)
+            if status.grant_id is None:
+                return autofill_refused("grant_invalid", "the release was approved without a grant", origin=origin)
+
+            # 2. Check the destination against what was GRANTED, which an approval may have
+            #    narrowed below what was asked for.
+            info = await self.keychute.grant_info(status.grant_id)
+            reference_now = info.server_time or now_utc()
+            if (
+                info.mechanism != "autofill"
+                or info.revoked
+                or info.not_after <= reference_now
+                or (info.max_uses is not None and info.use_count >= info.max_uses)
+            ):
+                return autofill_refused("grant_invalid", "the grant is not usable", origin=origin)
+            if not any(granted.matches(host, port) for granted in info.origins):
+                return autofill_refused(
+                    "wrong_origin", "the granted capability does not cover this document's origin", origin=origin
+                )
+
+            # 3. Re-verify the pinned document BEFORE spending the grant's single read: a site
+            #    can navigate itself while an approval is outstanding.
+            verified = await worker.autofill_fill(nonce, origin, targets, {})
+            if verified.get("error"):
+                return autofill_refused(
+                    "target_invalidated", "the page changed while the release was decided", origin=origin
+                )
+
+            self._raise_if_expired(session)
+            await self._enforce_jar_not_revoked_locked(session)
+            secret = await self.keychute.read_grant(status.grant_id, idempotency_key)
+            session.autofill_fill_count += 1
+            session.autofill_pending.pop(req.step_key, None)
+        except KeychuteNotConfigured:
+            return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
+        except KeychuteError as exc:
+            # str(exc) is built only from Keychute's non-secret error envelope and status codes.
+            return autofill_refused("keychute_unavailable", str(exc), origin=origin)
+
+        values: dict[str, str] = {}
+        try:
+            values = _parse_secret(secret)
+            missing = [str(target["kind"]) for target in targets if str(target["kind"]) not in values]
+            if missing:
+                return autofill_refused(
+                    "grant_invalid",
+                    f"the released secret carries no {missing[0]}",
+                    origin=origin,
+                )
+            self._raise_if_expired(session)
+            await self._enforce_jar_not_revoked_locked(session)
+            result = await worker.autofill_fill(nonce, origin, targets, values)
+        finally:
+            zero_secret(secret)
+            values.clear()
+            del secret
+
+        if result.get("error"):
+            return autofill_refused("target_invalidated", "the page changed before the fill landed", origin=origin)
+        filled = [
+            FilledField(ref=entry.get("ref"), kind=entry["kind"]) for entry in cast(list, result.get("filled") or [])
+        ]
+        return AutofillResponse(status="filled", filled=filled, origin=origin)
 
     # -- cookie jars --------------------------------------------------------
     def _require_jars_enabled(self) -> None:
@@ -691,6 +1092,7 @@ class SessionRegistry:
                 session.jar_generation = meta.generation
                 session.jar_origins = list(meta.origins)
                 session.jar_nav_allowlist = list(meta.nav_allowlist)
+                session.confine_origins = [*meta.origins, *meta.nav_allowlist]
                 session.jar_registrable_domains = list(meta.registrable_domains)
                 # Apply the (possibly NARROWED) scope to the live worker's route guard too, so the
                 # running context stops trusting origins the refreshed jar dropped — otherwise the
@@ -1032,6 +1434,23 @@ class SessionRegistry:
         session.current_url_redacted = None
         session.current_title_redacted = None
         self._event(session, "browser_sanitized", "service")
+
+    async def _reopen_confined_page_locked(self, session: BrowserSession) -> None:
+        """Open a fresh page inside the confinement set after sanitization.
+
+        The agent navigates for itself anyway, so a site that is down leaves the page at
+        about:blank rather than wedging the handback — a visible, ordinary starting state, not a
+        swallowed error."""
+        if not session.confine_origins:
+            return
+        worker = self.workers.get(session.worker_id or "")
+        if worker is None or worker.closed:
+            return
+        result = await worker.command(AgentCommandRequest(type="navigate", args={"url": session.confine_origins[0]}))
+        if result.get("blocked") or result.get("error"):
+            self._event(session, "resume_page_unavailable", "service", metadata={"reason": "navigation_failed"})
+            return
+        self._update_page_metadata(session, result)
 
     def _update_page_metadata(self, session: BrowserSession, result: dict[str, Any]) -> None:
         url = result.get("url")

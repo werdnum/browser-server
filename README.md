@@ -144,7 +144,9 @@ replicated RWX volume (e.g. a Longhorn volume) shared by several pods next. Ther
   chosen for NFS reliability); within a process they are already serialized by synchronous
   execution.
 - Live sessions recheck the shared tombstone before every agent command and every noVNC/human
-  authorization, so a revoke tears down running contexts, not just future loads.
+  authorization, so a revoke tears down running contexts, not just future loads. Human input is
+  checked immediately; screen-only and idle streams are checked by the five-second watchdog,
+  avoiding jar decryption for each screen frame.
 
 Honest residual: the **session registry itself is still in-memory and process-lifetime** (a
 session created on one pod is not visible to another). Persisting it onto the same shared jar
@@ -152,6 +154,140 @@ directory is a natural, self-contained follow-up; nothing in the jar design assu
 process. The one bound to know about today is a whole-filesystem rollback that also truncates the
 tombstone log — set an external monotonic anchor (`jar-anchor.json`, or a KMS/DB/WORM export) to
 close it.
+
+## Authenticated-site sessions and credential autofill
+
+A jar is one way to reach a logged-in page; the other is to let the operator's stored password be
+**filled** into a login form without it ever passing through the agent. Both live inside the same
+session type, created with `authenticated_site: true` on `create_session` (service token only,
+like `jar_id`):
+
+```jsonc
+POST /v1/sessions
+{
+  "conversation_id": "…",
+  "authenticated_site": true,
+  "jar_id": "jar_…",                                   // optional
+  "confine_origins": ["https://shop.example.com"],     // required when there is no jar
+  "credential_alias": "shop-login"                     // optional; no alias, no autofill
+}
+```
+
+The session type enforces these command and navigation restrictions:
+
+- `exec` and `extract` are denied outright, and clipboard/transfer chords (`Control`/`Meta` with
+  `c`/`x`/`v`/`Insert`, and `Shift+Insert/Delete`) are refused. Typing *into* a protected control is
+  still fine — writing is not leaking.
+- Navigation confinement is always on (`confine_navigation: false` is a 400, as is `allow_exec`),
+  and a **jarless** session supplies the set explicitly and is confined by the same route guard a
+  jar-loaded one uses. Stating both a `jar_id` and `confine_origins` requires the two to be equal;
+  otherwise the call is a 400, so a caller can never verify one set while the session enforces
+  another. The session record echoes `confine_origins` as actually enforced.
+
+Read-back masking is best-effort. Password inputs and autofilled controls receive a
+`data-fa-protected` attribute; snapshots omit marked values and screenshots mask those controls,
+including in child frames. Native drag starts from those controls are cancelled; ordinary
+drag-and-drop elsewhere remains available, even on a page containing password fields. Ordinary
+show-password toggles preserve this protection. Page code can
+remove the marker, replace the element, or render the credential elsewhere, so this is not a
+confidentiality boundary against a malicious or compromised approved origin. The approved origin
+already receives the credential, as with other password managers.
+
+A screenshot can fail visibly if an iframe detaches while Playwright resolves its mask locators.
+The caller may request a fresh screenshot; there is no automatic capture retry or unmasked fallback.
+This bounded transient failure keeps capture behavior simple without weakening masking.
+
+
+`POST /v1/sessions/{id}/autofill` then fills the pinned credential into the login form on the
+current HTTPS page. Plaintext HTTP documents are refused before a credential request is made.
+Policy outcomes are a 200 with a typed status, not an HTTP code:
+
+```jsonc
+// request
+{"step_key": "password", "fields": [{"ref": "e12", "kind": "password"}], "wait_seconds": 25,
+ "context": {"site": "shop", "acting_user": "andrew"}}
+
+// responses
+{"status": "filled", "filled": [{"ref": "e12", "kind": "password"}], "origin": "https://shop.example.com"}
+{"status": "approval_pending", "request_id": "…", "origin": "…"}
+{"status": "refused", "reason": "new_password_field", "detail": "…"}
+```
+
+`fields` may be omitted, in which case browser-server auto-detects on the main-frame document (a
+second visible password field is `ambiguous_fields`, not a guess). A kind-only entry such as
+`{"kind": "password"}` auto-detects just that kind. An explicit empty list (`"fields": []`)
+is rejected with HTTP 422 before any credential request. Refusal reasons:
+`not_authenticated_site`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
+`new_password_field`, `in_iframe`, `target_invalidated`, `policy_denied`, `request_expired`,
+`grant_invalid`, `bad_password_recorded`, `fill_cap_reached`, `keychute_unavailable`, `stale_ref`,
+`invalid_ref`.
+
+`POST /v1/sessions/{id}/autofill/outcome` with `{"outcome": "bad_password"}` latches the session:
+every later fill is refused. A per-session cap of 6 credential reads is the deterministic backstop behind it, including reads
+whose subsequent fill fails.
+
+### Handing out to a human and back
+
+A challenge a human can finish in the live session — an MFA code, a captcha, a "verify it's you"
+click — is a detour, not an ending, so the handoff has to be a round trip. `POST .../handoff` parks
+the session under human control as usual (it stays origin-confined and fail-closed for agent
+commands throughout; confinement is **never** lifted for an authenticated-site session, which is
+why the agent may inherit the context afterwards — the human cannot have widened it). When the
+human is done they `POST .../handover`, which for an authenticated-site session forces sanitized
+resume: the human-controlled page is closed and a fresh one opened inside the confinement set, so
+the authenticated cookies survive but the exact page and any in-progress form state do not.
+
+Trusted orchestration then takes the lease back with `POST .../agent-claim` **and no body**. The
+human's handover POST is the signal and the service token is the authority (it already creates
+and drives these sessions). No handover token is minted for an authenticated-site session; the
+page asks the human to tell their assistant to resume the task. Claiming revokes the human's
+control token. Ordinary sessions still require a one-time handover token, and a jar-loaded
+session that is *not* an authenticated-site session cannot be handed to an agent at all.
+
+Poll `GET /v1/sessions/{id}` for `state` and `lease_owner`; the handback is ready when `state` is
+`handover_requested`. A token-less claim in any other state is a 409, and in a non-authenticated-site
+session it is a 403.
+
+Each call is one [Keychute](https://github.com/werdnum/keychute) access request and one single-use
+grant read, and the destination is decided here rather than taken on trust:
+
+1. The request's origin constraint is the origin of the **document actually on screen**, never
+   anything the caller supplied, and the idempotency key is `"{session_id}:{step_key}"` — so an
+   `approval_pending` retry of the same step resumes the same decision instead of opening a second
+   one.
+2. The fill-time check is against the **granted** constraints, which an approval may have narrowed
+   below what was asked for. An origin the session may *navigate* is not thereby an origin a fill
+   may *target*.
+3. Resolve, verify and fill are one serialized operation under the session lock, and the target
+   document is pinned with a nonce; a navigation in between — including one the site starts while
+   an approval is pending — is `target_invalidated` rather than a fill into whatever is there now.
+4. Element checks refuse rather than guess: a password only into `input[type=password]` (or an
+   already-protected control), never into an `autocomplete=new-password` field, an identifier only
+   into text/email/tel, and main frame only.
+
+browser-server **stores no credential**: it holds the released plaintext only long enough to place
+it in the field, zeroes the returned mutable secret buffer, and puts it in no response, event,
+log or exception. HTTP response bytes and parsed Python strings are not zeroed; memory erasure
+is not guaranteed. Configure
+the broker (unconfigured ⇒ autofill returns `refused(keychute_unavailable)`):
+
+```bash
+export BROWSER_KEYCHUTE_URL="https://keychute.keychute.svc.cluster.local"
+export BROWSER_KEYCHUTE_TOKEN_FILE="/var/run/secrets/keychute/token"   # re-read per request
+export BROWSER_KEYCHUTE_TOKEN="<secret>"                               # alternative to the file
+export BROWSER_KEYCHUTE_CA_BUNDLE="/etc/ssl/internal-ca/ca.crt"        # internal CA, optional
+export BROWSER_KEYCHUTE_EXTERNAL_URL="https://keychute.example.com"    # approval links, optional
+```
+
+Release authority lives in Keychute's policy rows, not here: which secret may be released to
+client `browser-server` for mechanism `autofill`, for which page origins, with which outcome. The
+alias on the session is routing — it decides *which* secret this run may ask for — and authorizes
+nothing on its own.
+
+Read-back protection is best-effort by design, and the design says so: a browser is an open-ended
+rendering surface, and once a value is in the field the approved origin's own JavaScript can read
+it, exactly as with any password manager. What is mechanical is the destination check, the
+serialized target binding, and the absence of `exec`/`extract`.
 
 ## Setup
 

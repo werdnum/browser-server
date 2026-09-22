@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -32,7 +33,12 @@ from .jars import (
     validate_jar_id,
 )
 from .models import (
+    AUTOFILL_MAX_CONTEXT_BYTES,
+    AgentClaimRequest,
     AgentCommandRequest,
+    AutofillOutcomeRequest,
+    AutofillRequest,
+    AutofillResponse,
     ClaimRequest,
     CookieJarMeta,
     CreateSessionRequest,
@@ -443,6 +449,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           <button id="complete" class="btn">Complete</button>
           <button id="cancel" class="btn btn-danger">Cancel</button>
         </div>
+        {% if not session.authenticated_site %}
         <div id="handover-result" class="notice" hidden>
           <p><strong>Ready to hand back to your agent.</strong></p>
           <p class="muted">Copy the message below and send it to your agent — it has everything needed to take over.</p>
@@ -471,6 +478,9 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
           </details>
         </div>
         <p id="handover-pending" class="notice" hidden>Handover pending — the one-time token was shown once and can't be shown again. Click Cancel to stop and start over.</p>
+        {% else %}
+        <p id="handover-pending" class="notice" hidden>Ready to resume. Tell your assistant to continue the website task.</p>
+        {% endif %}
         <p id="action-error" class="notice error" role="alert" hidden></p>
       </div>
     </main>
@@ -577,6 +587,10 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     document.querySelector("#sensitive").onclick = action(() => post(`/v1/sessions/${sid}/mark-sensitive`, {token}));
     document.querySelector("#handover").onclick = action(async () => {
       const result = await post(`/v1/sessions/${sid}/handover`, {token, handoff_note: document.querySelector("#handover-note").value});
+      if (!result.handover_token) {
+        document.querySelector("#handover-pending").hidden = false;
+        return;
+      }
       document.querySelector("#handover-token").textContent = result.handover_token;
       document.querySelector("#handover-claim-url").textContent = result.agent_claim_url;
       document.querySelector("#agent-instruction").textContent =
@@ -912,6 +926,7 @@ async def create_session(
     # gate, so jar_id is rejected for OIDC callers.
     if req.jar_id is not None and auth.actor_type != "agent":
         raise HTTPException(status_code=403, detail="loading a saved session requires the service token")
+    _validate_authenticated_site_request(req, auth)
     # Resolve (and validate) the public base URL before launching a browser, so a
     # misconfigured BROWSER_HANDOFF_PUBLIC_URL fails fast instead of leaking a started session.
     base_url = public_base_url(request).rstrip("/")
@@ -931,6 +946,33 @@ async def create_session(
     return response
 
 
+def _validate_authenticated_site_request(req: CreateSessionRequest, auth: AuthContext) -> None:
+    """Reject every authenticated-site request shape that would widen the session.
+
+    Each check is a 400 for a combination whose only coherent reading is "the caller wanted a
+    protection turned off"; silently winning either way is what this refuses to do."""
+    requested = req.authenticated_site or req.confine_origins is not None or req.credential_alias is not None
+    if requested and auth.actor_type != "agent":
+        raise HTTPException(status_code=403, detail="authenticated-site sessions require the service token")
+    if not req.authenticated_site:
+        if req.confine_origins is not None:
+            raise HTTPException(status_code=400, detail="confine_origins requires authenticated_site")
+        if req.credential_alias is not None:
+            raise HTTPException(status_code=400, detail="credential_alias requires authenticated_site")
+        return
+    if req.allow_exec:
+        raise HTTPException(status_code=400, detail="allow_exec cannot be combined with authenticated_site")
+    if req.confine_navigation is False:
+        raise HTTPException(
+            status_code=400, detail="confine_navigation cannot be disabled for an authenticated_site session"
+        )
+    if req.jar_id is None and not req.confine_origins:
+        raise HTTPException(
+            status_code=400,
+            detail="a jarless authenticated_site session must supply a non-empty confine_origins",
+        )
+
+
 @app.get("/v1/sessions/{session_id}", dependencies=[Depends(require_service_auth)])
 async def get_session(session_id: str):
     try:
@@ -945,6 +987,34 @@ async def agent_command(session_id: str, req: AgentCommandRequest):
         return await registry.agent_command(session_id, req)
     except Exception as exc:
         raise map_errors(exc) from exc
+
+
+@app.post(
+    "/v1/sessions/{session_id}/autofill",
+    response_model=AutofillResponse,
+    dependencies=[Depends(require_agent_auth)],
+)
+async def autofill(session_id: str, req: AutofillRequest):
+    """Fill the session's pinned credential into the login form on the current page.
+
+    Policy outcomes are a 200 with a typed status, not an HTTP code: "the operator has not
+    decided yet" and "that field is a new-password field" are answers the agent acts on, while
+    only infrastructure failures (unknown session, lost lease, dead worker) are errors."""
+    if req.context is not None and len(json.dumps(req.context).encode("utf-8")) > AUTOFILL_MAX_CONTEXT_BYTES:
+        raise HTTPException(status_code=400, detail=f"context exceeds {AUTOFILL_MAX_CONTEXT_BYTES} bytes")
+    try:
+        return await registry.autofill(session_id, req)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post("/v1/sessions/{session_id}/autofill/outcome", dependencies=[Depends(require_agent_auth)])
+async def autofill_outcome(session_id: str, req: AutofillOutcomeRequest):
+    try:
+        session = await registry.record_autofill_outcome(session_id, req.outcome)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+    return {"session_id": session.session_id, "autofill_bad_password": session.autofill_bad_password}
 
 
 @app.post(
@@ -1176,9 +1246,9 @@ async def handover(session_id: str, req: HandoverRequest, request: Request):
 
 
 @app.post("/v1/sessions/{session_id}/agent-claim", dependencies=[Depends(require_agent_auth)])
-async def agent_claim(session_id: str, req: ClaimRequest):
+async def agent_claim(session_id: str, req: AgentClaimRequest | None = None):
     try:
-        return await registry.agent_claim(session_id, req.token)
+        return await registry.agent_claim(session_id, req.token if req is not None else None)
     except Exception as exc:
         raise map_errors(exc) from exc
 
@@ -1279,12 +1349,10 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
     try:
         async with websockets.connect(upstream_url, subprotocols=subprotocols, max_size=None) as upstream:
             await websocket.accept(subprotocol=upstream.subprotocol)
-            # Authorization is checked once at connect, but a jar-backed session can be revoked
-            # mid-stream by another process; poll the shared tombstone and tear the context down so
-            # the kill-switch reaches a live human-driven browser, not just future loads.
-            watchdog = asyncio.create_task(_novnc_revocation_watchdog(session_id))
+            token = websocket.query_params.get("token") or websocket.cookies.get(_novnc_cookie_name(session_id)) or ""
+            watchdog = asyncio.create_task(_novnc_revocation_watchdog(session_id, token, upstream))
             try:
-                await _bridge_websockets(websocket, upstream)
+                await _bridge_websockets(websocket, upstream, session_id=session_id, token=token)
             finally:
                 watchdog.cancel()
     except WebSocketDisconnect:
@@ -1296,16 +1364,20 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
             pass
 
 
-async def _novnc_revocation_watchdog(session_id: str) -> None:
-    """Close the session (and its worker/noVNC display) if a jar backing it is revoked while a
-    noVNC connection is live. Closing the worker drops the upstream websocket, ending the bridge."""
+async def _novnc_stream_authorized(session_id: str, token: str, upstream) -> bool:
+    try:
+        await registry.authorize_remote(session_id, token)
+    except (AuthorizationError, SessionInactiveError, NotFoundError):
+        await upstream.close(code=1008)
+        return False
+    return True
+
+
+async def _novnc_revocation_watchdog(session_id: str, token: str, upstream) -> None:
+    """Recheck idle streams as well as traffic, including shared jar revocation."""
     while True:
         await asyncio.sleep(5)
-        if registry.session_jar_revoked(session_id):
-            try:
-                await registry.close(session_id)
-            except Exception:
-                logger.warning("failed to close revoked noVNC session %s", session_id, exc_info=True)
+        if not await _novnc_stream_authorized(session_id, token, upstream):
             return
 
 
@@ -1427,12 +1499,14 @@ def _novnc_upstream_websocket_url(remote_url: str) -> str:
     return urlunsplit((scheme, remote.netloc, "/websockify", "", ""))
 
 
-async def _bridge_websockets(client: WebSocket, upstream) -> None:
+async def _bridge_websockets(client: WebSocket, upstream, *, session_id: str, token: str) -> None:
     async def client_to_upstream() -> None:
         while True:
             message = await client.receive()
             if message["type"] == "websocket.disconnect":
                 await upstream.close()
+                return
+            if not await _novnc_stream_authorized(session_id, token, upstream):
                 return
             if message.get("bytes") is not None:
                 await upstream.send(message["bytes"])

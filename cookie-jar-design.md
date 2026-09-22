@@ -767,8 +767,13 @@ a "please re-login" task) — browser-server never probes on its own initiative.
 
 ## What this deliberately does not do
 
-- No credential storage, no password vault, no IdP integration (credential broker remains deferred
-  and optional per the assessment).
+- No credential storage, no password vault, no IdP integration. The one credential path that
+  exists is **autofill** (see the README): browser-server asks an external broker (Keychute) for a
+  single-use release, places the value in the form field, and zeroes it — it stores nothing,
+  returns nothing, and holds no standing authority. Release authority is the broker's policy rows,
+  which is the same mechanism/policy split as everywhere else here: browser-server enforces where
+  a value may go (the checked document's origin, against the *granted* constraints), never whether
+  it should be released at all.
 - No confirmation prompts, profile checks, or taint decisions in browser-server — see
   mechanism/policy split.
 - No multi-jar sessions, no jar sharing/export API (a jar can never be read back out, only loaded
