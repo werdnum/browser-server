@@ -673,6 +673,9 @@ async def test_pending_retry_keeps_the_original_document_binding(keychute, chang
         if changed:
             assert second.json()["reason"] == "target_invalidated"
             assert keychute.reads == 0
+            third = await _autofill(ac, session["session_id"])
+            assert third.json()["reason"] == "target_invalidated"
+            assert keychute.reads == 0
         else:
             assert second.json()["status"] == "filled"
             assert keychute.reads == 1

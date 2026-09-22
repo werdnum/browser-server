@@ -733,8 +733,6 @@ class SessionRegistry:
                 raise AuthorizationError("autofill is denied unless the agent owns the lease")
             await self._enforce_jar_not_revoked_locked(session)
             response = await self._autofill_locked(session, req)
-            if response.status != "approval_pending" and response.reason != "keychute_unavailable":
-                session.autofill_pending.pop(req.step_key, None)
             session.updated_at = now_utc()
             session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
             self._event(
@@ -871,6 +869,7 @@ class SessionRegistry:
             await self._enforce_jar_not_revoked_locked(session)
             secret = await self.keychute.read_grant(status.grant_id, idempotency_key)
             session.autofill_fill_count += 1
+            session.autofill_pending.pop(req.step_key, None)
         except KeychuteNotConfigured:
             return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
         except KeychuteError as exc:
