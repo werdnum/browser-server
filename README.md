@@ -191,6 +191,10 @@ remove the marker, replace the element, or render the credential elsewhere, so t
 confidentiality boundary against a malicious or compromised approved origin. The approved origin
 already receives the credential, as with other password managers.
 
+A screenshot can fail visibly if an iframe detaches while Playwright resolves its mask locators.
+The caller may request a fresh screenshot; there is no automatic capture retry or unmasked fallback.
+This bounded transient failure keeps capture behavior simple without weakening masking.
+
 
 `POST /v1/sessions/{id}/autofill` then fills the pinned credential into the login form on the
 current HTTPS page. Plaintext HTTP documents are refused before a credential request is made.

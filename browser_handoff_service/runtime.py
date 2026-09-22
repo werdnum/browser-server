@@ -678,13 +678,12 @@ AUTOFILL_STAMP_JS = (
 # fillable login control? Used only to answer "the target is in an iframe" honestly instead of
 # reporting a main-frame miss.
 AUTOFILL_PROBE_JS = (
-    "(ref) => {"
+    "(args) => {"
     + _AUTOFILL_HELPERS_JS
     + r"""
-  if (ref) return document.querySelectorAll('[data-fa-ref="' + ref + '"]').length === 1;
+  if (args.ref) return document.querySelectorAll('[data-fa-ref="' + args.ref + '"]').length === 1;
   for (const el of document.querySelectorAll('input')) {
-    if (!visible(el) || el.disabled || el.readOnly) continue;
-    if (isPasswordField(el) && !isNewPassword(el)) return true;
+    if (args.kinds.some(kind => unfillable(el, kind) === null)) return true;
   }
   return false;
 }
@@ -1704,11 +1703,12 @@ class PlaywrightBrowserWorker:
             return {"error": True, "reason": "target_invalidated"}
         if result.get("error") and str(result.get("reason")) in {"no_eligible_field", "stale_ref"}:
             ref = next((spec.get("ref") for spec in (fields or []) if spec.get("ref")), None)
-            if await self._autofill_in_child_frame(page, ref):
+            kinds = [str(spec["kind"]) for spec in fields] if fields else ["username", "password"]
+            if await self._autofill_in_child_frame(page, ref, kinds):
                 return {"error": True, "reason": "in_iframe", "origin": result.get("origin")}
         return result
 
-    async def _autofill_in_child_frame(self, page: Any, ref: str | None) -> bool:
+    async def _autofill_in_child_frame(self, page: Any, ref: str | None, kinds: list[str]) -> bool:
         """Whether a child frame holds what the main frame did not. Read-only."""
         from patchright.async_api import Error as PlaywrightError
 
@@ -1716,7 +1716,7 @@ class PlaywrightBrowserWorker:
             if frame == page.main_frame:
                 continue
             try:
-                if bool(await frame.evaluate(AUTOFILL_PROBE_JS, ref)):
+                if bool(await frame.evaluate(AUTOFILL_PROBE_JS, {"ref": ref, "kinds": kinds})):
                     return True
             except PlaywrightError:
                 continue

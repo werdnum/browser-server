@@ -417,3 +417,15 @@ async def test_detaching_child_does_not_break_password_preflight(worker, page_se
     result = await worker.command(AgentCommandRequest(type="press_key", args={"key": "Tab"}))
     assert result["accepted"]
     assert await worker._page.locator("#main").get_attribute("data-fa-protected") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["username", "password"])
+async def test_child_frame_identifier_respects_requested_kind(worker, page_server, kind):
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content('<iframe src="/child"></iframe>')
+    frame = worker._page.frames[1]
+    await frame.wait_for_selector("#pw")
+    await frame.evaluate("document.querySelectorAll('input[type=password]').forEach(el => el.remove())")
+    result = await worker.autofill_prepare([{"kind": kind}], "child-identifier")
+    assert result["reason"] == ("in_iframe" if kind == "username" else "no_eligible_field")
