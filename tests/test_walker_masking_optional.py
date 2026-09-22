@@ -373,3 +373,26 @@ async def test_fill_handler_cannot_remove_post_fill_masking_target(worker, page_
     snapshot = await worker.command(AgentCommandRequest(type="snapshot", args={}))
     assert SECRET not in str(snapshot)
     assert await worker._page.locator("#pw").get_attribute("data-fa-protected") is not None
+
+
+@pytest.mark.asyncio
+async def test_child_frame_password_is_stamped_and_masked(worker, page_server, monkeypatch):
+    worker.mask_protected = True
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": page_server + "/login"}))
+    await worker._page.set_content('<iframe src="/child"></iframe>')
+    frame = worker._page.frames[1]
+    await frame.wait_for_selector("#pw")
+    await worker.command(AgentCommandRequest(type="press_key", args={"key": "Tab"}))
+    assert await frame.locator("#pw").get_attribute("data-fa-protected") is not None
+    await frame.locator("#pw").evaluate("el => el.type = 'text'")
+    original = worker._page.screenshot
+    masked = []
+
+    async def capture(**kwargs):
+        masked.extend([await locator.count() for locator in kwargs["mask"]])
+        return await original(**kwargs)
+
+    monkeypatch.setattr(worker._page, "screenshot", capture)
+    await worker.command(AgentCommandRequest(type="screenshot", args={}))
+    assert len(masked) == 2
+    assert masked[1] >= 1

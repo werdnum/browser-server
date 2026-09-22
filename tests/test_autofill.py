@@ -66,6 +66,7 @@ class FakeKeychute:
         self.granted_port: int | None = None
         self.revoked = False
         self.grant_info_unavailable = False
+        self.lose_request_response = False
         self.mechanism = "autofill"
         self.expired = False
         self.reads = 0
@@ -85,6 +86,8 @@ class FakeKeychute:
             self.requests.append(body)
             # Idempotent by key, exactly as the real server is.
             request_id = self.request_ids.setdefault(body["idempotency_key"], str(uuid.uuid4()))
+            if self.lose_request_response:
+                raise httpx.ReadError("response lost", request=request)
             return httpx.Response(201, json=self._status(request_id))
         if path.endswith("/wait"):
             self.wait_calls += 1
@@ -725,6 +728,20 @@ async def test_approved_retry_retains_target_after_broker_failure(keychute):
         assert first.json()["reason"] == "keychute_unavailable"
         await worker.autofill_prepare(None, "replacement-document")
         keychute.grant_info_unavailable = False
+        second = await _autofill(ac, session["session_id"])
+        assert second.json()["reason"] == "target_invalidated"
+        assert keychute.reads == 0
+
+
+@pytest.mark.asyncio
+async def test_lost_creation_response_retains_original_target(keychute):
+    async with client() as ac:
+        session, worker = await _session(ac)
+        keychute.lose_request_response = True
+        first = await _autofill(ac, session["session_id"])
+        assert first.json()["reason"] == "keychute_unavailable"
+        await worker.autofill_prepare(None, "replacement-document")
+        keychute.lose_request_response = False
         second = await _autofill(ac, session["session_id"])
         assert second.json()["reason"] == "target_invalidated"
         assert keychute.reads == 0

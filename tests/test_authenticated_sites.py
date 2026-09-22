@@ -639,6 +639,9 @@ async def test_live_novnc_bridge_stops_forwarding_after_handback():
         class Client:
             count = 0
 
+            async def send_bytes(self, data):
+                pass
+
             async def receive(self):
                 self.count += 1
                 if self.count == 2:
@@ -651,3 +654,30 @@ async def test_live_novnc_bridge_stops_forwarding_after_handback():
         assert closed.is_set()
         assert registry.get(session_id).state.value == "agent_active"
         assert not registry.workers[session["worker_id"]].closed
+
+
+@pytest.mark.asyncio
+async def test_screen_frames_do_not_repeat_remote_authorization(monkeypatch):
+    async def unexpected_authorize(*args):
+        raise AssertionError("screen update must use the revocation watchdog")
+
+    monkeypatch.setattr(registry, "authorize_remote", unexpected_authorize)
+    screens = []
+
+    class Client:
+        async def receive(self):
+            await asyncio.Event().wait()
+
+        async def send_bytes(self, data):
+            screens.append(data)
+
+    class Upstream:
+        def __aiter__(self):
+            return self.messages()
+
+        async def messages(self):
+            for _ in range(20):
+                yield b"screen"
+
+    await main._bridge_websockets(cast(WebSocket, Client()), Upstream(), session_id="session", token="control")
+    assert len(screens) == 20

@@ -1377,9 +1377,10 @@ class PlaywrightBrowserWorker:
         from patchright.async_api import Error as PlaywrightError
 
         if self.mask_protected:
-            await page.locator("input[type=password]").evaluate_all(
-                "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
-            )
+            for frame in page.frames:
+                await frame.locator("input[type=password]").evaluate_all(
+                    "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
+                )
 
         # Any action (a click on a link, Enter submitting a form, go_back to an off-scope page) can
         # trigger a navigation the route guard aborts. Reset the flag and, if such an abort escapes
@@ -1580,7 +1581,9 @@ class PlaywrightBrowserWorker:
             if self.mask_protected:
                 # A revealed ("show password") field is a picture of the secret, so the pixels
                 # are masked at the capture itself rather than after the fact.
-                png = await page.screenshot(type="png", full_page=False, mask=[page.locator(PROTECTED_SELECTOR)])
+                png = await page.screenshot(
+                    type="png", full_page=False, mask=[frame.locator(PROTECTED_SELECTOR) for frame in page.frames]
+                )
             else:
                 png = await page.screenshot(type="png", full_page=False)
             return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}

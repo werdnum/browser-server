@@ -144,7 +144,9 @@ replicated RWX volume (e.g. a Longhorn volume) shared by several pods next. Ther
   chosen for NFS reliability); within a process they are already serialized by synchronous
   execution.
 - Live sessions recheck the shared tombstone before every agent command and every noVNC/human
-  authorization, so a revoke tears down running contexts, not just future loads.
+  authorization, so a revoke tears down running contexts, not just future loads. Human input is
+  checked immediately; screen-only and idle streams are checked by the five-second watchdog,
+  avoiding jar decryption for each screen frame.
 
 Honest residual: the **session registry itself is still in-memory and process-lifetime** (a
 session created on one pod is not visible to another). Persisting it onto the same shared jar

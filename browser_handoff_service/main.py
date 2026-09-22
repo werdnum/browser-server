@@ -1515,8 +1515,6 @@ async def _bridge_websockets(client: WebSocket, upstream, *, session_id: str, to
 
     async def upstream_to_client() -> None:
         async for message in upstream:
-            if not await _novnc_stream_authorized(session_id, token, upstream):
-                return
             if isinstance(message, bytes):
                 await client.send_bytes(message)
             else:

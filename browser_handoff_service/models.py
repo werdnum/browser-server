@@ -204,7 +204,7 @@ class ExtendRequest(BaseModel):
 
 
 class PendingAutofill(BaseModel):
-    request_id: str
+    request_id: str | None = None
     nonce: str
     origin: str
     targets: list[dict[str, Any]]

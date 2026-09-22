@@ -792,6 +792,12 @@ class SessionRegistry:
         if not self.keychute.configured:
             return autofill_refused("keychute_unavailable", "no credential broker is configured", origin=origin)
 
+        session.autofill_pending[req.step_key] = PendingAutofill(
+            request_id=pending.request_id if pending else None,
+            nonce=nonce,
+            origin=origin,
+            targets=targets,
+        )
         idempotency_key = f"{session.session_id}:{req.step_key}"
         host, port = _origin_host_port(origin)
         site = str((req.context or {}).get("site") or alias)
