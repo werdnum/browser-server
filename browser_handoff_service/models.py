@@ -127,6 +127,8 @@ class CreateSessionRequest(BaseModel):
     # enforced regardless of what else the caller asked for: exec/extract denied, clipboard
     # chords denied, navigation confinement always on, read-back protections active.
     authenticated_site: bool = False
+    # Credential protection from creation, with per-request Keychute secret selection.
+    autofill_enabled: bool = False
     # Explicit confinement set (exact origins). Required for a JARLESS authenticated-site
     # session; when a jar is also loaded it must equal the jar's effective set.
     confine_origins: list[BoundedOriginStr] | None = Field(default=None, max_length=MAX_ORIGINS)
@@ -204,6 +206,7 @@ class ExtendRequest(BaseModel):
 
 
 class PendingAutofill(BaseModel):
+    secret_name: str
     request_id: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)
     nonce: str
@@ -251,6 +254,8 @@ class BrowserSession(BaseModel):
     # Authenticated-site marker and the confinement set actually enforced (jar-derived or
     # explicit), so the creating service can verify what it got. Never holds secret material.
     authenticated_site: bool = False
+    # Credential protection from creation, with per-request Keychute secret selection.
+    autofill_enabled: bool = False
     confine_origins: list[str] = Field(default_factory=list)
     credential_alias: str | None = None
     # Autofill bookkeeping: the deterministic backstop cap, the bad-password latch, and the
@@ -278,7 +283,8 @@ AutofillKind = Literal["username", "password"]
 # Everything the autofill endpoint can answer with other than "filled"/"approval_pending".
 # A policy outcome is a 200 with one of these, so the caller never parses HTTP codes for it.
 AutofillRefusal = Literal[
-    "not_authenticated_site",
+    "autofill_disabled",
+    "alias_mismatch",
     "no_alias",
     "wrong_origin",
     "no_eligible_field",
@@ -313,6 +319,8 @@ class AutofillField(BaseModel):
 
 
 class AutofillRequest(BaseModel):
+    # A request, not authorization: Keychute decides release for the actual page origin.
+    secret_name: str | None = Field(default=None, min_length=1, max_length=256)
     # Opaque per-step key; reused across approval_pending retries of the SAME step, because
     # it is what makes the Keychute access request idempotent.
     step_key: str = Field(min_length=1, max_length=64)

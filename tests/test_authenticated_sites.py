@@ -253,7 +253,7 @@ async def test_exec_and_extract_are_denied_before_any_fill():
                 f"/v1/sessions/{session['session_id']}/agent-command", json=command, headers=agent_headers()
             )
             assert resp.status_code == 403, resp.text
-            assert "authenticated-site session" in resp.json()["detail"]
+            assert "credential-protected session" in resp.json()["detail"]
 
 
 @pytest.mark.parametrize(

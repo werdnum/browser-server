@@ -217,7 +217,7 @@ Policy outcomes are a 200 with a typed status, not an HTTP code:
 second visible password field is `ambiguous_fields`, not a guess). A kind-only entry such as
 `{"kind": "password"}` auto-detects just that kind. An explicit empty list (`"fields": []`)
 is rejected with HTTP 422 before any credential request. Refusal reasons:
-`not_authenticated_site`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
+`autofill_disabled`, `alias_mismatch`, `no_alias`, `wrong_origin`, `no_eligible_field`, `ambiguous_fields`,
 `new_password_field`, `in_iframe`, `target_invalidated`, `policy_denied`, `request_expired`,
 `grant_invalid`, `bad_password_recorded`, `fill_cap_reached`, `keychute_unavailable`, `stale_ref`,
 `invalid_ref`.
@@ -252,9 +252,10 @@ Each call is one [Keychute](https://github.com/werdnum/keychute) access request 
 grant read, and the destination is decided here rather than taken on trust:
 
 1. The request's origin constraint is the origin of the **document actually on screen**, never
-   anything the caller supplied, and the idempotency key is `"{session_id}:{step_key}"` — so an
-   `approval_pending` retry of the same step resumes the same decision instead of opening a second
-   one.
+   anything the caller supplied. The idempotency key binds the session, secret, origin and fill
+   step, so an `approval_pending` retry resumes the same decision instead of opening a second
+   one. Use the structured `session_id` and `step_key` context fields to correlate requests; the
+   key itself is opaque.
 2. The fill-time check is against the **granted** constraints, which an approval may have narrowed
    below what was asked for. An origin the session may *navigate* is not thereby an origin a fill
    may *target*.
@@ -413,3 +414,27 @@ make check
 .venv/bin/pre-commit install
 make pre-commit
 ```
+
+
+### On-demand Keychute autofill
+
+Create a service-token browser session with `autofill_enabled: true` to allow
+credential requests during ordinary browsing. No `authenticated_site`, origin
+configuration or pinned alias is needed. The session masks credential controls
+and denies `exec`, raw `extract` and protected-value transfer commands from
+creation; it can navigate across sites normally.
+
+At a login form, POST to `/v1/sessions/{session_id}/autofill` with
+`{"secret_name": "amazon-password", "step_key": "login-1"}`. The existing optional
+`fields`, `wait_seconds` and `context` arguments still apply. This **requests**
+access: browser-server obtains the actual HTTPS document origin and Keychute
+approves, denies, or waits for a human decision. Standing grants are optional and
+should constrain origins when appropriate. Browser-server verifies the granted
+origin before reading or filling the credential; plaintext never goes to FA.
+
+Retry an `approval_pending` response with the same secret and step key, without
+navigating the page. After a terminal result, use a new step key for another fill.
+A configured authenticated-site session still uses its pinned alias and rejects
+requests for another account. An ordinary on-demand session intentionally has no
+per-site account allowlist: access is governed by Keychute's browser-server client
+policy. Its acting-user context is audit information, not separate user identity.

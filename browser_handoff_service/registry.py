@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -311,6 +312,9 @@ class SessionRegistry:
             session.credential_alias = req.credential_alias
             session.allow_exec = False
             session.confine_navigation = True
+        session.autofill_enabled = req.autofill_enabled or req.authenticated_site
+        if session.autofill_enabled:
+            session.allow_exec = False
         session.confine_origins = list(confine_origins or [])
 
         self.sessions[session.session_id] = session
@@ -325,7 +329,7 @@ class SessionRegistry:
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=session.timezone_id,
-            mask_protected=session.authenticated_site,
+            mask_protected=session.autofill_enabled,
         )
         self.workers[session.worker_id or ""] = worker
         try:
@@ -650,11 +654,11 @@ class SessionRegistry:
             # Read-back protection. exec and extract both hand the raw DOM (a filled password
             # field included) straight to the model, so neither exists in an authenticated-site
             # session — jar or no jar, and with no opt-in.
-            if session.authenticated_site and req.type in AUTHENTICATED_SITE_DENIED_COMMANDS:
-                raise AuthorizationError(f"{req.type} is denied in an authenticated-site session")
-            if session.authenticated_site and _is_transfer_chord(req):
+            if session.autofill_enabled and req.type in AUTHENTICATED_SITE_DENIED_COMMANDS:
+                raise AuthorizationError(f"{req.type} is denied in a credential-protected session")
+            if session.autofill_enabled and _is_transfer_chord(req):
                 raise AuthorizationError(
-                    "clipboard and transfer key chords are denied in an authenticated-site session"
+                    "clipboard and transfer key chords are denied in a credential-protected session"
                 )
             # Per-command revocation recheck. In a multi-process deployment sharing the jar
             # directory, a revoke in another process cannot reach into this registry's in-memory
@@ -719,7 +723,7 @@ class SessionRegistry:
             return session
 
     async def autofill(self, session_id: str, req: AutofillRequest) -> AutofillResponse:
-        """Fill the session's pinned credential into the login form on the current document.
+        """Request a credential for the login form on the current document.
 
         The whole resolve -> request -> wait -> verify -> read -> fill sequence holds the session
         command lock, so nothing the agent does can move the page underneath it; the page itself
@@ -744,11 +748,13 @@ class SessionRegistry:
             return response
 
     async def _autofill_locked(self, session: BrowserSession, req: AutofillRequest) -> AutofillResponse:
-        if not session.authenticated_site:
-            return autofill_refused("not_authenticated_site", "autofill exists only in an authenticated-site session")
-        alias = session.credential_alias
+        if not session.autofill_enabled:
+            return autofill_refused("autofill_disabled", "this session was not created with credential protection")
+        if session.authenticated_site and req.secret_name not in (None, session.credential_alias):
+            return autofill_refused("alias_mismatch", "this configured session is bound to a different credential")
+        alias = session.credential_alias if session.authenticated_site else req.secret_name
         if not alias:
-            return autofill_refused("no_alias", "this session has no credential pinned to it")
+            return autofill_refused("no_alias", "name the Keychute secret to request")
         if session.autofill_bad_password:
             return autofill_refused("bad_password_recorded", "a bad password was reported for this session")
         if session.autofill_fill_count >= AUTOFILL_FILL_CAP:
@@ -762,6 +768,8 @@ class SessionRegistry:
         # 1. Pin the document and choose the targets. The origin is the document's own, never
         #    anything the caller supplied.
         pending = session.autofill_pending.get(req.step_key)
+        if pending is not None and pending.secret_name != alias:
+            return autofill_refused("alias_mismatch", "use a new step key to request a different secret")
         if pending is not None:
             nonce, origin, targets = pending.nonce, pending.origin, pending.targets
         else:
@@ -777,7 +785,7 @@ class SessionRegistry:
                 )
             origin = _normalize_origin(str(prepared.get("origin") or ""))
             targets = list(prepared.get("targets") or [])
-        if origin is None or origin not in set(session.confine_origins):
+        if origin is None or (session.confine_navigation and origin not in set(session.confine_origins)):
             # Cannot happen while the route guard holds, so it is a fail-closed backstop rather
             # than a routine outcome — about:blank reaches it too.
             return autofill_refused(
@@ -792,13 +800,16 @@ class SessionRegistry:
 
         context = pending.context if pending else dict(req.context or {})
         session.autofill_pending[req.step_key] = PendingAutofill(
+            secret_name=alias,
             request_id=pending.request_id if pending else None,
             context=context,
             nonce=nonce,
             origin=origin,
             targets=targets,
         )
-        idempotency_key = f"{session.session_id}:{req.step_key}"
+        # A caller reusing a step on another account or origin must request a new grant.
+        request_scope = json.dumps([alias, origin, req.step_key])
+        idempotency_key = f"{session.session_id}:{hashlib.sha256(request_scope.encode()).hexdigest()}"
         host, port = _origin_host_port(origin)
         site = str(context.get("site") or alias)
         acting_user = str(context.get("acting_user") or "the configured user")
@@ -820,7 +831,12 @@ class SessionRegistry:
                 },
             )
             session.autofill_pending[req.step_key] = PendingAutofill(
-                request_id=status.request_id, context=context, nonce=nonce, origin=origin, targets=targets
+                secret_name=alias,
+                request_id=status.request_id,
+                context=context,
+                nonce=nonce,
+                origin=origin,
+                targets=targets,
             )
             if status.state == "pending" and req.wait_seconds > 0:
                 status = await self.keychute.wait(status.request_id, req.wait_seconds)
