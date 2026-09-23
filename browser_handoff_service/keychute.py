@@ -175,7 +175,7 @@ class KeychuteClient:
     def approval_url(self, request_id: str) -> str | None:
         """Where a human goes to decide, when the operator configured an external base."""
         raw = os.environ.get(KEYCHUTE_EXTERNAL_URL_ENV, "").strip().rstrip("/")
-        return f"{raw}/requests/{request_id}" if raw else None
+        return f"{raw}/ui/requests/{request_id}" if raw else None
 
     def _base_url(self) -> str:
         raw = os.environ.get(KEYCHUTE_URL_ENV, "").strip()
