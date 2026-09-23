@@ -899,3 +899,29 @@ async def test_configured_session_cannot_request_another_account(keychute):
         response = await _autofill(ac, session["session_id"], secret_name="other-account")
         assert response.json()["reason"] == "alias_mismatch"
         assert not keychute.requests
+
+
+def test_keychute_approval_url(monkeypatch):
+    kc = KeychuteClient()
+    assert kc.approval_url("req-123") is None
+
+    monkeypatch.setenv("BROWSER_KEYCHUTE_EXTERNAL_URL", "https://keychute.example.com")
+    assert kc.approval_url("req-123") == "https://keychute.example.com/ui/requests/req-123"
+
+    monkeypatch.setenv("BROWSER_KEYCHUTE_EXTERNAL_URL", "https://keychute.example.com/")
+    assert kc.approval_url("req-456") == "https://keychute.example.com/ui/requests/req-456"
+
+
+@pytest.mark.asyncio
+async def test_approval_pending_detail_includes_ui_url(keychute, monkeypatch):
+    monkeypatch.setenv("BROWSER_KEYCHUTE_EXTERNAL_URL", "https://keychute.example.com")
+    keychute.state = "pending"
+    async with client() as ac:
+        session, _ = await _session(ac)
+        resp = await _autofill(ac, session["session_id"], wait_seconds=0)
+        assert resp.json()["status"] == "approval_pending"
+        request_id = resp.json()["request_id"]
+        assert (
+            resp.json()["detail"]
+            == f"awaiting a release decision at https://keychute.example.com/ui/requests/{request_id}"
+        )
