@@ -1,5 +1,7 @@
 import base64
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from browser_handoff_service.main import app, registry
@@ -10,6 +12,8 @@ from browser_handoff_service.runtime import (
     StorageTooLarge,
     remote_display_status,
 )
+from browser_handoff_service.web_bot_auth import WebBotAuthSigner
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from httpx import ASGITransport, AsyncClient
 
 TEST_SERVICE_TOKEN = "test-service-token"
@@ -187,3 +191,85 @@ async def test_headed_novnc_assets_are_served_through_authenticated_service_prox
         denied = await client.get(novnc_url)
     assert denied.status_code == 403
     await registry.close(session_id)
+
+
+class _RecordingHandler(BaseHTTPRequestHandler):
+    requests: list[tuple[str, dict[str, str]]]
+
+    def do_GET(self) -> None:
+        self.requests.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
+        if self.path == "/":
+            body = b'<html><head><title>signed</title></head><body><img src="/pixel.gif"></body></html>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Set-Cookie", "session=abc; Path=/")
+        else:
+            body = b"GIF89a"
+            self.send_response(200)
+            self.send_header("Content-Type", "image/gif")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+def _verify_web_bot_auth(headers: dict[str, str], authority: str, public_key) -> None:
+    signature_input = headers["signature-input"].removeprefix("sig1=")
+    assert signature_input.startswith('("@authority" "signature-agent");')
+    assert ';tag="web-bot-auth"' in signature_input
+    base = "\n".join(
+        [
+            f'"@authority": {authority}',
+            f'"signature-agent": {headers["signature-agent"]}',
+            f'"@signature-params": {signature_input}',
+        ]
+    )
+    signature = base64.b64decode(headers["signature"].removeprefix("sig1=:").removesuffix(":"))
+    public_key.verify(signature, base.encode("ascii"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confined", [False, True])
+async def test_real_chromium_signs_every_request_with_web_bot_auth(monkeypatch, confined):
+    """Documents and subresources both carry a verifiable signature, the browser's own cookies
+    still go out alongside it, and the confinement guard (which continues the request after the
+    signing handler falls back to it) keeps the signed headers."""
+    monkeypatch.delenv("BROWSER_RUNTIME", raising=False)
+    handler = type("Handler", (_RecordingHandler,), {"requests": []})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    authority = f"127.0.0.1:{server.server_port}"
+    origin = f"http://{authority}"
+    key = Ed25519PrivateKey.generate()
+    signer = WebBotAuthSigner(key, signature_agent="https://bot.example.com")
+    worker = PlaywrightBrowserWorker(
+        "worker_web_bot_auth", web_bot_auth=signer, confine_origins=[origin] if confined else None
+    )
+    try:
+        try:
+            await worker.start()
+        except RuntimeUnavailable as exc:
+            pytest.skip(f"real local Chromium unavailable on this host: {exc}")
+        # Patchright injects init scripts (the stealth patches among them) into routed documents;
+        # continuing a document from the signing handler must not lose them.
+        assert worker._context is not None
+        await worker._context.add_init_script(
+            "document.addEventListener('DOMContentLoaded', () => { document.title += '+init'; })"
+        )
+        for _ in range(2):
+            result = await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{origin}/"}))
+            assert result["title"] == "signed+init"
+    finally:
+        await worker.close()
+        server.shutdown()
+
+    paths = [path for path, _ in handler.requests]
+    assert "/" in paths and "/pixel.gif" in paths
+    for _, headers in handler.requests:
+        assert headers["signature-agent"] == '"https://bot.example.com"'
+        _verify_web_bot_auth(headers, authority, key.public_key())
+    documents = [headers for path, headers in handler.requests if path == "/"]
+    assert "session=abc" in documents[-1].get("cookie", "")

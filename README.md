@@ -24,6 +24,8 @@ Implemented:
 - Agent-side smoke client in `scripts/agent_client_smoke.py`.
 - Cookie jars: opt-in, encrypted, scope-filtered persistence of authenticated browser state
   (see "Cookie jars" below).
+- Optional Web Bot Auth: Ed25519 HTTP Message Signatures on every outgoing browser request
+  (see "Web Bot Auth" below).
 - Python and Playwright e2e tests.
 
 ## Session flows
@@ -365,6 +367,54 @@ This is not a full anti-fingerprinting layer: CDP-protocol and TLS-level detecti
 out of scope. Headed mode (`BROWSER_HEADED=1`) remains meaningfully harder to detect
 than headless, and a hard Cloudflare-class interstitial may still need to be solved
 manually through the noVNC handoff view.
+
+### Web Bot Auth (signed requests)
+
+Optionally, every request the browser sends can carry a
+[Web Bot Auth](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/)
+signature: an Ed25519 HTTP Message Signature (RFC 9421) over `@authority` and `Signature-Agent`,
+tagged `web-bot-auth`, with a fresh nonce and a short `created`/`expires` window. A verifier that
+knows the key (Cloudflare, once the bot is registered there) then treats the browser as a
+verified bot or signed agent instead of challenging it.
+
+This is the opposite of the stealth hardening above: a signed request announces itself as
+automated. Signing a request with a key the verifier does not know gains nothing, so turn it on
+only once the key is registered. It is off unless explicitly flagged on, and a flagged-on service
+with an unusable key refuses to start rather than run unsigned:
+
+```bash
+export BROWSER_WEB_BOT_AUTH=1
+export BROWSER_WEB_BOT_AUTH_KEY_FILE=/var/run/secrets/web-bot-auth/private-key.pem  # PKCS#8 Ed25519
+export BROWSER_WEB_BOT_AUTH_SIGNATURE_AGENT=https://bot.example.com  # host serving the key directory
+export BROWSER_WEB_BOT_AUTH_VALIDITY_SECONDS=60                      # optional; default shown
+```
+
+Generate a key with `openssl genpkey -algorithm ed25519 -out private-key.pem`.
+
+Signing happens in a Playwright route handler on every browser context, so documents, subresources
+and XHR/fetch are all signed, including in confined sessions; the UCP probe is signed too.
+Requests a Service Worker makes on its own are not routed and go out unsigned.
+`Signature-Agent` uses the quoted-string form (`"https://bot.example.com"`), which is the form
+Cloudflare verifies; the dictionary form of later drafts fails there.
+
+Verifiers find the public key at `<signature agent>/.well-known/http-message-signatures-directory`,
+which must be publicly reachable. browser-server does not serve it, since its own routes sit behind
+edge authentication. Instead the CLI emits the directory body and its response signature for
+publication as a static file:
+
+```bash
+python -m browser_handoff_service.web_bot_auth sign-directory --authority bot.example.com --validity-days 365
+python -m browser_handoff_service.web_bot_auth public-key   # JWK and keyid only
+```
+
+The directory signature covers only the host (`"@authority";req`), so the output stays valid
+until its `expires`, and re-running the command before then renews it. Both commands read the key
+from `--key-file` or `BROWSER_WEB_BOT_AUTH_KEY_FILE`, so they can run inside the deployed
+container.
+
+To check a deployment end to end, `https://crawltest.com/cdn-cgi/web-bot-auth` answers 400 for a
+malformed or missing signature, 401 for a well-formed one with an unregistered key, and 200 once
+the key is registered.
 
 ### OIDC clock skew
 

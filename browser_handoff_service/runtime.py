@@ -20,6 +20,7 @@ import httpx
 from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
+from .web_bot_auth import WebBotAuthSigner
 
 # Bound the merchant-controlled UCP probe so a huge or slow-trickle
 # /.well-known/ucp response cannot tie up the snapshot — which the registry
@@ -1129,11 +1130,13 @@ class PlaywrightBrowserWorker:
         confine_origins: list[str] | None = None,
         timezone_id: str | None = None,
         mask_protected: bool = False,
+        web_bot_auth: WebBotAuthSigner | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.closed = False
         self._next_ref = 1
         self.headed = headed
+        self.web_bot_auth = web_bot_auth
         self.stealth = stealth_enabled()
         self.width = width
         self.height = height
@@ -1176,9 +1179,10 @@ class PlaywrightBrowserWorker:
         """
 
         async def probe() -> Any:
+            headers = self.web_bot_auth.request_headers(url) if self.web_bot_auth else None
             async with (
                 httpx.AsyncClient(timeout=_UCP_PROBE_TIMEOUT_S, follow_redirects=False) as client,
-                client.stream("GET", url) as response,
+                client.stream("GET", url, headers=headers) as response,
             ):
                 if response.status_code // 100 != 2:
                     return None
@@ -1280,6 +1284,10 @@ class PlaywrightBrowserWorker:
                 await self._context.add_init_script(script)
             if self.confine_origins:
                 await self._install_confinement(self._context)
+            if self.web_bot_auth is not None:
+                # Registered after the confinement guard so it runs first (Playwright runs route
+                # handlers in reverse registration order) and hands the signed headers on to it.
+                await self._install_web_bot_auth(self._context, self.web_bot_auth, hand_on=bool(self.confine_origins))
             self._page = await self._context.new_page()
         except Exception as exc:
             await self.close()
@@ -1307,6 +1315,31 @@ class PlaywrightBrowserWorker:
         if not isinstance(user_agent, str) or _HEADLESS_UA_TOKEN not in user_agent:
             return None
         return user_agent.replace(_HEADLESS_UA_TOKEN, "Chrome")
+
+    async def _install_web_bot_auth(self, context: Any, signer: WebBotAuthSigner, *, hand_on: bool) -> None:
+        """Sign every request the context sends, subresources included: a verifier challenges an
+        unsigned XHR as readily as an unsigned document.
+
+        With ``hand_on`` the signed headers go to the next handler (the confinement guard) through
+        ``fallback``, and that handler decides whether the request goes out. Without one the request
+        is continued here: patchright serves document requests that fall through to its default
+        handling itself, and drops fallback overrides on the way.
+
+        Requests a Service Worker makes on its own are not routed and go unsigned."""
+
+        async def route_handler(route: Any) -> None:
+            request = route.request
+            try:
+                headers = {**request.headers, **signer.request_headers(request.url)}
+            except ValueError:
+                # No authority to sign (e.g. a non-network scheme); send it as the browser built it.
+                headers = None
+            if hand_on:
+                await route.fallback(headers=headers)
+            else:
+                await route.continue_(headers=headers)
+
+        await context.route("**/*", route_handler)
 
     async def _install_confinement(self, context: Any) -> None:
         """Confine top-level *document* requests in every frame (main, child, popup) to the jar's
@@ -2108,6 +2141,7 @@ def make_worker(
     confine_origins: list[str] | None = None,
     timezone_id: str | None = None,
     mask_protected: bool = False,
+    web_bot_auth: WebBotAuthSigner | None = None,
 ) -> BrowserRuntime:
     runtime = os.environ.get("BROWSER_RUNTIME", "playwright").lower()
     # Fall back to the operator-level default timezone when the caller did not request
@@ -2131,6 +2165,7 @@ def make_worker(
         confine_origins=confine_origins,
         timezone_id=resolved_timezone_id,
         mask_protected=mask_protected,
+        web_bot_auth=web_bot_auth,
     )
 
 
