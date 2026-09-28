@@ -50,6 +50,7 @@ from .models import (
 from .runtime import BrowserRuntime, RuntimeUnavailable, StorageTooLarge, make_worker
 from .security import hash_token, mint_token, redact_url
 from .transitions import transition
+from .web_bot_auth import WebBotAuthSigner, signer_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ class TokenRecord:
 
 
 class SessionRegistry:
-    def __init__(self, jar_store: JarStore | None = None) -> None:
+    def __init__(self, jar_store: JarStore | None = None, web_bot_auth: WebBotAuthSigner | None = None) -> None:
         self.sessions: dict[str, BrowserSession] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self.events: dict[str, list[SessionEvent]] = {}
@@ -238,6 +239,9 @@ class SessionRegistry:
         self.jar_locks: dict[str, asyncio.Lock] = {}
         # Credential broker for autofill. Unconfigured => autofill refuses; injectable for tests.
         self.keychute = KeychuteClient()
+        # Web Bot Auth request signing for every browser this registry starts. Off unless
+        # configured; a flagged-on but unusable key fails here, at startup.
+        self.web_bot_auth: WebBotAuthSigner | None = web_bot_auth if web_bot_auth is not None else signer_from_env()
 
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
@@ -330,6 +334,7 @@ class SessionRegistry:
             confine_origins=confine_origins,
             timezone_id=session.timezone_id,
             mask_protected=session.autofill_enabled,
+            web_bot_auth=self.web_bot_auth,
         )
         self.workers[session.worker_id or ""] = worker
         try:
@@ -1141,6 +1146,7 @@ class SessionRegistry:
             height=profile.height,
             user_agent=profile.user_agent,
             confine_origins=[o for o in (normalize_origin(x) for x in origins) if o],
+            web_bot_auth=self.web_bot_auth,
         )
         try:
             await worker.start()
@@ -1371,6 +1377,7 @@ class SessionRegistry:
             user_agent=profile.user_agent,
             storage_state=storage_state,
             confine_origins=confine_origins,
+            web_bot_auth=self.web_bot_auth,
         )
         try:
             await worker.start()
