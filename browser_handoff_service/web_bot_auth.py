@@ -201,6 +201,10 @@ def signer_from_env() -> WebBotAuthSigner | None:
     agent = os.environ.get(SIGNATURE_AGENT_ENV, "").strip() or None
     if agent is not None:
         parts = urlsplit(agent)
+        try:
+            parts.port  # noqa: B018 -- raises on a malformed port
+        except ValueError as exc:
+            raise WebBotAuthConfigError(f"{SIGNATURE_AGENT_ENV} has an invalid port") from exc
         if parts.scheme != "https" or not parts.hostname:
             raise WebBotAuthConfigError(f"{SIGNATURE_AGENT_ENV} must be an https:// URL with a host")
         try:
