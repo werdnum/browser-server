@@ -394,7 +394,10 @@ Generate a key with `openssl genpkey -algorithm ed25519 -out private-key.pem`.
 Signing happens in a Playwright route handler on every browser context, so documents, subresources
 and XHR/fetch are all signed, including in confined sessions; the UCP probe is signed too.
 Requests a Service Worker makes on its own, and WebSocket handshakes, are not routed and go out
-unsigned.
+unsigned. Playwright routes only the first hop of a redirect: Chromium re-sends that hop's headers
+on each later hop, so a redirect that changes host (`example.com` to `www.example.com`, or into an
+SSO domain) delivers a signature bound to the old host, which fails verification for that one
+request. Redirects that keep the host, including `http` to `https` on default ports, stay valid.
 `Signature-Agent` uses the quoted-string form (`"https://bot.example.com"`), which is the form
 Cloudflare verifies; the dictionary form of later drafts fails there.
 

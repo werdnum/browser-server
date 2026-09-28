@@ -1326,7 +1326,8 @@ class PlaywrightBrowserWorker:
         handling itself, and drops fallback overrides on the way.
 
         Requests a Service Worker makes on its own, and WebSocket handshakes, are not routed and go
-        unsigned."""
+        unsigned. Redirect hops are not routed either; Chromium carries the first hop's headers
+        onward, so a cross-host redirect lands with a signature bound to the previous host."""
 
         async def route_handler(route: Any) -> None:
             request = route.request
