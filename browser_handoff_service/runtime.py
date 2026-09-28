@@ -28,6 +28,9 @@ from .web_bot_auth import WebBotAuthSigner
 _UCP_PROBE_TIMEOUT_S = 5.0
 _UCP_PROBE_MAX_BYTES = 256 * 1024
 
+# Request fields Web Bot Auth writes; a request that already carries any of them is left unsigned.
+_SIGNATURE_FIELDS = frozenset({"signature", "signature-input", "signature-agent"})
+
 # Product token Chromium's headless build puts in its native user agent, in place of "Chrome".
 _HEADLESS_UA_TOKEN = "HeadlessChrome"
 
@@ -1331,11 +1334,15 @@ class PlaywrightBrowserWorker:
 
         async def route_handler(route: Any) -> None:
             request = route.request
-            try:
-                headers = {**request.headers, **signer.request_headers(request.url)}
-            except ValueError:
-                # No authority to sign (e.g. a non-network scheme); send it as the browser built it.
-                headers = None
+            headers: dict[str, str] | None = None
+            # A request the page already signs itself (RFC 9421 on an API call) goes out as the page
+            # built it: adding a second dictionary under our label could clobber or conflict with it.
+            if _SIGNATURE_FIELDS.isdisjoint(name.lower() for name in request.headers):
+                try:
+                    headers = {**request.headers, **signer.request_headers(request.url)}
+                except ValueError:
+                    # No authority to sign (e.g. a non-network scheme); send it as the browser built it.
+                    headers = None
             if hand_on:
                 await route.fallback(headers=headers)
             else:

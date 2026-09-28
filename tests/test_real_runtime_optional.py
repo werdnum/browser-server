@@ -199,7 +199,10 @@ class _RecordingHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.requests.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
         if self.path == "/":
-            body = b'<html><head><title>signed</title></head><body><img src="/pixel.gif"></body></html>'
+            body = (
+                b'<html><head><title>signed</title></head><body><img src="/pixel.gif">'
+                b"<script>fetch('/api', {headers: {'Signature': 'app=:AAAA:'}})</script></body></html>"
+            )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Set-Cookie", "session=abc; Path=/")
@@ -261,8 +264,13 @@ async def test_real_chromium_signs_every_request_with_web_bot_auth(monkeypatch, 
         server.shutdown()
 
     paths = [path for path, _ in handler.requests]
-    assert "/" in paths and "/pixel.gif" in paths
-    for _, headers in handler.requests:
+    assert "/" in paths and "/pixel.gif" in paths and "/api" in paths
+    for path, headers in handler.requests:
+        if path == "/api":
+            # The page's own RFC 9421 signature goes out untouched and unaccompanied.
+            assert headers["signature"] == "app=:AAAA:"
+            assert "signature-input" not in headers and "signature-agent" not in headers
+            continue
         assert headers["signature-agent"] == '"https://bot.example.com"'
         _verify_web_bot_auth(headers, authority, key.public_key())
     documents = [headers for path, headers in handler.requests if path == "/"]

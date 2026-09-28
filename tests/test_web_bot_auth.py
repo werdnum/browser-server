@@ -150,6 +150,7 @@ def test_signer_from_env_configured(monkeypatch, tmp_path):
         ({}, "BROWSER_WEB_BOT_AUTH_KEY_FILE is not set"),
         ({"BROWSER_WEB_BOT_AUTH_KEY_FILE": "/nonexistent/key.pem"}, "cannot load"),
         ({"BROWSER_WEB_BOT_AUTH_SIGNATURE_AGENT": "http://bot.example.com"}, "https://"),
+        ({"BROWSER_WEB_BOT_AUTH_SIGNATURE_AGENT": "https:///bot"}, "with a host"),
         ({"BROWSER_WEB_BOT_AUTH_SIGNATURE_AGENT": "https://böt.example.com"}, "printable ASCII"),
         ({"BROWSER_WEB_BOT_AUTH_VALIDITY_SECONDS": "0"}, "positive"),
     ],

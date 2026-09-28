@@ -200,8 +200,9 @@ def signer_from_env() -> WebBotAuthSigner | None:
         raise WebBotAuthConfigError(f"{ENABLED_ENV} is on but {KEY_FILE_ENV} is not set")
     agent = os.environ.get(SIGNATURE_AGENT_ENV, "").strip() or None
     if agent is not None:
-        if urlsplit(agent).scheme != "https":
-            raise WebBotAuthConfigError(f"{SIGNATURE_AGENT_ENV} must be an https:// URL")
+        parts = urlsplit(agent)
+        if parts.scheme != "https" or not parts.hostname:
+            raise WebBotAuthConfigError(f"{SIGNATURE_AGENT_ENV} must be an https:// URL with a host")
         try:
             _sf_string(agent)
         except ValueError as exc:
