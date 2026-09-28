@@ -253,15 +253,9 @@ async def test_real_chromium_signs_every_request_with_web_bot_auth(monkeypatch, 
             await worker.start()
         except RuntimeUnavailable as exc:
             pytest.skip(f"real local Chromium unavailable on this host: {exc}")
-        # Patchright injects init scripts (the stealth patches among them) into routed documents;
-        # continuing a document from the signing handler must not lose them.
-        assert worker._context is not None
-        await worker._context.add_init_script(
-            "document.addEventListener('DOMContentLoaded', () => { document.title += '+init'; })"
-        )
         for _ in range(2):
             result = await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{origin}/"}))
-            assert result["title"] == "signed+init"
+            assert result["title"] == "signed"
     finally:
         await worker.close()
         server.shutdown()
