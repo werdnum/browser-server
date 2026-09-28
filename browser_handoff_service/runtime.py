@@ -1325,7 +1325,8 @@ class PlaywrightBrowserWorker:
         is continued here: patchright serves document requests that fall through to its default
         handling itself, and drops fallback overrides on the way.
 
-        Requests a Service Worker makes on its own are not routed and go unsigned."""
+        Requests a Service Worker makes on its own, and WebSocket handshakes, are not routed and go
+        unsigned."""
 
         async def route_handler(route: Any) -> None:
             request = route.request

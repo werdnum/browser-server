@@ -393,7 +393,8 @@ Generate a key with `openssl genpkey -algorithm ed25519 -out private-key.pem`.
 
 Signing happens in a Playwright route handler on every browser context, so documents, subresources
 and XHR/fetch are all signed, including in confined sessions; the UCP probe is signed too.
-Requests a Service Worker makes on its own are not routed and go out unsigned.
+Requests a Service Worker makes on its own, and WebSocket handshakes, are not routed and go out
+unsigned.
 `Signature-Agent` uses the quoted-string form (`"https://bot.example.com"`), which is the form
 Cloudflare verifies; the dictionary form of later drafts fails there.
 
