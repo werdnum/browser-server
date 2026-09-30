@@ -252,13 +252,15 @@ async def test_human_started_session_hands_over_to_agent_through_http_api(monkey
         )
         assert nav.status_code == 200, nav.text
 
-        # The handover token is one-time.
+        # Re-claiming the session the agent already owns is idempotent, not a 409:
+        # a retried handback must not wedge the browser for the rest of the session.
         reused = await client.post(
             f"/v1/sessions/{session_id}/agent-claim",
             headers=headers,
             json={"token": handover_token},
         )
-        assert reused.status_code == 409
+        assert reused.status_code == 200, reused.text
+        assert reused.json()["state"] == "agent_active"
 
 
 @pytest.mark.asyncio
