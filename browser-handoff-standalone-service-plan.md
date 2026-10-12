@@ -578,15 +578,16 @@ Exit criteria:
 
 ### 6. Sanitized Resume
 
-- Implement `after_sanitize` for low-risk reasons only.
+- Implement `after_sanitize` for any handoff reason the agent opts into.
 - Close human-controlled page.
 - Open a fresh page in the same context at an allowed origin.
 - Run simple sensitive-field checks before returning lease.
 
 Exit criteria:
 
-- CAPTCHA/cookie-consent style flows can resume.
-- Payment, credential, and legal-consent flows still close by default.
+- A handoff requested with `after_sanitize` can resume, including after a login, OTP or payment
+  step, which is the main reason to hand off.
+- A handoff requested with `never` closes.
 
 ### 7. Hardening
 
@@ -647,8 +648,7 @@ Security regression tests:
 4. Persistence: for shared-fate V1, keep handoff-service state in memory and let Family Assistant
    persist only high-level conversation events. Add handoff-service persistence later only if workers
    can outlive the API, multiple API replicas share sessions, or durable service audit is required.
-5. Resume policy: default `never`; allow `after_sanitize` only for non-payment, non-credential,
-   non-legal-consent reasons.
+5. Resume policy: default `never`; the agent opts into `after_sanitize` for any reason.
 
 ## Recommended V1 Scope
 

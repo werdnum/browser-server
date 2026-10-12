@@ -400,8 +400,6 @@ class SessionRegistry:
         session = self.get(session_id)
         async with self.locks[session_id]:
             self._raise_if_expired(session)
-            if req.reason in {"payment", "credentials", "otp", "legal_consent"} and req.allowed_resume != "never":
-                raise ConflictError("sensitive handoffs cannot resume on the same browser page")
             # A jar-loaded session must never be resumed as the same context after human control:
             # the human can visit off-scope login/payment/SSO origins and accumulate credentials
             # broader than the jar's immutable jar_origins. Force allowed_resume=never so
