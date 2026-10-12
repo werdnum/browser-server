@@ -44,7 +44,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -785,7 +785,7 @@ class JarStore:
         return self.jar_dir / f"{validate_jar_id(jar_id)}.json"
 
     @contextlib.contextmanager
-    def _ops_lock(self) -> Iterator[None]:
+    def _ops_lock(self) -> Generator[None]:
         """Serialize tombstone-mutating operations (save/invalidate/delete) *across processes*
         sharing the jar directory. Without it two workers can append tombstones chained from the
         same tail (one silently dropped as forged) or a refresh can publish a higher generation

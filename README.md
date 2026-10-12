@@ -13,7 +13,7 @@ Implemented:
 - One-time handoff URL tokens; claim returns a separate human control token for remote/actions.
 - Optional `expected_origin` validation before minting a handoff URL.
 - Fail-closed command authorization after handoff starts.
-- Sanitized resume (`allowed_resume: "after_sanitize"`), for any handoff reason, closes the human-controlled page before returning the lease.
+- Sanitized resume (`allowed_resume: "after_sanitize"`), for any handoff reason, closes the human-controlled page before returning the lease. It keeps the browser context, including cookies, localStorage and IndexedDB, so the agent gets the signed-in session back. Whatever a site stored there during the human's step is readable to the agent afterwards; that is accepted, because the signed-in context is what resuming is for.
 - Real Playwright Chromium runtime by default.
 - Headed Chromium plus Xvfb/x11vnc/noVNC launch path when host binaries are installed.
 - Form factor auto-detected from the user's aspect ratio (portrait -> mobile, landscape -> desktop); the noVNC viewport is sized to match.
