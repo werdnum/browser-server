@@ -1846,7 +1846,7 @@ class PlaywrightBrowserWorker:
             raise StorageTooLarge(f"storage_state exceeds {max_bytes} bytes")
         # storage_state()'s return is typed as a Playwright-specific mapping across versions;
         # normalize to the plain dict the jar layer expects (copy, not alias).
-        return cast(dict[str, Any], dict(state))
+        return dict(state)
 
     async def selector_present(self, selector: str) -> bool | None:
         """True/False if the selector is present/absent; None if it could not be evaluated (a

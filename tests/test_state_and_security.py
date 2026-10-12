@@ -91,18 +91,6 @@ async def test_pending_handoff_token_cannot_extend_claim_timeout():
 
 
 @pytest.mark.asyncio
-async def test_payment_handoff_rejects_resume_policy():
-    registry = SessionRegistry()
-    session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
-    with pytest.raises(ConflictError):
-        await registry.handoff(
-            session.session_id,
-            HandoffRequest(reason="payment", allowed_resume="after_sanitize"),
-            "http://testserver",
-        )
-
-
-@pytest.mark.asyncio
 async def test_handoff_expected_origin_must_match_current_origin():
     registry = SessionRegistry()
     session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
@@ -134,7 +122,8 @@ async def test_handoff_expected_origin_must_match_current_origin():
 
 
 @pytest.mark.asyncio
-async def test_low_risk_handoff_can_return_agent_resumable_after_sanitize():
+@pytest.mark.parametrize("reason", ["captcha", "credentials", "otp", "payment"])
+async def test_handoff_can_return_agent_resumable_after_sanitize(reason):
     registry = SessionRegistry()
     session, _ = await registry.create_session(CreateSessionRequest(conversation_id="conv_1"))
     await registry.agent_command(
@@ -143,12 +132,12 @@ async def test_low_risk_handoff_can_return_agent_resumable_after_sanitize():
     )
     _, url = await registry.handoff(
         session.session_id,
-        HandoffRequest(reason="captcha", allowed_resume="after_sanitize"),
+        HandoffRequest(reason=reason, allowed_resume="after_sanitize"),
         "http://testserver",
     )
     token = url.split("token=", 1)[1]
     _, control_token = await registry.claim(session.session_id, token)
-    resumable = await registry.human_complete(session.session_id, control_token, "captcha solved")
+    resumable = await registry.human_complete(session.session_id, control_token, "done")
 
     assert resumable.state == SessionState.AGENT_RESUMABLE
     assert resumable.lease_owner == LeaseOwner.AGENT
