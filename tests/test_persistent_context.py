@@ -1,0 +1,411 @@
+"""The persistent-context launch mode (``BROWSER_CONTEXT_PERSISTENT``).
+
+Off by default. When enabled, ``start()`` must launch a *headed persistent
+context* (a real profile) instead of an incognito ``launch()`` + ``new_context()``:
+patchright's documented best-practice posture against Cloudflare-class
+interstitials. Fences must hold on that path too: a jar's storage_state fails
+closed, confinement still installs its route guard, the per-session profile dir
+is removed on close (with a bounded retry for the Linux teardown race and a
+logged residual if even that fails), and the default (incognito) launch is
+unchanged. A headed display whose start() fails mid-launch is closed, not
+leaked — on both the re-raise path and the persistent local-display fallback.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+import pytest
+from browser_handoff_service import runtime as runtime_module
+from browser_handoff_service.runtime import (
+    PlaywrightBrowserWorker,
+    RuntimeUnavailable,
+    persistent_context_enabled,
+)
+
+_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+
+
+class _StubPage:
+    def __init__(self) -> None:
+        self.url = "about:blank"
+
+    async def evaluate(self, _expression: str) -> str:
+        return _UA
+
+
+class _StubContext:
+    def __init__(self, pages: list[_StubPage] | None = None) -> None:
+        self.pages = pages if pages is not None else []
+        self.init_scripts: list[str] = []
+        self.routes: list[str] = []
+        self.events: dict[str, Any] = {}
+        self.closed = False
+
+    async def new_page(self) -> _StubPage:
+        page = _StubPage()
+        self.pages.append(page)
+        return page
+
+    async def add_init_script(self, script: str) -> None:
+        self.init_scripts.append(script)
+
+    async def route(self, pattern: str, _handler: Any) -> None:
+        self.routes.append(pattern)
+
+    def on(self, event: str, handler: Any) -> None:
+        self.events[event] = handler
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _StubBrowser:
+    def __init__(self) -> None:
+        self.contexts: list[_StubContext] = []
+
+    async def new_context(self, **_kwargs: Any) -> _StubContext:
+        context = _StubContext()
+        self.contexts.append(context)
+        return context
+
+    async def close(self) -> None:
+        return None
+
+
+class _StubChromium:
+    def __init__(self) -> None:
+        self.launch_calls: list[dict[str, Any]] = []
+        self.persistent_calls: list[dict[str, Any]] = []
+
+    async def launch(self, **kwargs: Any) -> _StubBrowser:
+        self.launch_calls.append(kwargs)
+        return _StubBrowser()
+
+    async def launch_persistent_context(self, user_data_dir: str, **kwargs: Any) -> _StubContext:
+        self.persistent_calls.append({"user_data_dir": user_data_dir, **kwargs})
+        return _StubContext([_StubPage()])
+
+
+class _StubPlaywright:
+    def __init__(self) -> None:
+        self.chromium = _StubChromium()
+
+    async def start(self) -> _StubPlaywright:
+        return self
+
+    async def stop(self) -> None:
+        return None
+
+
+class _StubPlaywrightFactory:
+    """Shape of ``patchright.async_api.async_playwright``: sync call, async start."""
+
+    def __init__(self, playwright: _StubPlaywright) -> None:
+        self._playwright = playwright
+
+    async def start(self) -> _StubPlaywright:
+        return self._playwright
+
+
+def _patch_playwright(monkeypatch: pytest.MonkeyPatch) -> _StubPlaywright:
+    stub = _StubPlaywright()
+    monkeypatch.setattr(
+        "patchright.async_api.async_playwright",
+        lambda: _StubPlaywrightFactory(stub),
+    )
+    return stub
+
+
+def _no_remote_display(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the noVNC stack absent so the local-display fallback is deterministic."""
+
+    class _UnavailableDisplay:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> str:
+            raise RuntimeUnavailable("missing remote display binaries")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(runtime_module, "LocalNovncDisplay", _UnavailableDisplay)
+
+
+def _failing_display(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> list[Any]:
+    """A display whose ``start()`` fails; records instances and close() calls."""
+
+    created: list[Any] = []
+
+    class _FailingDisplay:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.close_calls = 0
+            created.append(self)
+
+        def start(self) -> str:
+            raise exc
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(runtime_module, "LocalNovncDisplay", _FailingDisplay)
+    return created
+
+
+def test_persistent_flag_parses_and_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BROWSER_CONTEXT_PERSISTENT", raising=False)
+    assert persistent_context_enabled() is False
+    for value in ("1", "true", "yes", "on", " TRUE "):
+        monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", value)
+        assert persistent_context_enabled() is True, value
+    for value in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", value)
+        assert persistent_context_enabled() is False, value
+
+
+@pytest.mark.asyncio
+async def test_persistent_start_launches_headed_real_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setenv("BROWSER_CHROMIUM_CHANNEL", "chrome")
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    worker = PlaywrightBrowserWorker("worker_persistent")
+    await worker.start()
+    try:
+        assert worker.headed is True
+        # The real-profile launch: headed persistent context, branded channel,
+        # desktop profile without viewport emulation — and no incognito launch.
+        assert len(stub.chromium.persistent_calls) == 1
+        call = stub.chromium.persistent_calls[0]
+        assert call["channel"] == "chrome"
+        assert call["headless"] is False
+        assert call["no_viewport"] is True
+        assert "viewport" not in call
+        assert stub.chromium.launch_calls == []
+        # The page comes from the persistent context's own (initial) page.
+        assert worker._context is not None
+        assert worker._page is worker._context.pages[0]
+        # A host without the noVNC stack still starts: the window opens on the
+        # local display and there is no remote mirror.
+        assert worker.remote_url is None
+        assert worker._display is None
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_dir_removed_on_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    worker = PlaywrightBrowserWorker("worker_profile_cleanup")
+    await worker.start()
+    assert worker._profile_dir is not None
+    profile_dir = worker._profile_dir
+    assert os.path.exists(profile_dir)  # noqa: ASYNC240 - trivial temp-dir existence probe
+    # The launched context was pointed at exactly that per-session dir.
+    assert stub.chromium.persistent_calls[0]["user_data_dir"] == profile_dir
+    await worker.close()
+    assert worker._profile_dir is None
+    assert not os.path.exists(profile_dir)  # noqa: ASYNC240 - trivial temp-dir existence probe
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_cleanup_retries_transient_rmtree_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Linux teardown race: a just-exited Chromium briefly holds profile files,
+    so the first rmtree fails and a bounded retry must remove the dir, not orphan it."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    # No real pause between attempts: the retry loop is what is under test.
+    monkeypatch.setattr(runtime_module, "_PROFILE_CLEANUP_RETRY_SECONDS", 0.0)
+    calls = {"n": 0}
+    orig_rmtree = runtime_module.shutil.rmtree
+
+    def _rmtree_once_blocked(path: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(39, "Directory not empty")  # the raced teardown
+        orig_rmtree(path)
+
+    monkeypatch.setattr(runtime_module.shutil, "rmtree", _rmtree_once_blocked)
+    worker = PlaywrightBrowserWorker("worker_profile_race")
+    await worker.start()
+    profile_dir = worker._profile_dir
+    assert profile_dir is not None
+    await worker.close()
+    assert calls["n"] == 2  # failed once, succeeded on the retry
+    assert worker._profile_dir is None
+    assert not os.path.exists(profile_dir)  # noqa: ASYNC240 - trivial temp-dir existence probe
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_cleanup_residual_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If even the retries cannot remove the dir, teardown must complete, the
+    residual must be logged (observable, not silently abandoned), and close stays
+    idempotent."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    monkeypatch.setattr(runtime_module, "_PROFILE_CLEANUP_RETRY_SECONDS", 0.0)
+    orig_rmtree = runtime_module.shutil.rmtree
+
+    def _rmtree_always_blocked(_path: str) -> None:
+        raise OSError(39, "Directory not empty")
+
+    monkeypatch.setattr(runtime_module.shutil, "rmtree", _rmtree_always_blocked)
+    worker = PlaywrightBrowserWorker("worker_profile_stuck")
+    await worker.start()
+    profile_dir = worker._profile_dir
+    assert profile_dir is not None
+    with caplog.at_level(logging.WARNING, logger="browser_handoff_service.runtime"):
+        await worker.close()  # must not raise
+    assert worker._profile_dir is None  # reset even on the residual path
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # one residual warning, not one per failed attempt
+    assert profile_dir in warnings[0].getMessage(), caplog.text
+    # A second close() is a no-op: the residual was accepted exactly once.
+    await worker.close()
+    # Leave nothing behind in the test runner's tempdir.
+    orig_rmtree(profile_dir)
+
+
+@pytest.mark.asyncio
+async def test_headed_display_mid_start_failure_closes_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start() failure after a subprocess was spawned (Xvfb up, x11vnc or
+    websockify failed to exec) must still reach close() via self._display —
+    assigned before start() — or the already-started processes leak."""
+    monkeypatch.delenv("BROWSER_CONTEXT_PERSISTENT", raising=False)
+    _patch_playwright(monkeypatch)
+    created = _failing_display(monkeypatch, OSError("websockify exec failed after Xvfb started"))
+    worker = PlaywrightBrowserWorker("worker_display_mid_start", headed=True)
+    with pytest.raises(RuntimeUnavailable, match="websockify"):
+        await worker.start()
+    # The outer handler's close() reached the display and closed it exactly once.
+    assert len(created) == 1
+    assert created[0].close_calls == 1
+    assert worker._display is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_display_fallback_closes_partial_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persistent local-display fallback must close a display whose start()
+    failed — even a partial one with spawned processes — not discard it."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    created = _failing_display(monkeypatch, RuntimeUnavailable("noVNC web assets are unavailable"))
+    worker = PlaywrightBrowserWorker("worker_display_fallback")
+    await worker.start()
+    try:
+        assert worker.remote_url is None
+        assert worker._display is None
+        # Closed by the fallback before being discarded.
+        assert len(created) == 1
+        assert created[0].close_calls == 1
+    finally:
+        await worker.close()
+    # The worker's own close() is a no-op on the discarded display.
+    assert created[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_jar_storage_state_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    stub = _patch_playwright(monkeypatch)
+    worker = PlaywrightBrowserWorker(
+        "worker_persistent_jar",
+        storage_state={"cookies": [], "origins": []},
+    )
+    with pytest.raises(RuntimeUnavailable, match="storage_state"):
+        await worker.start()
+    assert stub.chromium.persistent_calls == []
+    assert stub.chromium.launch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_persistent_keeps_confinement_and_skips_init_scripts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    worker = PlaywrightBrowserWorker(
+        "worker_persistent_confined",
+        confine_origins=["https://shop.example.com"],
+    )
+    await worker.start()
+    try:
+        context: Any = worker._context
+        # Confinement installs its route guard and popup watcher on the
+        # persistent context exactly as on an incognito one.
+        assert context.routes == ["**/*"]
+        assert "page" in context.events
+        # No fingerprint-injection init script on the real-profile path: the real
+        # Chrome surfaces are already genuine, and patching them is a tell.
+        assert context.init_scripts == []
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_mobile_keeps_explicit_viewport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    worker = PlaywrightBrowserWorker(
+        "worker_persistent_mobile",
+        user_agent="Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
+    )
+    await worker.start()
+    try:
+        call = stub.chromium.persistent_calls[0]
+        # The mobile profile (UA + touch + explicit viewport) is a deliberate
+        # product feature and stays as it is on the incognito path.
+        assert call["viewport"] == {"width": worker.width, "height": worker.height}
+        assert call["is_mobile"] is True
+        assert call["has_touch"] is True
+        assert call["user_agent"] == worker.user_agent
+        assert "no_viewport" not in call
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_default_incognito_launch_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BROWSER_CONTEXT_PERSISTENT", raising=False)
+    monkeypatch.delenv("BROWSER_CHROMIUM_CHANNEL", raising=False)
+    stub = _patch_playwright(monkeypatch)
+    worker = PlaywrightBrowserWorker("worker_default")
+    await worker.start()
+    try:
+        assert worker.persistent is False
+        assert stub.chromium.persistent_calls == []
+        assert len(stub.chromium.launch_calls) == 1
+        call = stub.chromium.launch_calls[0]
+        assert call["headless"] is True
+        assert call["channel"] is None
+        assert worker._profile_dir is None
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_env_passes_to_incognito_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BROWSER_CONTEXT_PERSISTENT", raising=False)
+    monkeypatch.setenv("BROWSER_CHROMIUM_CHANNEL", "chromium")
+    stub = _patch_playwright(monkeypatch)
+    worker = PlaywrightBrowserWorker("worker_channel")
+    await worker.start()
+    try:
+        assert stub.chromium.launch_calls[0]["channel"] == "chromium"
+    finally:
+        await worker.close()

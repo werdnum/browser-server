@@ -44,6 +44,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
   && rm -rf /var/lib/apt/lists/*
 
+# Branded Google Chrome: the launch target of BROWSER_CHROMIUM_CHANNEL=chrome
+# (the strongest stealth posture; see README "Persistent real-profile mode").
+# Google's apt repository serves both amd64 and arm64 debs (the production
+# cluster's nodes are arm64); apt resolves the native arch on each build leg.
+RUN mkdir -p /etc/apt/keyrings \
+  && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub -o /etc/apt/keyrings/google-chrome.asc \
+  && echo "deb [signed-by=/etc/apt/keyrings/google-chrome.asc] https://dl.google.com/linux/chrome/deb stable main" > /etc/apt/sources.list.d/google-chrome.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends google-chrome-stable \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml README.md ./
 COPY browser_handoff_service ./browser_handoff_service
 

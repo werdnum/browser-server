@@ -318,7 +318,7 @@ async def test_click_off_scope_abort_returns_controlled_block():
         def locator(self, _selector):
             return _StubLocator()
 
-    worker._page = _StubPage()  # ty: ignore[invalid-assignment]
+    worker._page = _StubPage()
     result = await worker.command(AgentCommandRequest(type="click", args={"selector": "a#logout"}))
     assert result["blocked"] is True
     assert result["target_origin"] == "https://idp.example.com"
@@ -342,7 +342,7 @@ async def test_click_error_without_off_scope_flag_reraises():
         def locator(self, _selector):
             return _StubLocator()
 
-    worker._page = _StubPage()  # ty: ignore[invalid-assignment]
+    worker._page = _StubPage()
     with pytest.raises(PlaywrightError):
         await worker.command(AgentCommandRequest(type="click", args={"selector": "a#logout"}))
 

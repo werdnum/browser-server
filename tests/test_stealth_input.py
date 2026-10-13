@@ -46,7 +46,7 @@ class _StubPage:
 
 
 async def _run_type_text(worker: PlaywrightBrowserWorker, locator: Any, text: str) -> None:
-    worker._page = _StubPage(locator)  # ty: ignore[invalid-assignment]
+    worker._page = _StubPage(locator)
     await worker.command(AgentCommandRequest(type="type_text", args={"selector": "#f", "text": text}))
 
 
@@ -118,7 +118,7 @@ async def test_navigate_reports_block_when_off_scope_abort_lands_during_settle()
         async def title(self) -> str:
             return "Sign in"
 
-    worker._page = _LateAbortPage()  # ty: ignore[invalid-assignment]
+    worker._page = _LateAbortPage()
     result = await worker.command(
         AgentCommandRequest(type="navigate", args={"url": "https://shop.example.com/account"})
     )
@@ -165,27 +165,27 @@ async def test_click_hold_present_when_stealth_on_absent_when_off(monkeypatch):
 
     stealth_worker = PlaywrightBrowserWorker("worker_stealth_click")
     stealth_worker.stealth = True
-    stealth_worker._page = page  # ty: ignore[invalid-assignment]
+    stealth_worker._page = page
     await stealth_worker.command(AgentCommandRequest(type="click", args={"selector": "#b"}))
     assert page.recording.click_kwargs is not None and "delay" in page.recording.click_kwargs
 
     plain_worker = PlaywrightBrowserWorker("worker_plain_click")
     plain_worker.stealth = False
     plain_page = _ClickStubPage()
-    plain_worker._page = plain_page  # ty: ignore[invalid-assignment]
+    plain_worker._page = plain_page
     await plain_worker.command(AgentCommandRequest(type="click", args={"selector": "#b"}))
     assert plain_page.recording.click_kwargs == {}
 
     stealth_mouse_worker = PlaywrightBrowserWorker("worker_stealth_mouse")
     stealth_mouse_worker.stealth = True
     mouse_page = _ClickStubPage()
-    stealth_mouse_worker._page = mouse_page  # ty: ignore[invalid-assignment]
+    stealth_mouse_worker._page = mouse_page
     await stealth_mouse_worker.command(AgentCommandRequest(type="mouse_click", args={"x": 10, "y": 20}))
     assert mouse_page.mouse.click_kwargs is not None and "delay" in mouse_page.mouse.click_kwargs
 
     plain_mouse_worker = PlaywrightBrowserWorker("worker_plain_mouse")
     plain_mouse_worker.stealth = False
     plain_mouse_page = _ClickStubPage()
-    plain_mouse_worker._page = plain_mouse_page  # ty: ignore[invalid-assignment]
+    plain_mouse_worker._page = plain_mouse_page
     await plain_mouse_worker.command(AgentCommandRequest(type="mouse_click", args={"x": 10, "y": 20}))
     assert plain_mouse_page.mouse.click_kwargs == {}

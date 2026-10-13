@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import random
 import re
@@ -20,6 +21,8 @@ import httpx
 from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
+
+logger = logging.getLogger(__name__)
 
 # Bound the merchant-controlled UCP probe so a huge or slow-trickle
 # /.well-known/ucp response cannot tie up the snapshot — which the registry
@@ -40,6 +43,22 @@ def stealth_enabled() -> bool:
     can get a plain vanilla Playwright browser back with one variable.
     """
     return os.environ.get("BROWSER_STEALTH", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def persistent_context_enabled() -> bool:
+    """Whether Chromium sessions launch as headed *persistent* browser contexts.
+
+    Off by default. ``BROWSER_CONTEXT_PERSISTENT=1`` launches every session as a
+    ``launch_persistent_context`` (a real on-disk profile in a per-session temp
+    directory) on a visible display instead of an incognito ``new_context`` — the
+    posture patchright itself documents as its best practice against
+    Cloudflare-class interstitials, because a real profile has no
+    incognito/artifact inconsistencies to fingerprint and patchright's
+    driver-level patches are fully engaged on that path. Branded Chrome is
+    strongly recommended alongside it: ``BROWSER_CHROMIUM_CHANNEL=chrome`` with
+    Chrome installed (``patchright install chrome``).
+    """
+    return os.environ.get("BROWSER_CONTEXT_PERSISTENT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # Runs in every frame (main + iframes) before page scripts on each navigation.
@@ -1115,6 +1134,13 @@ class FakeBrowserWorker:
 DEFAULT_DISPLAY_WIDTH = 1280
 DEFAULT_DISPLAY_HEIGHT = 720
 
+# Persistent-profile deletion at session close: a just-exited Chromium (crashpad
+# handler, SingletonLock) can still hold profile files for a moment on Linux, so
+# removal is retried this many times with a short pause between attempts before
+# the leftover dir is logged and left to the container's /tmp lifecycle.
+_PROFILE_CLEANUP_ATTEMPTS = 3
+_PROFILE_CLEANUP_RETRY_SECONDS = 1.0
+
 
 class PlaywrightBrowserWorker:
     def __init__(
@@ -1133,8 +1159,12 @@ class PlaywrightBrowserWorker:
         self.worker_id = worker_id
         self.closed = False
         self._next_ref = 1
-        self.headed = headed
         self.stealth = stealth_enabled()
+        self.persistent = persistent_context_enabled()
+        # A persistent context is a real profile on a real display: always headed.
+        # (Without the noVNC stack the window opens on the host's own display.)
+        self.headed = headed or self.persistent
+        self._profile_dir: str | None = None
         self.width = width
         self.height = height
         self.user_agent = user_agent
@@ -1195,6 +1225,15 @@ class PlaywrightBrowserWorker:
             return None
 
     async def start(self) -> None:
+        if self.persistent and self._storage_state is not None:
+            # A persistent context cannot be seeded with a jar's storage_state
+            # (no storage_state kwarg on launch_persistent_context), and silently
+            # dropping the IndexedDB half of a jar would under-report the load,
+            # so a jar-loaded session fails closed instead.
+            raise RuntimeUnavailable(
+                "BROWSER_CONTEXT_PERSISTENT=1 cannot load a jar's storage_state into a "
+                "persistent context; unset it for jar-loaded sessions"
+            )
         try:
             from patchright.async_api import async_playwright
 
@@ -1214,10 +1253,30 @@ class PlaywrightBrowserWorker:
             if self.stealth:
                 args += ["--no-first-run", "--no-default-browser-check"]
             if self.headed:
-                self._display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
-                self.remote_url = self._display.start()
-                env["DISPLAY"] = self._display.display
-                # Fill the framebuffer so the noVNC view matches the session form factor.
+                display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
+                # Assigned before start(): a start() failure after a subprocess was
+                # spawned (Xvfb up, x11vnc/websockify failed) must still be reachable
+                # by close() via self._display, or the started processes leak.
+                # LocalNovncDisplay.close() is idempotent, so the fallback below can
+                # close and discard it safely.
+                self._display = display
+                try:
+                    self.remote_url = display.start()
+                except RuntimeUnavailable:
+                    # A failed start can leave spawned processes behind; close()
+                    # terminates them (a no-op when nothing was spawned).
+                    display.close()
+                    if not self.persistent:
+                        raise
+                    # A host with its own display (e.g. a macOS machine) heads the
+                    # browser on the local screen; there is no noVNC mirror for the
+                    # human UI to embed for such a session.
+                    display = None
+                self._display = display
+                if display is not None:
+                    env["DISPLAY"] = display.display
+                # Size the window (Xvfb framebuffer or the local screen) so the
+                # viewport follows the session form factor.
                 args.append(f"--window-size={self.width},{self.height}")
                 args.append("--window-position=0,0")
             self._playwright = await async_playwright().start()
@@ -1225,16 +1284,39 @@ class PlaywrightBrowserWorker:
             # of the revision bundled with patchright (also how tests can drive a
             # real browser when only a different revision is installed). Unset => bundled.
             executable_path = os.environ.get("BROWSER_CHROMIUM_PATH") or None
-            self._browser = await self._playwright.chromium.launch(
-                headless=not self.headed,
-                args=args,
-                ignore_default_args=ignore_default_args,
-                env=env,
-                executable_path=executable_path,
-            )
-            # Explicit context (rather than browser.new_page) so a jar's storage_state can be
-            # seeded at creation and exported back out with context.storage_state(indexed_db=True).
-            context_kwargs: dict[str, Any] = {"viewport": {"width": self.width, "height": self.height}}
+            # BROWSER_CHROMIUM_CHANNEL picks a branded channel ("chrome" for real
+            # Google Chrome, installed via `patchright install chrome`; "chromium"
+            # for the full bundled Chromium build with --headless=new). Unset => the
+            # default build, which for headless is the (more detectable) headless shell.
+            channel = os.environ.get("BROWSER_CHROMIUM_CHANNEL", "").strip() or None
+            # The incognito browser is launched before the context kwargs are
+            # assembled: the headless-UA demasking probe below reads the live
+            # browser, so it must run once self._browser exists.
+            incognito_browser: Any = None
+            if not self.persistent:
+                incognito_browser = await self._playwright.chromium.launch(
+                    headless=not self.headed,
+                    channel=channel,
+                    args=args,
+                    ignore_default_args=ignore_default_args,
+                    env=env,
+                    executable_path=executable_path,
+                )
+                self._browser = incognito_browser
+            # Context kwargs shared by the persistent and incognito launch paths.
+            # An explicit context (rather than browser.new_page) so a jar's storage_state
+            # can be seeded at creation and exported back out with
+            # context.storage_state(indexed_db=True).
+            # (Built after the incognito launch above: the headless-UA demasking probe
+            # reads the live browser, so it must run once self._browser exists.)
+            context_kwargs: dict[str, Any] = {}
+            if self.persistent and not self.user_agent:
+                # Desktop persistent profile: the OS window IS the viewport (patchright's
+                # no-fingerprint-injection posture); the form factor is carried by
+                # --window-size above. The mobile profile keeps an explicit viewport.
+                context_kwargs["no_viewport"] = True
+            else:
+                context_kwargs["viewport"] = {"width": self.width, "height": self.height}
             if self.stealth and not self.headed:
                 # Match screen to the viewport so window.screen doesn't disagree with
                 # window.innerWidth/Height, a mismatch headless defaults can produce.
@@ -1268,19 +1350,42 @@ class PlaywrightBrowserWorker:
                 # A Service Worker can serve document/form requests that context.route() never
                 # sees, routing around the guard — so block SWs in confined contexts.
                 context_kwargs["service_workers"] = "block"
-            self._context = await self._browser.new_context(**context_kwargs)
-            if self.stealth:
-                script = STEALTH_INIT_SCRIPT
-                if not self.user_agent:
-                    # A pinned user agent means the mobile profile (UA + touch):
-                    # Chrome on Android has no desktop plugin array, so injecting
-                    # one would be an internally impossible fingerprint. Desktop
-                    # sessions (including plain headless) get the synthesis.
-                    script += "\n" + PLUGIN_SYNTHESIS_SCRIPT
-                await self._context.add_init_script(script)
+            if self.persistent:
+                # The real-profile launch: a per-session temp profile dir (removed in
+                # close(), with a bounded retry for the Linux teardown race where a
+                # just-exited Chromium still holds profile files) rather than an
+                # operator-configured durable one, so the mode changes no retention
+                # posture by itself.
+                self._profile_dir = tempfile.mkdtemp(prefix=f"{self.worker_id}_profile_")
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    self._profile_dir,
+                    channel=channel,
+                    headless=False,
+                    args=args,
+                    ignore_default_args=ignore_default_args,
+                    env=env,
+                    executable_path=executable_path,
+                    **context_kwargs,
+                )
+                # No init script on this path: a real profile on real Chrome already
+                # presents genuine plugins/chrome.webdriver surfaces, and patching
+                # correct surfaces is itself a fingerprint (patchright's
+                # "no fingerprint injection" best practice).
+                self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+            else:
+                self._context = await incognito_browser.new_context(**context_kwargs)
+                if self.stealth:
+                    script = STEALTH_INIT_SCRIPT
+                    if not self.user_agent:
+                        # A pinned user agent means the mobile profile (UA + touch):
+                        # Chrome on Android has no desktop plugin array, so injecting
+                        # one would be an internally impossible fingerprint. Desktop
+                        # sessions (including plain headless) get the synthesis.
+                        script += "\n" + PLUGIN_SYNTHESIS_SCRIPT
+                    await self._context.add_init_script(script)
+                self._page = await self._context.new_page()
             if self.confine_origins:
                 await self._install_confinement(self._context)
-            self._page = await self._context.new_page()
         except Exception as exc:
             await self.close()
             raise RuntimeUnavailable(str(exc)) from exc
@@ -1942,6 +2047,29 @@ class PlaywrightBrowserWorker:
             except Exception:
                 pass
             self._context = None
+        # For a persistent context the browser dies with the context above; the
+        # profile dir is removed after the close releases it. A just-exited
+        # Chromium can still hold profile files (crashpad handler, SingletonLock)
+        # for a moment, so removal is retried briefly rather than failing
+        # teardown; a dir that still cannot be removed is logged and left to the
+        # container's /tmp lifecycle (wiped on pod restart) — an explicitly
+        # bounded residual rather than a silently abandoned deletion.
+        if self._profile_dir is not None:
+            profile_dir = self._profile_dir
+            self._profile_dir = None
+            for attempt in range(_PROFILE_CLEANUP_ATTEMPTS):
+                try:
+                    shutil.rmtree(profile_dir)
+                    break
+                except OSError:
+                    if attempt == _PROFILE_CLEANUP_ATTEMPTS - 1:
+                        logger.warning(
+                            "persistent profile %s could not be removed after the browser "
+                            "exited; leaving it to the container's /tmp lifecycle",
+                            profile_dir,
+                        )
+                    else:
+                        await asyncio.sleep(_PROFILE_CLEANUP_RETRY_SECONDS)
         if self._browser is not None:
             await self._browser.close()
             self._browser = None

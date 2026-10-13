@@ -366,6 +366,52 @@ out of scope. Headed mode (`BROWSER_HEADED=1`) remains meaningfully harder to de
 than headless, and a hard Cloudflare-class interstitial may still need to be solved
 manually through the noVNC handoff view.
 
+#### Persistent real-profile mode (`BROWSER_CONTEXT_PERSISTENT=1`)
+
+Off by default. Patchright's own documented best-practice posture is a *headed
+persistent context* on branded Chrome — no incognito `new_context`, no
+fingerprint-injection init scripts, no viewport emulation (the window is the
+viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches every session exactly that way:
+
+```bash
+# Branded Chrome is strongly recommended on this path (patchright install chrome):
+export BROWSER_CONTEXT_PERSISTENT=1
+export BROWSER_CHROMIUM_CHANNEL=chrome
+export BROWSER_HANDOFF_SERVICE_TOKEN="…"
+.venv/bin/python -m uvicorn browser_handoff_service.main:app --host 127.0.0.1 --port 8000
+```
+
+- Each session gets a real on-disk profile in a per-session temp directory, removed
+  when the session closes (no durable state is added). A just-exited Chromium can
+  still hold profile files for a moment on Linux, so removal is retried briefly;
+  a directory that still cannot be removed is logged and left to the container's
+  `/tmp` lifecycle (wiped on pod restart).
+- The browser is always headed: on a host with the Xvfb/noVNC stack it runs there
+  (and the human UI gets its noVNC view); on a host with its own display (e.g. a
+  macOS machine) the window opens on the local screen and there is no noVNC mirror
+  for the handoff view to embed.
+- The stealth init scripts are skipped on this path: a real profile on real Chrome
+  already presents genuine `plugins`/`navigator.webdriver`/`window.chrome` surfaces,
+  and patching correct surfaces is itself a fingerprint.
+- Jar-loaded sessions fail closed (`RuntimeUnavailable` at creation) — a persistent
+  context cannot be seeded with a jar's `storage_state`, and silently dropping the
+  IndexedDB half of a jar would under-report the load.
+- `BROWSER_CHROMIUM_CHANNEL` also works without persistent mode: `chromium` selects
+  the full bundled Chromium build (`--headless=new`) over the default, more
+  detectable headless shell; `chrome` selects branded Google Chrome (installed in
+  the container image via Google's apt repo, which serves both amd64 and arm64).
+
+Measured locally (macOS VM, one run per site, fresh profile each): in default
+incognito-headless mode, Cloudflare-protected `fandom.com`, `discogs.com`,
+`crocs.com` and `ebgames.com.au` all served the "Just a moment..." interstitial
+while `discord.com`, `speedtest.net` and `nowsecure.nl` passed unchallenged; in
+persistent real-Chrome mode `fandom.com`, `discogs.com` and `ebgames.com.au` also
+passed unchallenged (`crocs.com` still interstitial, likely an always-interactive
+challenge configuration). A deliberately adversarial challenge demo
+(`scrapingcourse.com/cloudflare-challenge`) silently loops in "Performing security
+verification" in *every* configuration from this host, headed branded Chrome
+included — hard interstitials remain the human-handoff case.
+
 ### OIDC clock skew
 
 Humans authenticate with an OIDC JWT (`BROWSER_HANDOFF_OIDC_JWKS_URL`,
