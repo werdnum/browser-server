@@ -5,11 +5,14 @@ context* (a real profile) instead of an incognito ``launch()`` + ``new_context()
 patchright's documented best-practice posture against Cloudflare-class
 interstitials. Fences must hold on that path too: a jar's storage_state fails
 closed, confinement still installs its route guard, the per-session profile dir
-is removed on close, and the default (incognito) launch is unchanged.
+is removed on close (with a bounded retry for the Linux teardown race and a
+logged residual if even that fails), and the default (incognito) launch is
+unchanged.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -175,16 +178,82 @@ async def test_persistent_start_launches_headed_real_profile(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_persistent_profile_dir_removed_on_close(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
-    _patch_playwright(monkeypatch)
+    stub = _patch_playwright(monkeypatch)
     _no_remote_display(monkeypatch)
     worker = PlaywrightBrowserWorker("worker_profile_cleanup")
     await worker.start()
-    assert worker._profile_tmpdir is not None
-    profile_dir = worker._profile_tmpdir.name
+    assert worker._profile_dir is not None
+    profile_dir = worker._profile_dir
     assert os.path.exists(profile_dir)  # noqa: ASYNC240 - trivial temp-dir existence probe
+    # The launched context was pointed at exactly that per-session dir.
+    assert stub.chromium.persistent_calls[0]["user_data_dir"] == profile_dir
     await worker.close()
-    assert worker._profile_tmpdir is None
+    assert worker._profile_dir is None
     assert not os.path.exists(profile_dir)  # noqa: ASYNC240 - trivial temp-dir existence probe
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_cleanup_retries_transient_rmtree_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Linux teardown race: a just-exited Chromium briefly holds profile files,
+    so the first rmtree fails and a bounded retry must remove the dir, not orphan it."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    # No real pause between attempts: the retry loop is what is under test.
+    monkeypatch.setattr(runtime_module, "_PROFILE_CLEANUP_RETRY_SECONDS", 0.0)
+    calls = {"n": 0}
+    orig_rmtree = runtime_module.shutil.rmtree
+
+    def _rmtree_once_blocked(path: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(39, "Directory not empty")  # the raced teardown
+        orig_rmtree(path)
+
+    monkeypatch.setattr(runtime_module.shutil, "rmtree", _rmtree_once_blocked)
+    worker = PlaywrightBrowserWorker("worker_profile_race")
+    await worker.start()
+    profile_dir = worker._profile_dir
+    assert profile_dir is not None
+    await worker.close()
+    assert calls["n"] == 2  # failed once, succeeded on the retry
+    assert worker._profile_dir is None
+    assert not os.path.exists(profile_dir)  # noqa: ASYNC240 - trivial temp-dir existence probe
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_cleanup_residual_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If even the retries cannot remove the dir, teardown must complete, the
+    residual must be logged (observable, not silently abandoned), and close stays
+    idempotent."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    monkeypatch.setattr(runtime_module, "_PROFILE_CLEANUP_RETRY_SECONDS", 0.0)
+    orig_rmtree = runtime_module.shutil.rmtree
+
+    def _rmtree_always_blocked(_path: str) -> None:
+        raise OSError(39, "Directory not empty")
+
+    monkeypatch.setattr(runtime_module.shutil, "rmtree", _rmtree_always_blocked)
+    worker = PlaywrightBrowserWorker("worker_profile_stuck")
+    await worker.start()
+    profile_dir = worker._profile_dir
+    assert profile_dir is not None
+    with caplog.at_level(logging.WARNING, logger="browser_handoff_service.runtime"):
+        await worker.close()  # must not raise
+    assert worker._profile_dir is None  # reset even on the residual path
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # one residual warning, not one per failed attempt
+    assert profile_dir in warnings[0].getMessage(), caplog.text
+    # A second close() is a no-op: the residual was accepted exactly once.
+    await worker.close()
+    # Leave nothing behind in the test runner's tempdir.
+    orig_rmtree(profile_dir)
 
 
 @pytest.mark.asyncio
@@ -261,7 +330,7 @@ async def test_default_incognito_launch_unchanged(monkeypatch: pytest.MonkeyPatc
         call = stub.chromium.launch_calls[0]
         assert call["headless"] is True
         assert call["channel"] is None
-        assert worker._profile_tmpdir is None
+        assert worker._profile_dir is None
     finally:
         await worker.close()
 

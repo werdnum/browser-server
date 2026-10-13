@@ -382,7 +382,10 @@ export BROWSER_HANDOFF_SERVICE_TOKEN="…"
 ```
 
 - Each session gets a real on-disk profile in a per-session temp directory, removed
-  when the session closes (no durable state is added).
+  when the session closes (no durable state is added). A just-exited Chromium can
+  still hold profile files for a moment on Linux, so removal is retried briefly;
+  a directory that still cannot be removed is logged and left to the container's
+  `/tmp` lifecycle (wiped on pod restart).
 - The browser is always headed: on a host with the Xvfb/noVNC stack it runs there
   (and the human UI gets its noVNC view); on a host with its own display (e.g. a
   macOS machine) the window opens on the local screen and there is no noVNC mirror

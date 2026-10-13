@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import random
 import re
@@ -20,6 +21,8 @@ import httpx
 from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
+
+logger = logging.getLogger(__name__)
 
 # Bound the merchant-controlled UCP probe so a huge or slow-trickle
 # /.well-known/ucp response cannot tie up the snapshot — which the registry
@@ -1131,6 +1134,13 @@ class FakeBrowserWorker:
 DEFAULT_DISPLAY_WIDTH = 1280
 DEFAULT_DISPLAY_HEIGHT = 720
 
+# Persistent-profile deletion at session close: a just-exited Chromium (crashpad
+# handler, SingletonLock) can still hold profile files for a moment on Linux, so
+# removal is retried this many times with a short pause between attempts before
+# the leftover dir is logged and left to the container's /tmp lifecycle.
+_PROFILE_CLEANUP_ATTEMPTS = 3
+_PROFILE_CLEANUP_RETRY_SECONDS = 1.0
+
 
 class PlaywrightBrowserWorker:
     def __init__(
@@ -1154,7 +1164,7 @@ class PlaywrightBrowserWorker:
         # A persistent context is a real profile on a real display: always headed.
         # (Without the noVNC stack the window opens on the host's own display.)
         self.headed = headed or self.persistent
-        self._profile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._profile_dir: str | None = None
         self.width = width
         self.height = height
         self.user_agent = user_agent
@@ -1333,17 +1343,13 @@ class PlaywrightBrowserWorker:
                 context_kwargs["service_workers"] = "block"
             if self.persistent:
                 # The real-profile launch: a per-session temp profile dir (removed in
-                # close()) rather than an operator-configured durable one, so the mode
-                # changes no retention posture by itself. ignore_cleanup_errors:
-                # on Linux the just-closed Chromium can still hold profile files
-                # (crashpad, SingletonLock) for a moment, and a raced rmtree would
-                # otherwise fail session teardown; a leaked dir is left to the OS
-                # (wiped with the container's /tmp on restart) instead.
-                self._profile_tmpdir = tempfile.TemporaryDirectory(
-                    prefix=f"{self.worker_id}_profile_", ignore_cleanup_errors=True
-                )
+                # close(), with a bounded retry for the Linux teardown race where a
+                # just-exited Chromium still holds profile files) rather than an
+                # operator-configured durable one, so the mode changes no retention
+                # posture by itself.
+                self._profile_dir = tempfile.mkdtemp(prefix=f"{self.worker_id}_profile_")
                 self._context = await self._playwright.chromium.launch_persistent_context(
-                    self._profile_tmpdir.name,
+                    self._profile_dir,
                     channel=channel,
                     headless=False,
                     args=args,
@@ -2033,10 +2039,28 @@ class PlaywrightBrowserWorker:
                 pass
             self._context = None
         # For a persistent context the browser dies with the context above; the
-        # profile dir is removed after the close releases it.
-        if self._profile_tmpdir is not None:
-            self._profile_tmpdir.cleanup()
-            self._profile_tmpdir = None
+        # profile dir is removed after the close releases it. A just-exited
+        # Chromium can still hold profile files (crashpad handler, SingletonLock)
+        # for a moment, so removal is retried briefly rather than failing
+        # teardown; a dir that still cannot be removed is logged and left to the
+        # container's /tmp lifecycle (wiped on pod restart) — an explicitly
+        # bounded residual rather than a silently abandoned deletion.
+        if self._profile_dir is not None:
+            profile_dir = self._profile_dir
+            self._profile_dir = None
+            for attempt in range(_PROFILE_CLEANUP_ATTEMPTS):
+                try:
+                    shutil.rmtree(profile_dir)
+                    break
+                except OSError:
+                    if attempt == _PROFILE_CLEANUP_ATTEMPTS - 1:
+                        logger.warning(
+                            "persistent profile %s could not be removed after the browser "
+                            "exited; leaving it to the container's /tmp lifecycle",
+                            profile_dir,
+                        )
+                    else:
+                        await asyncio.sleep(_PROFILE_CLEANUP_RETRY_SECONDS)
         if self._browser is not None:
             await self._browser.close()
             self._browser = None
