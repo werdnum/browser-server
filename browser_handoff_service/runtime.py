@@ -1254,9 +1254,18 @@ class PlaywrightBrowserWorker:
                 args += ["--no-first-run", "--no-default-browser-check"]
             if self.headed:
                 display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
+                # Assigned before start(): a start() failure after a subprocess was
+                # spawned (Xvfb up, x11vnc/websockify failed) must still be reachable
+                # by close() via self._display, or the started processes leak.
+                # LocalNovncDisplay.close() is idempotent, so the fallback below can
+                # close and discard it safely.
+                self._display = display
                 try:
                     self.remote_url = display.start()
                 except RuntimeUnavailable:
+                    # A failed start can leave spawned processes behind; close()
+                    # terminates them (a no-op when nothing was spawned).
+                    display.close()
                     if not self.persistent:
                         raise
                     # A host with its own display (e.g. a macOS machine) heads the

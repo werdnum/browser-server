@@ -7,7 +7,8 @@ interstitials. Fences must hold on that path too: a jar's storage_state fails
 closed, confinement still installs its route guard, the per-session profile dir
 is removed on close (with a bounded retry for the Linux teardown race and a
 logged residual if even that fails), and the default (incognito) launch is
-unchanged.
+unchanged. A headed display whose start() fails mid-launch is closed, not
+leaked — on both the re-raise path and the persistent local-display fallback.
 """
 
 from __future__ import annotations
@@ -134,6 +135,26 @@ def _no_remote_display(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime_module, "LocalNovncDisplay", _UnavailableDisplay)
 
 
+def _failing_display(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> list[Any]:
+    """A display whose ``start()`` fails; records instances and close() calls."""
+
+    created: list[Any] = []
+
+    class _FailingDisplay:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.close_calls = 0
+            created.append(self)
+
+        def start(self) -> str:
+            raise exc
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(runtime_module, "LocalNovncDisplay", _FailingDisplay)
+    return created
+
+
 def test_persistent_flag_parses_and_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BROWSER_CONTEXT_PERSISTENT", raising=False)
     assert persistent_context_enabled() is False
@@ -254,6 +275,48 @@ async def test_persistent_profile_cleanup_residual_is_logged_not_raised(
     await worker.close()
     # Leave nothing behind in the test runner's tempdir.
     orig_rmtree(profile_dir)
+
+
+@pytest.mark.asyncio
+async def test_headed_display_mid_start_failure_closes_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start() failure after a subprocess was spawned (Xvfb up, x11vnc or
+    websockify failed to exec) must still reach close() via self._display —
+    assigned before start() — or the already-started processes leak."""
+    monkeypatch.delenv("BROWSER_CONTEXT_PERSISTENT", raising=False)
+    _patch_playwright(monkeypatch)
+    created = _failing_display(monkeypatch, OSError("websockify exec failed after Xvfb started"))
+    worker = PlaywrightBrowserWorker("worker_display_mid_start", headed=True)
+    with pytest.raises(RuntimeUnavailable, match="websockify"):
+        await worker.start()
+    # The outer handler's close() reached the display and closed it exactly once.
+    assert len(created) == 1
+    assert created[0].close_calls == 1
+    assert worker._display is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_display_fallback_closes_partial_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persistent local-display fallback must close a display whose start()
+    failed — even a partial one with spawned processes — not discard it."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    _patch_playwright(monkeypatch)
+    created = _failing_display(monkeypatch, RuntimeUnavailable("noVNC web assets are unavailable"))
+    worker = PlaywrightBrowserWorker("worker_display_fallback")
+    await worker.start()
+    try:
+        assert worker.remote_url is None
+        assert worker._display is None
+        # Closed by the fallback before being discarded.
+        assert len(created) == 1
+        assert created[0].close_calls == 1
+    finally:
+        await worker.close()
+    # The worker's own close() is a no-op on the discarded display.
+    assert created[0].close_calls == 1
 
 
 @pytest.mark.asyncio
