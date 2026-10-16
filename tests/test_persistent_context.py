@@ -65,8 +65,12 @@ class _StubContext:
 class _StubBrowser:
     def __init__(self) -> None:
         self.contexts: list[_StubContext] = []
+        self.context_calls: list[dict[str, Any]] = []
+        # The running build's version, as patchright's Browser.version reports it.
+        self.version = "155.0.6723.58"
 
-    async def new_context(self, **_kwargs: Any) -> _StubContext:
+    async def new_context(self, **kwargs: Any) -> _StubContext:
+        self.context_calls.append(kwargs)
         context = _StubContext()
         self.contexts.append(context)
         return context

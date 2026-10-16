@@ -366,6 +366,20 @@ out of scope. Headed mode (`BROWSER_HEADED=1`) remains meaningfully harder to de
 than headless, and a hard Cloudflare-class interstitial may still need to be solved
 manually through the noVNC handoff view.
 
+#### Mobile profile consistency
+
+The mobile form factor pins an Android UA so sites serve their mobile layout, but a
+UA that disagrees with the rest of the emulated device is itself a tell. The profile is
+kept internally consistent: the UA's Chrome version is rewritten to the running build's
+major version (as Chrome's own UA reduction does) so it cannot drift from the Client
+Hints and `navigator.userAgentData` Chromium derives from its real version; the headless
+viewport reports a phone device pixel ratio rather than the default `1`; and the mobile
+init script pins `navigator.platform` to Chrome's frozen Android value (`Linux armv81`)
+plus Pixel-class `hardwareConcurrency`/`deviceMemory`. These apply to the incognito path
+where a pinned UA is used; the opt-in persistent real-profile mode skips UA/viewport
+emulation entirely (see below), and genuine hardware/renderer properties (real GPU
+strings, core count) still reflect the host.
+
 #### Persistent real-profile mode (`BROWSER_CONTEXT_PERSISTENT=1`)
 
 Off by default. Patchright's own documented best-practice posture is a *headed
