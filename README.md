@@ -369,23 +369,28 @@ manually through the noVNC handoff view.
 #### Mobile profile consistency
 
 The mobile form factor pins an Android UA so sites serve their mobile layout, but a
-UA that disagrees with the rest of the emulated device is itself a tell. The profile is
-kept internally consistent: the UA's Chrome version is rewritten to the running build's
-major version (as Chrome's own UA reduction does) so it cannot drift from the Client
-Hints and `navigator.userAgentData` Chromium derives from its real version; the headless
-viewport reports a phone device pixel ratio rather than the default `1`; and the mobile
-init script pins `navigator.platform` to Chrome's frozen Android value (`Linux armv81`)
-plus Pixel-class `hardwareConcurrency`/`deviceMemory`. These apply to the incognito path
-where a pinned UA is used; the opt-in persistent real-profile mode skips UA/viewport
-emulation entirely (see below), and genuine hardware/renderer properties (real GPU
-strings, core count) still reflect the host.
+UA that disagrees with the rest of the emulated device is itself a tell. On the incognito
+path the profile is kept internally consistent: the UA's Chrome version is rewritten to
+the running build's major version (as Chrome's own UA reduction does) so it cannot drift
+from the Client Hints and `navigator.userAgentData` Chromium derives from its real
+version; the headless viewport reports a phone device pixel ratio rather than the default
+`1`; and the mobile init script pins `navigator.platform` to Chrome's frozen Android value
+(`Linux armv81`) plus Pixel-class `hardwareConcurrency`/`deviceMemory`.
+
+Those consistency patches are the incognito path's. A persistent real-profile session
+(`BROWSER_CONTEXT_PERSISTENT=1`) still applies the mobile UA, explicit viewport, and touch
+flags, but skips the init scripts and the headless DPR override — so on that path
+`navigator.platform`, `deviceMemory`, and `hardwareConcurrency` report the host, and the
+UA keeps its pinned Chrome version. (Desktop persistent sessions use the OS window as the
+viewport and leave the UA alone.)
 
 #### Persistent real-profile mode (`BROWSER_CONTEXT_PERSISTENT=1`)
 
 Off by default. Patchright's own documented best-practice posture is a *headed
 persistent context* on branded Chrome — no incognito `new_context`, no
 fingerprint-injection init scripts, no viewport emulation (the window is the
-viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches every session exactly that way:
+viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches a desktop session exactly that way;
+a mobile session still gets its UA/viewport/touch emulation:
 
 ```bash
 # Branded Chrome is strongly recommended on this path (patchright install chrome):
@@ -406,7 +411,9 @@ export BROWSER_HANDOFF_SERVICE_TOKEN="…"
   for the handoff view to embed.
 - The stealth init scripts are skipped on this path: a real profile on real Chrome
   already presents genuine `plugins`/`navigator.webdriver`/`window.chrome` surfaces,
-  and patching correct surfaces is itself a fingerprint.
+  and patching correct surfaces is itself a fingerprint. A mobile session still applies
+  its UA/viewport/touch emulation, but not the incognito path's Android
+  platform/memory patches (see "Mobile profile consistency" above).
 - Jar-loaded sessions fail closed (`RuntimeUnavailable` at creation) — a persistent
   context cannot be seeded with a jar's `storage_state`, and silently dropping the
   IndexedDB half of a jar would under-report the load.
