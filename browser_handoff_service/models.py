@@ -29,35 +29,26 @@ RequestedFormFactor = Literal["mobile", "desktop", "auto"]
 # (e.g. agent-created sessions with no browser to measure).
 DEFAULT_FORM_FACTOR: FormFactorName = "mobile"
 
-# Modern Chrome-on-Android user agent so sites serve their mobile layout. The Chrome
-# version is a placeholder the runtime rewrites to the running build's major version
-# (see runtime._mobile_user_agent): pinning it here would drift from the Client Hints
-# and navigator.userAgentData Chromium derives from its real version.
-MOBILE_USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-)
-
-# A Pixel 7 renders at a 2.625 device pixel ratio (1080 physical / 412 CSS px). A mobile
-# viewport reported at the headless default DPR of 1 is an emulation mismatch that
-# cross-layer scanners flag.
-MOBILE_DEVICE_SCALE_FACTOR = 2.625
-
 
 @dataclass(frozen=True)
 class FormFactor:
-    """Display profile for a session: framebuffer size and optional emulation UA."""
+    """Display profile for a session: framebuffer (and viewport) size.
+
+    The form factor chooses only the pane/window shape. No form factor overrides the
+    user agent: a pinned device UA has to be corroborated by every other observable
+    layer (platform, Client Hints, DPR, plugins, GPU), and each compensating patch is
+    itself a tell, so sessions keep the browser's own genuine identity.
+    """
 
     width: int
     height: int
-    user_agent: str | None = None
 
 
 FORM_FACTORS: dict[str, FormFactor] = {
-    # Portrait phone (Pixel 7 logical viewport).
-    "mobile": FormFactor(width=412, height=915, user_agent=MOBILE_USER_AGENT),
+    # Portrait phone viewport (a 412x915 window, the Pixel 7 logical size).
+    "mobile": FormFactor(width=412, height=915),
     # Landscape desktop.
-    "desktop": FormFactor(width=1280, height=720, user_agent=None),
+    "desktop": FormFactor(width=1280, height=720),
 }
 
 

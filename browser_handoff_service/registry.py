@@ -325,7 +325,6 @@ class SessionRegistry:
             session.worker_id or "",
             width=profile.width,
             height=profile.height,
-            user_agent=profile.user_agent,
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=session.timezone_id,
@@ -1137,7 +1136,6 @@ class SessionRegistry:
             "baseline_probe",
             width=profile.width,
             height=profile.height,
-            user_agent=profile.user_agent,
             confine_origins=[o for o in (normalize_origin(x) for x in origins) if o],
         )
         try:
@@ -1366,7 +1364,6 @@ class SessionRegistry:
             label,
             width=profile.width,
             height=profile.height,
-            user_agent=profile.user_agent,
             storage_state=storage_state,
             confine_origins=confine_origins,
         )

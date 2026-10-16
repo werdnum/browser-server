@@ -18,7 +18,7 @@ from typing import Any, Protocol, cast
 
 import httpx
 
-from .models import MOBILE_DEVICE_SCALE_FACTOR, AgentCommandRequest
+from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
 
@@ -32,60 +32,6 @@ _UCP_PROBE_MAX_BYTES = 256 * 1024
 
 # Product token Chromium's headless build puts in its native user agent, in place of "Chrome".
 _HEADLESS_UA_TOKEN = "HeadlessChrome"
-
-# The Chrome product token in a user agent: "Chrome/120.0.0.0".
-_CHROME_UA_VERSION_RE = re.compile(r"Chrome/\d+(?:\.\d+)*")
-
-# The running browser's major version cannot change while the process lives, but it is only
-# needed to keep a pinned device UA in step with the Client Hints the real build reports.
-# The incognito path reads it straight off the browser it already launched; a persistent
-# launch creates its context in a single call, so the first mobile persistent session probes
-# a throwaway browser once and caches the result here (guarded so concurrent first
-# sessions do not each launch one).
-_CHROMIUM_MAJOR_VERSION: str | None = None
-_CHROMIUM_MAJOR_VERSION_LOCK: asyncio.Lock | None = None
-
-
-def _major_version(version: str) -> str | None:
-    """The leading integer of a version string ("155.0.6723.58" -> "155")."""
-    match = re.match(r"\s*(\d+)", version)
-    return match.group(1) if match else None
-
-
-async def _probe_chromium_major_version(
-    playwright: Any, *, channel: str | None, executable_path: str | None
-) -> str | None:
-    """Resolve the running browser's major version with a throwaway headless launch.
-
-    Only the persistent mobile path needs this (the incognito path reads the version off
-    the browser it launched anyway). Best-effort: any failure returns ``None`` so a mobile
-    session still starts with its pinned UA rather than failing.
-    """
-    global _CHROMIUM_MAJOR_VERSION, _CHROMIUM_MAJOR_VERSION_LOCK
-    if _CHROMIUM_MAJOR_VERSION is not None:
-        return _CHROMIUM_MAJOR_VERSION
-    if _CHROMIUM_MAJOR_VERSION_LOCK is None:
-        _CHROMIUM_MAJOR_VERSION_LOCK = asyncio.Lock()
-    async with _CHROMIUM_MAJOR_VERSION_LOCK:
-        if _CHROMIUM_MAJOR_VERSION is not None:
-            return _CHROMIUM_MAJOR_VERSION
-        try:
-            probe = await playwright.chromium.launch(
-                headless=True,
-                channel=channel,
-                executable_path=executable_path,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-        except Exception:
-            return None
-        try:
-            version = probe.version
-        finally:
-            await probe.close()
-        major = _major_version(version) if isinstance(version, str) else None
-        if major:
-            _CHROMIUM_MAJOR_VERSION = major
-        return major
 
 
 def stealth_enabled() -> bool:
@@ -294,29 +240,6 @@ PLUGIN_SYNTHESIS_SCRIPT = """
     Object.defineProperty(Navigator.prototype, 'plugins', { get: () => pluginArray, configurable: true });
     Object.defineProperty(Navigator.prototype, 'mimeTypes', { get: () => mimeTypeArray, configurable: true });
   } catch (err) {}
-})();
-"""
-
-# Mobile-only companion to STEALTH_INIT_SCRIPT: aligns the JS platform surface with the
-# Chrome-on-Android UA the context is created with. Chromium's userAgentMetadata (which
-# Playwright derives from the UA) fixes Sec-CH-UA-Platform to "Android" and
-# navigator.userAgentData.platform to "Android", but it does NOT touch navigator.platform,
-# which stays the host's value ("Linux x86_64" / "MacIntel") — a cross-layer mismatch
-# scanners read as "Android UA on a desktop platform". Chrome freezes navigator.platform to
-# "Linux armv81" on Android as part of UA reduction, so that is the consistent value. Also
-# pins the Pixel-class hardware counts. NEVER applied to desktop sessions: a desktop UA
-# reporting an Android platform is the same contradiction in the other direction.
-MOBILE_STEALTH_INIT_SCRIPT = """
-(() => {
-  const define = (prop, value) => {
-    try {
-      Object.defineProperty(Navigator.prototype, prop, { get: () => value, configurable: true });
-    } catch (err) {}
-  };
-  // Chrome's UA reduction freezes navigator.platform to "Linux armv81" on Android.
-  define('platform', 'Linux armv81');
-  define('deviceMemory', 8);
-  define('hardwareConcurrency', 8);
 })();
 """
 
@@ -1227,7 +1150,6 @@ class PlaywrightBrowserWorker:
         headed: bool = False,
         width: int = DEFAULT_DISPLAY_WIDTH,
         height: int = DEFAULT_DISPLAY_HEIGHT,
-        user_agent: str | None = None,
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
         timezone_id: str | None = None,
@@ -1244,7 +1166,6 @@ class PlaywrightBrowserWorker:
         self._profile_dir: str | None = None
         self.width = width
         self.height = height
-        self.user_agent = user_agent
         self.timezone_id = timezone_id
         # Cookie-jar load/confinement. ``storage_state`` seeds the context at creation;
         # ``confine_origins`` (exact scheme+host+port) restricts every top-level document.
@@ -1387,10 +1308,10 @@ class PlaywrightBrowserWorker:
             # (Built after the incognito launch above: the headless-UA demasking probe
             # reads the live browser, so it must run once self._browser exists.)
             context_kwargs: dict[str, Any] = {}
-            if self.persistent and not self.user_agent:
-                # Desktop persistent profile: the OS window IS the viewport (patchright's
-                # no-fingerprint-injection posture); the form factor is carried by
-                # --window-size above. The mobile profile keeps an explicit viewport.
+            if self.persistent:
+                # The real-profile launch runs on a real display: the OS window IS the
+                # viewport (patchright's no-fingerprint-injection posture); the form
+                # factor is carried by --window-size above.
                 context_kwargs["no_viewport"] = True
             else:
                 context_kwargs["viewport"] = {"width": self.width, "height": self.height}
@@ -1398,34 +1319,14 @@ class PlaywrightBrowserWorker:
                 # Match screen to the viewport so window.screen doesn't disagree with
                 # window.innerWidth/Height, a mismatch headless defaults can produce.
                 context_kwargs["screen"] = {"width": self.width, "height": self.height}
-            if self.user_agent:
-                # A mobile UA plus touch makes sites render their mobile layout, and the
-                # emulation is applied on BOTH launch paths so a persistent session is
-                # no more internally inconsistent than an incognito one. The Chrome
-                # version is aligned to the running build so the pinned device string
-                # cannot drift from the Client Hints / navigator.userAgentData Chromium
-                # derives from its real version; the DPR matches a phone rather than the
-                # default of 1.
-                major = _major_version(getattr(incognito_browser, "version", "") or "")
-                if major is None:
-                    major = await _probe_chromium_major_version(
-                        self._playwright, channel=channel, executable_path=executable_path
-                    )
-                context_kwargs["user_agent"] = self._mobile_user_agent(major)
-                context_kwargs["is_mobile"] = True
-                context_kwargs["has_touch"] = True
-                if self.stealth:
-                    context_kwargs["device_scale_factor"] = MOBILE_DEVICE_SCALE_FACTOR
-            else:
-                # Otherwise leave the UA alone: the browser's own string always matches its
-                # real version and its Client Hints, which a pinned override drifts away from.
-                # The one exception is the headless build, whose native UA advertises
-                # "HeadlessChrome" — a louder automation tell than any UA we could pin.
-                if self.stealth and not self.headed:
-                    context_kwargs["device_scale_factor"] = 1
-                demasked = await self._demasked_headless_user_agent()
-                if demasked:
-                    context_kwargs["user_agent"] = demasked
+                context_kwargs["device_scale_factor"] = 1
+            # Leave the UA alone: the browser's own string always matches its real version
+            # and its Client Hints, which a pinned override drifts away from. The one
+            # exception is the headless build, whose native UA advertises "HeadlessChrome"
+            # — a louder automation tell than any UA we could pin.
+            demasked = await self._demasked_headless_user_agent()
+            if demasked:
+                context_kwargs["user_agent"] = demasked
             # Apply the resolved IANA timezone so in-page new Date()/Intl report the
             # caller's local time. Chromium/ICU validates the id; an unknown zone
             # surfaces as a RuntimeUnavailable when the context is created.
@@ -1458,49 +1359,23 @@ class PlaywrightBrowserWorker:
                     executable_path=executable_path,
                     **context_kwargs,
                 )
-                # The desktop real-profile path injects no init script: a real profile on
-                # real Chrome already presents genuine plugins/chrome.webdriver surfaces,
-                # and patching correct surfaces is itself a fingerprint (patchright's
-                # "no fingerprint injection" best practice). A MOBILE persistent session is
-                # different — it emulates a device on top of that real profile (the UA,
-                # viewport, and touch above), so the Android platform/memory patches are
-                # what keep the emulation self-consistent; without them navigator.platform
-                # reports the host under an Android UA.
-                if self.stealth and self.user_agent:
-                    await self._context.add_init_script(MOBILE_STEALTH_INIT_SCRIPT)
+                # The real-profile path injects no init script: a real profile on real
+                # Chrome already presents genuine plugins/chrome.webdriver surfaces, and
+                # patching correct surfaces is itself a fingerprint (patchright's
+                # "no fingerprint injection" best practice).
                 self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
             else:
                 self._context = await incognito_browser.new_context(**context_kwargs)
                 if self.stealth:
-                    script = STEALTH_INIT_SCRIPT
-                    # The mobile profile gets the Android platform/memory patches; a
-                    # desktop UA gets the synthesized PDF plugin arrays instead. Chrome on
-                    # Android exposes no desktop plugin array, so injecting it under a
-                    # mobile UA would be an internally impossible fingerprint.
-                    script += "\n" + (MOBILE_STEALTH_INIT_SCRIPT if self.user_agent else PLUGIN_SYNTHESIS_SCRIPT)
-                    await self._context.add_init_script(script)
+                    # The incognito build's plugin array is empty; synthesize the real
+                    # Chrome plugin surfaces back on top of the base stealth patches.
+                    await self._context.add_init_script(STEALTH_INIT_SCRIPT + "\n" + PLUGIN_SYNTHESIS_SCRIPT)
                 self._page = await self._context.new_page()
             if self.confine_origins:
                 await self._install_confinement(self._context)
         except Exception as exc:
             await self.close()
             raise RuntimeUnavailable(str(exc)) from exc
-
-    def _mobile_user_agent(self, major: str | None) -> str | None:
-        """The mobile UA with its Chrome version aligned to the running browser build.
-
-        The device identity must stay pinned (a desktop UA would forfeit the mobile
-        layout), but pinning its Chrome version lets it drift from the Client Hints and
-        ``navigator.userAgentData`` Chromium derives from its real version — the
-        cross-layer inconsistency scanners dock. Rewriting just the major version (as
-        Chrome's own UA reduction does) keeps the two in step without changing the
-        device identity. With no resolved version the caller's UA is used unchanged.
-        """
-        if not self.user_agent:
-            return None
-        if not major:
-            return self.user_agent
-        return _CHROME_UA_VERSION_RE.sub(f"Chrome/{major}.0.0.0", self.user_agent, count=1)
 
     async def _demasked_headless_user_agent(self) -> str | None:
         """Return the browser's own UA with the ``HeadlessChrome`` token rewritten to ``Chrome``,
@@ -2343,7 +2218,6 @@ def make_worker(
     *,
     width: int = DEFAULT_DISPLAY_WIDTH,
     height: int = DEFAULT_DISPLAY_HEIGHT,
-    user_agent: str | None = None,
     storage_state: dict[str, Any] | None = None,
     confine_origins: list[str] | None = None,
     timezone_id: str | None = None,
@@ -2366,7 +2240,6 @@ def make_worker(
         headed=os.environ.get("BROWSER_HEADED") == "1",
         width=width,
         height=height,
-        user_agent=user_agent,
         storage_state=storage_state,
         confine_origins=confine_origins,
         timezone_id=resolved_timezone_id,

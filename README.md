@@ -30,11 +30,10 @@ Implemented:
 
 The session `form_factor` defaults to `"auto"`: the browser UI measures the user's
 aspect ratio (`client_viewport`) when starting a session, and the service picks `"mobile"`
-for portrait screens (a 412×915 framebuffer with a mobile user agent so sites serve their
-mobile layout) or `"desktop"` for landscape (1280×720). With no client measurement (e.g.
-agent-created sessions) `"auto"` falls back to mobile. Pass an explicit
-`form_factor: "mobile" | "desktop"` to override detection. The human UI sizes its noVNC
-viewport to match the session's aspect ratio.
+for portrait screens (a 412×915 framebuffer) or `"desktop"` for landscape (1280×720). With
+no client measurement (e.g. agent-created sessions) `"auto"` falls back to mobile. Pass an
+explicit `form_factor: "mobile" | "desktop"` to override detection. The human UI sizes its
+noVNC viewport to match the session's aspect ratio.
 
 The service supports handing control of a single browser session in either direction:
 
@@ -366,31 +365,25 @@ out of scope. Headed mode (`BROWSER_HEADED=1`) remains meaningfully harder to de
 than headless, and a hard Cloudflare-class interstitial may still need to be solved
 manually through the noVNC handoff view.
 
-#### Mobile profile consistency
+#### No user-agent override
 
-The mobile form factor pins an Android UA so sites serve their mobile layout, but a UA
-that disagrees with the rest of the emulated device is itself a tell. The profile is kept
-internally consistent on **both** the incognito and persistent launch paths: the UA's
-Chrome version is aligned to the running build's major version (as Chrome's own UA
-reduction does) so it cannot drift from the Client Hints and `navigator.userAgentData`
-Chromium derives from its real version; the viewport reports a phone device pixel ratio
-rather than the default `1`; and a mobile init script pins `navigator.platform` to
-Chrome's frozen Android value (`Linux armv81`) plus Pixel-class
-`hardwareConcurrency`/`deviceMemory`.
-
-Aligning a *persistent* mobile session means a real desktop Chrome profile is deliberately
-patched to present as a phone (UA, platform, memory, DPR), so it does not carry the
-"genuine, untouched profile" property the *desktop* persistent path keeps — see below.
-Desktop persistent sessions stay fully unemulated.
+The mobile form factor is only a portrait window/viewport (412×915); it does **not**
+override the user agent, and neither does the desktop profile. A pinned device UA has to
+be corroborated by every other observable layer — platform, Client Hints, device pixel
+ratio, plugins, GPU — and the container cannot supply most of them (no mobile GPU, a real
+profile exposes the host's plugins), so a UA override reads as a cross-layer contradiction
+to scanners, and each compensating JS patch is itself a tell (a non-native `navigator`
+getter). Sessions therefore run browser-as-is: the browser's own UA always matches its
+real version, its Client Hints, and `navigator.platform`. The one rewrite is the headless
+build's `HeadlessChrome` product token, demasked to `Chrome` (a louder automation tell
+than any UA we could pin). The cost is that portrait panes get desktop page layouts.
 
 #### Persistent real-profile mode (`BROWSER_CONTEXT_PERSISTENT=1`)
 
 Off by default. Patchright's own documented best-practice posture is a *headed
 persistent context* on branded Chrome — no incognito `new_context`, no
 fingerprint-injection init scripts, no viewport emulation (the window is the
-viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches a desktop session exactly that way; a
-mobile session additionally emulates a consistent Android device (see "Mobile profile
-consistency" above):
+viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches a session exactly that way:
 
 ```bash
 # Branded Chrome is strongly recommended on this path (patchright install chrome):
@@ -409,12 +402,9 @@ export BROWSER_HANDOFF_SERVICE_TOKEN="…"
   (and the human UI gets its noVNC view); on a host with its own display (e.g. a
   macOS machine) the window opens on the local screen and there is no noVNC mirror
   for the handoff view to embed.
-- The stealth init scripts are skipped on the desktop path: a real profile on real Chrome
+- The stealth init scripts are skipped on this path: a real profile on real Chrome
   already presents genuine `plugins`/`navigator.webdriver`/`window.chrome` surfaces,
-  and patching correct surfaces is itself a fingerprint. A mobile session is the
-  exception — it is emulating a device on top of the real profile, so the Android
-  platform/memory patch is injected to keep that emulation self-consistent (see "Mobile
-  profile consistency" above).
+  and patching correct surfaces is itself a fingerprint.
 - Jar-loaded sessions fail closed (`RuntimeUnavailable` at creation) — a persistent
   context cannot be seeded with a jar's `storage_state`, and silently dropping the
   IndexedDB half of a jar would under-report the load.

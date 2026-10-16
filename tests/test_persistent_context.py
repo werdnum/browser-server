@@ -19,7 +19,7 @@ from typing import Any, cast
 
 import pytest
 from browser_handoff_service import runtime as runtime_module
-from browser_handoff_service.models import MOBILE_DEVICE_SCALE_FACTOR
+from browser_handoff_service.models import form_factor_profile
 from browser_handoff_service.runtime import (
     PlaywrightBrowserWorker,
     RuntimeUnavailable,
@@ -362,30 +362,29 @@ async def test_persistent_keeps_confinement_and_skips_init_scripts(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_persistent_mobile_keeps_explicit_viewport(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_persistent_mobile_uses_window_as_viewport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
     stub = _patch_playwright(monkeypatch)
     _no_remote_display(monkeypatch)
+    profile = form_factor_profile("mobile")
     worker = PlaywrightBrowserWorker(
         "worker_persistent_mobile",
-        user_agent="Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
+        width=profile.width,
+        height=profile.height,
     )
     await worker.start()
     try:
         call = stub.chromium.persistent_calls[0]
-        # The mobile profile (UA + touch + explicit viewport) is a deliberate product
-        # feature and stays as it is on the incognito path — including the cross-layer
-        # consistency layers (Chrome version aligned to the running build, phone DPR,
-        # Android platform/memory init script).
-        assert call["viewport"] == {"width": worker.width, "height": worker.height}
-        assert call["is_mobile"] is True
-        assert call["has_touch"] is True
-        # The stub browser reports 155.0.6723.58, so the (already 155) UA is unchanged.
-        assert call["user_agent"] == worker.user_agent
-        assert call["device_scale_factor"] == MOBILE_DEVICE_SCALE_FACTOR
-        assert "no_viewport" not in call
-        script = cast(Any, worker._context).init_scripts[0]
-        assert "Linux armv81" in script
+        # A real profile is browser-as-is: the portrait form factor is carried by the
+        # 412x915 window (--window-size) and the OS window IS the viewport. No UA
+        # override, no touch/mobile emulation, no init script.
+        assert call["no_viewport"] is True
+        assert "viewport" not in call
+        assert "user_agent" not in call
+        assert "is_mobile" not in call
+        assert "has_touch" not in call
+        assert "device_scale_factor" not in call
+        assert cast(Any, worker._context).init_scripts == []
     finally:
         await worker.close()
 
