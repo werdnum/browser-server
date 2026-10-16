@@ -66,16 +66,14 @@ def test_explicit_form_factor_overrides_client_aspect_ratio():
     assert req.resolved_form_factor() == "mobile"
 
 
-def test_mobile_profile_is_portrait_with_mobile_user_agent():
+def test_mobile_profile_is_portrait():
     profile = form_factor_profile("mobile")
     assert profile.height > profile.width  # portrait
-    assert profile.user_agent and "Mobile" in profile.user_agent
 
 
 def test_desktop_profile_is_landscape():
     profile = form_factor_profile("desktop")
     assert profile.width > profile.height  # landscape
-    assert profile.user_agent is None
 
 
 def test_unknown_form_factor_falls_back_to_default():
@@ -102,12 +100,10 @@ def test_make_worker_forwards_form_factor_dimensions(monkeypatch):
         "worker_ff",
         width=profile.width,
         height=profile.height,
-        user_agent=profile.user_agent,
     )
     assert isinstance(worker, PlaywrightBrowserWorker)
     assert worker.width == profile.width
     assert worker.height == profile.height
-    assert worker.user_agent == profile.user_agent
 
 
 def test_local_novnc_display_defaults_match_desktop():

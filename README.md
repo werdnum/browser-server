@@ -30,11 +30,10 @@ Implemented:
 
 The session `form_factor` defaults to `"auto"`: the browser UI measures the user's
 aspect ratio (`client_viewport`) when starting a session, and the service picks `"mobile"`
-for portrait screens (a 412×915 framebuffer with a mobile user agent so sites serve their
-mobile layout) or `"desktop"` for landscape (1280×720). With no client measurement (e.g.
-agent-created sessions) `"auto"` falls back to mobile. Pass an explicit
-`form_factor: "mobile" | "desktop"` to override detection. The human UI sizes its noVNC
-viewport to match the session's aspect ratio.
+for portrait screens (a 412×915 framebuffer) or `"desktop"` for landscape (1280×720). With
+no client measurement (e.g. agent-created sessions) `"auto"` falls back to mobile. Pass an
+explicit `form_factor: "mobile" | "desktop"` to override detection. The human UI sizes its
+noVNC viewport to match the session's aspect ratio.
 
 The service supports handing control of a single browser session in either direction:
 
@@ -366,12 +365,25 @@ out of scope. Headed mode (`BROWSER_HEADED=1`) remains meaningfully harder to de
 than headless, and a hard Cloudflare-class interstitial may still need to be solved
 manually through the noVNC handoff view.
 
+#### No user-agent override
+
+The mobile form factor is only a portrait window/viewport (412×915); it does **not**
+override the user agent, and neither does the desktop profile. A pinned device UA has to
+be corroborated by every other observable layer — platform, Client Hints, device pixel
+ratio, plugins, GPU — and the container cannot supply most of them (no mobile GPU, a real
+profile exposes the host's plugins), so a UA override reads as a cross-layer contradiction
+to scanners, and each compensating JS patch is itself a tell (a non-native `navigator`
+getter). Sessions therefore run browser-as-is: the browser's own UA always matches its
+real version, its Client Hints, and `navigator.platform`. The one rewrite is the headless
+build's `HeadlessChrome` product token, demasked to `Chrome` (a louder automation tell
+than any UA we could pin). The cost is that portrait panes get desktop page layouts.
+
 #### Persistent real-profile mode (`BROWSER_CONTEXT_PERSISTENT=1`)
 
 Off by default. Patchright's own documented best-practice posture is a *headed
 persistent context* on branded Chrome — no incognito `new_context`, no
 fingerprint-injection init scripts, no viewport emulation (the window is the
-viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches every session exactly that way:
+viewport). `BROWSER_CONTEXT_PERSISTENT=1` launches a session exactly that way:
 
 ```bash
 # Branded Chrome is strongly recommended on this path (patchright install chrome):

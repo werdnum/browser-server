@@ -1150,7 +1150,6 @@ class PlaywrightBrowserWorker:
         headed: bool = False,
         width: int = DEFAULT_DISPLAY_WIDTH,
         height: int = DEFAULT_DISPLAY_HEIGHT,
-        user_agent: str | None = None,
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
         timezone_id: str | None = None,
@@ -1167,7 +1166,6 @@ class PlaywrightBrowserWorker:
         self._profile_dir: str | None = None
         self.width = width
         self.height = height
-        self.user_agent = user_agent
         self.timezone_id = timezone_id
         # Cookie-jar load/confinement. ``storage_state`` seeds the context at creation;
         # ``confine_origins`` (exact scheme+host+port) restricts every top-level document.
@@ -1310,10 +1308,10 @@ class PlaywrightBrowserWorker:
             # (Built after the incognito launch above: the headless-UA demasking probe
             # reads the live browser, so it must run once self._browser exists.)
             context_kwargs: dict[str, Any] = {}
-            if self.persistent and not self.user_agent:
-                # Desktop persistent profile: the OS window IS the viewport (patchright's
-                # no-fingerprint-injection posture); the form factor is carried by
-                # --window-size above. The mobile profile keeps an explicit viewport.
+            if self.persistent:
+                # The real-profile launch runs on a real display: the OS window IS the
+                # viewport (patchright's no-fingerprint-injection posture); the form
+                # factor is carried by --window-size above.
                 context_kwargs["no_viewport"] = True
             else:
                 context_kwargs["viewport"] = {"width": self.width, "height": self.height}
@@ -1322,19 +1320,13 @@ class PlaywrightBrowserWorker:
                 # window.innerWidth/Height, a mismatch headless defaults can produce.
                 context_kwargs["screen"] = {"width": self.width, "height": self.height}
                 context_kwargs["device_scale_factor"] = 1
-            if self.user_agent:
-                # A mobile UA plus touch makes sites render their mobile layout.
-                context_kwargs["user_agent"] = self.user_agent
-                context_kwargs["is_mobile"] = True
-                context_kwargs["has_touch"] = True
-            else:
-                # Otherwise leave the UA alone: the browser's own string always matches its
-                # real version and its Client Hints, which a pinned override drifts away from.
-                # The one exception is the headless build, whose native UA advertises
-                # "HeadlessChrome" — a louder automation tell than any UA we could pin.
-                demasked = await self._demasked_headless_user_agent()
-                if demasked:
-                    context_kwargs["user_agent"] = demasked
+            # Leave the UA alone: the browser's own string always matches its real version
+            # and its Client Hints, which a pinned override drifts away from. The one
+            # exception is the headless build, whose native UA advertises "HeadlessChrome"
+            # — a louder automation tell than any UA we could pin.
+            demasked = await self._demasked_headless_user_agent()
+            if demasked:
+                context_kwargs["user_agent"] = demasked
             # Apply the resolved IANA timezone so in-page new Date()/Intl report the
             # caller's local time. Chromium/ICU validates the id; an unknown zone
             # surfaces as a RuntimeUnavailable when the context is created.
@@ -1367,22 +1359,17 @@ class PlaywrightBrowserWorker:
                     executable_path=executable_path,
                     **context_kwargs,
                 )
-                # No init script on this path: a real profile on real Chrome already
-                # presents genuine plugins/chrome.webdriver surfaces, and patching
-                # correct surfaces is itself a fingerprint (patchright's
+                # The real-profile path injects no init script: a real profile on real
+                # Chrome already presents genuine plugins/chrome.webdriver surfaces, and
+                # patching correct surfaces is itself a fingerprint (patchright's
                 # "no fingerprint injection" best practice).
                 self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
             else:
                 self._context = await incognito_browser.new_context(**context_kwargs)
                 if self.stealth:
-                    script = STEALTH_INIT_SCRIPT
-                    if not self.user_agent:
-                        # A pinned user agent means the mobile profile (UA + touch):
-                        # Chrome on Android has no desktop plugin array, so injecting
-                        # one would be an internally impossible fingerprint. Desktop
-                        # sessions (including plain headless) get the synthesis.
-                        script += "\n" + PLUGIN_SYNTHESIS_SCRIPT
-                    await self._context.add_init_script(script)
+                    # The incognito build's plugin array is empty; synthesize the real
+                    # Chrome plugin surfaces back on top of the base stealth patches.
+                    await self._context.add_init_script(STEALTH_INIT_SCRIPT + "\n" + PLUGIN_SYNTHESIS_SCRIPT)
                 self._page = await self._context.new_page()
             if self.confine_origins:
                 await self._install_confinement(self._context)
@@ -2231,7 +2218,6 @@ def make_worker(
     *,
     width: int = DEFAULT_DISPLAY_WIDTH,
     height: int = DEFAULT_DISPLAY_HEIGHT,
-    user_agent: str | None = None,
     storage_state: dict[str, Any] | None = None,
     confine_origins: list[str] | None = None,
     timezone_id: str | None = None,
@@ -2254,7 +2240,6 @@ def make_worker(
         headed=os.environ.get("BROWSER_HEADED") == "1",
         width=width,
         height=height,
-        user_agent=user_agent,
         storage_state=storage_state,
         confine_origins=confine_origins,
         timezone_id=resolved_timezone_id,
