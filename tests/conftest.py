@@ -2,6 +2,7 @@ import os
 from collections.abc import Generator
 
 import pytest
+from browser_handoff_service import runtime as runtime_module
 from browser_handoff_service.runtime import RuntimeUnavailable
 
 TEST_SERVICE_TOKEN = "test-service-token"
@@ -11,6 +12,17 @@ TEST_SERVICE_TOKEN = "test-service-token"
 def fake_runtime(monkeypatch):
     monkeypatch.setenv("BROWSER_RUNTIME", "fake")
     monkeypatch.setenv("BROWSER_HANDOFF_SERVICE_TOKEN", TEST_SERVICE_TOKEN)
+
+
+@pytest.fixture(autouse=True)
+def reset_chromium_version_cache():
+    """The process-level Chromium-version cache must not leak between tests (each test's
+    stub browser reports its own version)."""
+    runtime_module._CHROMIUM_MAJOR_VERSION = None
+    runtime_module._CHROMIUM_MAJOR_VERSION_LOCK = None
+    yield
+    runtime_module._CHROMIUM_MAJOR_VERSION = None
+    runtime_module._CHROMIUM_MAJOR_VERSION_LOCK = None
 
 
 @pytest.hookimpl(wrapper=True)

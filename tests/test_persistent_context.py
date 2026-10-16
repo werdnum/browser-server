@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from browser_handoff_service import runtime as runtime_module
+from browser_handoff_service.models import MOBILE_DEVICE_SCALE_FACTOR
 from browser_handoff_service.runtime import (
     PlaywrightBrowserWorker,
     RuntimeUnavailable,
@@ -372,13 +373,19 @@ async def test_persistent_mobile_keeps_explicit_viewport(monkeypatch: pytest.Mon
     await worker.start()
     try:
         call = stub.chromium.persistent_calls[0]
-        # The mobile profile (UA + touch + explicit viewport) is a deliberate
-        # product feature and stays as it is on the incognito path.
+        # The mobile profile (UA + touch + explicit viewport) is a deliberate product
+        # feature and stays as it is on the incognito path — including the cross-layer
+        # consistency layers (Chrome version aligned to the running build, phone DPR,
+        # Android platform/memory init script).
         assert call["viewport"] == {"width": worker.width, "height": worker.height}
         assert call["is_mobile"] is True
         assert call["has_touch"] is True
+        # The stub browser reports 155.0.6723.58, so the (already 155) UA is unchanged.
         assert call["user_agent"] == worker.user_agent
+        assert call["device_scale_factor"] == MOBILE_DEVICE_SCALE_FACTOR
         assert "no_viewport" not in call
+        script = cast(Any, worker._context).init_scripts[0]
+        assert "Linux armv81" in script
     finally:
         await worker.close()
 
