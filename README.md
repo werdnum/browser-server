@@ -68,6 +68,12 @@ returns `{"error": true, "code": "stale_ref", "cause": "missing|hidden|changed",
 rather than waiting out the actionability timeout. A ref that is not of the form `e12` returns
 `invalid_ref`. A raw `selector` still works unchanged.
 
+An element that exists but never becomes actionable (covered by an overlay, disabled, never
+attached) fails after 10s, well inside a typical 30s client timeout, with
+`{"error": true, "code": "action_timeout", "reason": "click could not act on the element within
+10s: ...", ...}`. The reason carries Playwright's call log, so it names the cause, such as
+`<div> intercepts pointer events`.
+
 Identity is the stamped attributes (ref, role, name), not the node object: a page that replaces a
 stamped node with a clone carrying those attributes produces a look-alike the check cannot tell
 apart. This is a deliberate simplification shared with every surveyed harness except Playwright.

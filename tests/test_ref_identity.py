@@ -38,6 +38,13 @@ _PAGE_B = b"""<!doctype html><title>Beta</title>
 <button id="only">Only</button>
 """
 
+_PAGE_COVERED = b"""<!doctype html><title>Covered</title>
+<button id="under">Under</button>
+<input id="locked" type="text" aria-label="Locked" disabled>
+<select id="frozen" aria-label="Frozen" disabled><option value="a">A</option><option value="b">B</option></select>
+<div id="overlay" style="position:fixed;inset:0;background:rgba(0,0,0,.5)"></div>
+"""
+
 # The exact sentence a caller (and the model behind it) is shown for a ref that no longer resolves.
 _STALE_REASON = "ref {ref} is no longer on the page as snapshotted; the page has changed since the last snapshot"
 
@@ -47,7 +54,12 @@ class _StaticHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        body = _PAGE_B if self.path.startswith("/b") else _PAGE_A
+        if self.path.startswith("/covered"):
+            body = _PAGE_COVERED
+        elif self.path.startswith("/b"):
+            body = _PAGE_B
+        else:
+            body = _PAGE_A
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Cache-Control", "no-store")
@@ -389,3 +401,34 @@ def test_coerce_next_ref_clamps_to_the_javascript_safe_integer_range():
     assert coerce_next_ref(None) == 1
     assert coerce_next_ref(-5) == 1
     assert coerce_next_ref(float("inf")) == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "expected_cause"),
+    [
+        ("click", {"selector": "#under"}, "intercepts pointer events"),
+        ("type_text", {"selector": "#locked", "text": "hello"}, "not enabled"),
+        ("select", {"selector": "#frozen", "value": "b"}, "not enabled"),
+        ("click", {"selector": "#absent"}, "waiting for locator"),
+    ],
+)
+async def test_an_unactionable_element_returns_playwrights_reason_before_the_callers_timeout(
+    worker, page_server, command, args, expected_cause
+):
+    worker.action_timeout_ms = 1000
+    await _navigate(worker, f"{page_server}/covered")
+
+    started = time.monotonic()
+    result = await worker.command(AgentCommandRequest(type=command, args=args))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5, f"{command} took {elapsed:.1f}s"
+    assert result["error"] is True
+    assert result["code"] == "action_timeout"
+    assert result["reason"].startswith(f"{command} could not act on the element within 1s: ")
+    assert expected_cause in result["reason"]
+    assert result["title"] == "Covered"
+
+
+def test_the_default_action_timeout_leaves_room_inside_a_30s_client_timeout():
+    assert PlaywrightBrowserWorker("worker_default_timeout").action_timeout_ms <= 15_000

@@ -17,7 +17,7 @@ class _RecordingLocator:
         self.text_like = text_like
         self.calls: list[tuple[str, tuple, dict]] = []
 
-    async def evaluate(self, _expression: str):
+    async def evaluate(self, _expression: str, **_kwargs):
         return self.text_like
 
     async def click(self, *args, **kwargs):
@@ -91,7 +91,7 @@ async def test_unresolvable_target_falls_back_to_fill(monkeypatch):
     worker.stealth = True
 
     class _GoneLocator:
-        async def evaluate(self, _expression: str):
+        async def evaluate(self, _expression: str, **_kwargs):
             raise RuntimeError("element detached")
 
         async def fill(self, *args, **kwargs):
@@ -174,7 +174,7 @@ async def test_click_hold_present_when_stealth_on_absent_when_off(monkeypatch):
     plain_page = _ClickStubPage()
     plain_worker._page = plain_page
     await plain_worker.command(AgentCommandRequest(type="click", args={"selector": "#b"}))
-    assert plain_page.recording.click_kwargs == {}
+    assert plain_page.recording.click_kwargs == {"timeout": plain_worker.action_timeout_ms}
 
     stealth_mouse_worker = PlaywrightBrowserWorker("worker_stealth_mouse")
     stealth_mouse_worker.stealth = True
