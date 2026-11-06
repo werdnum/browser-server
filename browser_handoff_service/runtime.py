@@ -771,6 +771,33 @@ def stale_ref_result(ref: str, cause: str, url: str | None, title: str) -> dict[
     }
 
 
+# How long click/type_text/select wait for their element to become actionable. Playwright's own
+# default is 30s, which is also how long a caller like Family Assistant waits for the HTTP reply,
+# so a covered or hidden element used to reach the caller as a bare client timeout. Finishing well
+# inside that window returns Playwright's explanation ("<div> intercepts pointer events") instead.
+ACTION_TIMEOUT_MS = 10_000
+_ACTION_TIMEOUT_REASON_MAX_CHARS = 1500
+
+
+def action_timeout_result(
+    command: str, exc: Exception, timeout_ms: float, url: str | None, title: str
+) -> dict[str, Any]:
+    """The result for an action whose element never became actionable.
+
+    Playwright's message carries a call log that repeats each retry; only distinct lines are kept,
+    so the cause it names survives the length cap.
+    """
+    lines = list(dict.fromkeys(line.rstrip() for line in str(exc).splitlines() if line.strip()))
+    detail = "\n".join(lines)[:_ACTION_TIMEOUT_REASON_MAX_CHARS]
+    return {
+        "error": True,
+        "code": "action_timeout",
+        "reason": f"{command} could not act on the element within {timeout_ms / 1000:g}s: {detail}",
+        "url": url,
+        "title": title,
+    }
+
+
 def _wrap_exec_code(code: str) -> str:
     """Wrap caller-provided JS so ``page.evaluate`` runs it uniformly.
 
@@ -1158,6 +1185,7 @@ class PlaywrightBrowserWorker:
         self.worker_id = worker_id
         self.closed = False
         self._next_ref = 1
+        self.action_timeout_ms: float = ACTION_TIMEOUT_MS
         self.stealth = stealth_enabled()
         self.persistent = persistent_context_enabled()
         # A persistent context is a real profile on a real display: always headed.
@@ -1541,6 +1569,67 @@ class PlaywrightBrowserWorker:
             return None
         return str(result.get("cause") or "missing")
 
+    async def _perform_action(self, request: AgentCommandRequest, page: Any, target: str) -> dict[str, Any]:
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        timeout = self.action_timeout_ms
+        if request.type == "click":
+            await self._human_pause(0.05, 0.2)
+            if self.stealth:
+                # A randomized mousedown->mouseup hold instead of the instant
+                # synthetic click default.
+                await page.locator(target).click(delay=random.uniform(30, 90), timeout=timeout)
+            else:
+                await page.locator(target).click(timeout=timeout)
+            return await self._current_page_result({"accepted": True})
+        if request.type == "type_text":
+            locator = page.locator(target)
+            text = str(request.args["text"])
+            human_typing = self.stealth and len(text) <= 200
+            if human_typing:
+                # Only text-like controls take per-key delivery. Specialized
+                # inputs (date/color/range/checkbox...) have value semantics that
+                # literal keystrokes either mangle or miss entirely — keep fill()'s
+                # serialized-value behavior for those.
+                try:
+                    human_typing = bool(
+                        await locator.evaluate(
+                            "(el) => el.isContentEditable || el.tagName === 'TEXTAREA' || "
+                            "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password', 'email', 'number']"
+                            ".includes((el.type || '').toLowerCase()))",
+                            timeout=timeout,
+                        )
+                    )
+                except PlaywrightTimeoutError:
+                    # Nothing matched the target: fill() would wait out the same timeout again.
+                    raise
+                except Exception:
+                    # Target not resolvable to an element: fall back to fill().
+                    human_typing = False
+            if human_typing:
+                # Human-ish entry for short fields: per-key delivery with a FRESH
+                # jittered pause before every keystroke — a single constant delay
+                # passed to press_sequentially would produce a perfectly regular
+                # machine cadence. No synthetic mouse click — fill("")/
+                # press_sequentially focus the control themselves, and a click
+                # could fire onclick handlers (submit, navigate, clear dependent
+                # fields) that plain typing never did. fill("") first so the
+                # command keeps type_text's REPLACEMENT semantics —
+                # press_sequentially alone inserts at the caret and would splice
+                # new text into an autofilled/pre-filled value.
+                await self._human_pause(0.05, 0.2)
+                await locator.fill("", timeout=timeout)
+                for char in text:
+                    await locator.press_sequentially(char, timeout=timeout)
+                    await asyncio.sleep(random.uniform(0.045, 0.11))
+            else:
+                await locator.fill(text, timeout=timeout)
+            return await self._current_page_result({"accepted": True})
+        if request.type == "select":
+            await page.locator(target).select_option(str(request.args["value"]), timeout=timeout)
+            return await self._current_page_result({"accepted": True})
+        raise ValueError(f"not an element action: {request.type}")
+
     async def _human_pause(self, low: float, high: float) -> None:
         """Small randomized settle delay so consecutive agent commands don't land
         with machine-regular (or zero) spacing. No-op when stealth is off."""
@@ -1599,60 +1688,20 @@ class PlaywrightBrowserWorker:
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
         if request.type in {"click", "type_text", "select"}:
+            from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
             target = await self._resolve_action_target(request, page)
             if isinstance(target, dict):
                 return target
-            if request.type == "click":
-                await self._human_pause(0.05, 0.2)
-                if self.stealth:
-                    # A randomized mousedown->mouseup hold instead of the instant
-                    # synthetic click default.
-                    await page.locator(target).click(delay=random.uniform(30, 90))
-                else:
-                    await page.locator(target).click()
-                return await self._current_page_result({"accepted": True})
-            if request.type == "type_text":
-                locator = page.locator(target)
-                text = str(request.args["text"])
-                human_typing = self.stealth and len(text) <= 200
-                if human_typing:
-                    # Only text-like controls take per-key delivery. Specialized
-                    # inputs (date/color/range/checkbox...) have value semantics that
-                    # literal keystrokes either mangle or miss entirely — keep fill()'s
-                    # serialized-value behavior for those.
-                    try:
-                        human_typing = bool(
-                            await locator.evaluate(
-                                "(el) => el.isContentEditable || el.tagName === 'TEXTAREA' || "
-                                "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password', 'email', 'number']"
-                                ".includes((el.type || '').toLowerCase()))"
-                            )
-                        )
-                    except Exception:
-                        # Target not resolvable to an element: fall back to fill().
-                        human_typing = False
-                if human_typing:
-                    # Human-ish entry for short fields: per-key delivery with a FRESH
-                    # jittered pause before every keystroke — a single constant delay
-                    # passed to press_sequentially would produce a perfectly regular
-                    # machine cadence. No synthetic mouse click — fill("")/
-                    # press_sequentially focus the control themselves, and a click
-                    # could fire onclick handlers (submit, navigate, clear dependent
-                    # fields) that plain typing never did. fill("") first so the
-                    # command keeps type_text's REPLACEMENT semantics —
-                    # press_sequentially alone inserts at the caret and would splice
-                    # new text into an autofilled/pre-filled value.
-                    await self._human_pause(0.05, 0.2)
-                    await locator.fill("")
-                    for char in text:
-                        await locator.press_sequentially(char)
-                        await asyncio.sleep(random.uniform(0.045, 0.11))
-                else:
-                    await locator.fill(text)
-                return await self._current_page_result({"accepted": True})
-            if request.type == "select":
-                await page.locator(target).select_option(str(request.args["value"]))
-                return await self._current_page_result({"accepted": True})
+            try:
+                return await self._perform_action(request, page, target)
+            except PlaywrightTimeoutError as exc:
+                # An off-scope navigation the route guard aborted is reported by command() itself.
+                if self.confine_origins and self._nav_off_scope_block is not None:
+                    raise
+                return action_timeout_result(
+                    request.type, exc, self.action_timeout_ms, redact_url(page.url)[0], await self._safe_title(page)
+                )
         if request.type == "press_key":
             await page.keyboard.press(str(request.args["key"]))
             return await self._current_page_result({"accepted": True})
