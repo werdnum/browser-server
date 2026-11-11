@@ -22,7 +22,10 @@ apt-get install -y --no-install-recommends \
   libcups2 \
   libdbus-1-3 \
   libdrm2 \
+  libegl1 \
   libgbm1 \
+  libgl1 \
+  libgl1-mesa-dri \
   libglib2.0-0 \
   libnspr4 \
   libnss3 \

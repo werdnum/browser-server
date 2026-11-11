@@ -15,7 +15,7 @@ Implemented:
 - Fail-closed command authorization after handoff starts.
 - Sanitized resume (`allowed_resume: "after_sanitize"`), for any handoff reason, closes the human-controlled page before returning the lease. It keeps the browser context, including cookies, localStorage and IndexedDB, so the agent gets the signed-in session back. Whatever a site stored there during the human's step is readable to the agent afterwards; that is accepted, because the signed-in context is what resuming is for.
 - Real Playwright Chromium runtime by default.
-- Headed Chromium plus Xvfb/x11vnc/noVNC launch path when host binaries are installed.
+- Headed Chromium plus Xvfb/x11vnc/noVNC launch path when host binaries are installed, with WebGL1/WebGL2 enabled in GPU-less containers/VMs (Mesa software GL under Xvfb; SwiftShader fallback in headless).
 - Form factor auto-detected from the user's aspect ratio (portrait -> mobile, landscape -> desktop); the noVNC viewport is sized to match.
 - Automatic UCP (Universal Commerce Protocol) discovery: on each accessibility `snapshot` the worker probes the current HTTPS origin's `/.well-known/ucp` profile (once per origin, cached), and when a merchant advertises shopping support it attaches a `ucp` hint to the snapshot so the driving agent can use UCP shopping without merchant-specific endpoints being hardcoded.
 - noVNC access is exposed through the authenticated service proxy; raw worker noVNC ports stay loopback-only.
