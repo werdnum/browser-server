@@ -1,5 +1,10 @@
 import base64
 import os
+import shutil
+import subprocess
+import time
+import urllib.parse
+from collections.abc import Generator
 
 import pytest
 from browser_handoff_service.main import app, registry
@@ -8,11 +13,116 @@ from browser_handoff_service.runtime import (
     PlaywrightBrowserWorker,
     RuntimeUnavailable,
     StorageTooLarge,
+    _free_display_number,
     remote_display_status,
 )
 from httpx import ASGITransport, AsyncClient
 
 TEST_SERVICE_TOKEN = "test-service-token"
+
+_WEBGL_FIXTURE_HTML = """<!doctype html>
+<html><body><script>
+(() => {
+  let lostCount = 0;
+  const probe = (kind) => {
+    const c = document.createElement('canvas');
+    c.width = 16;
+    c.height = 16;
+    c.addEventListener('webglcontextlost', () => { lostCount += 1; });
+    const gl = c.getContext(kind);
+    if (!gl) return { ok: false };
+    gl.clearColor(1.0, 0.0, 0.5, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const px = new Uint8Array(4);
+    gl.readPixels(8, 8, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      ok: !gl.isContextLost(),
+      pixel: Array.from(px),
+      vendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+      renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+      ref: { c, gl },
+    };
+  };
+  const w1 = probe('webgl');
+  const w2 = probe('webgl2');
+  window.__glRefs = [w1, w2];
+  const report = () => {
+    document.body.dataset.webgl = JSON.stringify({
+      lostCount,
+      webgl: {
+        ok: Boolean(w1.ok && w1.ref && !w1.ref.gl.isContextLost()),
+        pixel: w1.pixel || null,
+        vendor: w1.vendor || '',
+        renderer: w1.renderer || '',
+      },
+      webgl2: {
+        ok: Boolean(w2.ok && w2.ref && !w2.ref.gl.isContextLost()),
+        pixel: w2.pixel || null,
+        vendor: w2.vendor || '',
+        renderer: w2.renderer || '',
+      },
+    });
+  };
+  report();
+  setTimeout(report, 150);
+})();
+</script></body></html>"""
+
+
+@pytest.fixture
+def xvfb_display() -> Generator[str, None, None]:
+    xvfb_path = shutil.which("Xvfb")
+    if xvfb_path is None:
+        pytest.skip("Xvfb unavailable on this host")
+    display_number = _free_display_number()
+    display = f":{display_number}"
+    socket_path = f"/tmp/.X11-unix/X{display_number}"
+    proc = subprocess.Popen(
+        [xvfb_path, display, "-screen", "0", "1280x720x24", "+extension", "GLX", "-nolisten", "tcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while not os.path.exists(socket_path):
+            if proc.poll() is not None:
+                pytest.fail(f"Xvfb exited early with code {proc.returncode}")
+            if time.monotonic() >= deadline:
+                pytest.fail(f"Xvfb socket {socket_path} did not appear within 5s")
+            time.sleep(0.05)
+        yield display
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+async def _assert_worker_webgl_renders(worker: PlaywrightBrowserWorker) -> None:
+    data_url = "data:text/html," + urllib.parse.quote(_WEBGL_FIXTURE_HTML)
+    await worker.command(AgentCommandRequest(type="navigate", args={"url": data_url}))
+    executed = await worker.command(
+        AgentCommandRequest(
+            type="exec",
+            args={
+                "code": (
+                    "new Promise((resolve) => setTimeout(() => resolve(JSON.parse(document.body.dataset.webgl)), 200))"
+                )
+            },
+        )
+    )
+    report = executed["result"]
+    assert report["lostCount"] == 0, report
+    for kind in ("webgl", "webgl2"):
+        info = report[kind]
+        assert info["ok"] is True, (kind, report)
+        r, g, b, a = info["pixel"]
+        assert abs(r - 255) <= 2 and abs(g - 0) <= 2 and abs(b - 128) <= 2 and a == 255, (kind, info)
+        assert info["vendor"], (kind, info)
+        assert info["renderer"], (kind, info)
 
 
 @pytest.mark.asyncio
@@ -49,6 +159,39 @@ async def test_real_local_chromium_runtime_smoke(monkeypatch):
 
         executed = await worker.command(AgentCommandRequest(type="exec", args={"code": "document.title"}))
         assert executed["result"] == "fixture"
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_webgl_available(monkeypatch):
+    monkeypatch.delenv("BROWSER_RUNTIME", raising=False)
+    worker = PlaywrightBrowserWorker("worker_real_webgl")
+    try:
+        await worker.start()
+    except RuntimeUnavailable as exc:
+        pytest.skip(f"real local Chromium unavailable on this host: {exc}")
+    try:
+        await _assert_worker_webgl_renders(worker)
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_headed_xvfb_persistent_webgl_available(monkeypatch, xvfb_display):
+    """Exercise the production GPU-less Xvfb path (headed persistent context): WebGL1 and
+    WebGL2 must initialize, render pixels, and stay live without an async GPU-channel
+    context-loss fallback race."""
+    monkeypatch.delenv("BROWSER_RUNTIME", raising=False)
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setenv("DISPLAY", xvfb_display)
+    worker = PlaywrightBrowserWorker("worker_headed_webgl", headed=True)
+    try:
+        await worker.start()
+    except RuntimeUnavailable as exc:
+        pytest.skip(f"real local Chromium unavailable on this host: {exc}")
+    try:
+        await _assert_worker_webgl_renders(worker)
     finally:
         await worker.close()
 

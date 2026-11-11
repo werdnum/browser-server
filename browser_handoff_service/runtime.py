@@ -1270,6 +1270,16 @@ class PlaywrightBrowserWorker:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--enable-features=NetworkService,NetworkServiceInProcess",
+                # Headed Linux on Xvfb in a GPU-less VM/container has no hardware
+                # GPU: Chromium 137+ disables automatic SwiftShader fallback and
+                # blocklists Mesa's software GL (llvmpipe), leaving WebGL
+                # unavailable. --ignore-gpu-blocklist lets headed Xvfb sessions use
+                # Mesa llvmpipe directly (avoiding the async GPU-channel teardown
+                # and WebGL context loss that SwiftShader-only fallback triggers on
+                # initial load), while --enable-unsafe-swiftshader backs headless
+                # or Mesa-less hosts; neither overrides a real GPU when present.
+                "--ignore-gpu-blocklist",
+                "--enable-unsafe-swiftshader",
             ]
             # Stealth-only launch hardening: drop Playwright's --enable-automation
             # default (it drives the "controlled by automated software" infobar and a
@@ -2160,6 +2170,8 @@ class LocalNovncDisplay:
                 "-screen",
                 "0",
                 f"{self.width}x{self.height}x24",
+                "+extension",
+                "GLX",
                 "-nolisten",
                 "tcp",
             ],

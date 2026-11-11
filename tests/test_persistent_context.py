@@ -403,7 +403,29 @@ async def test_default_incognito_launch_unchanged(monkeypatch: pytest.MonkeyPatc
         call = stub.chromium.launch_calls[0]
         assert call["headless"] is True
         assert call["channel"] is None
+        assert "--ignore-gpu-blocklist" in call["args"]
+        assert "--enable-unsafe-swiftshader" in call["args"]
         assert worker._profile_dir is None
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_webgl_launch_args_present_across_persistent_and_non_stealth_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WebGL availability is a runtime capability, not a stealth-only patch: both
+    persistent headed launches and BROWSER_STEALTH=0 launches must carry the flags."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setenv("BROWSER_STEALTH", "0")
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    worker = PlaywrightBrowserWorker("worker_webgl_flags")
+    await worker.start()
+    try:
+        args = stub.chromium.persistent_calls[0]["args"]
+        assert "--ignore-gpu-blocklist" in args
+        assert "--enable-unsafe-swiftshader" in args
     finally:
         await worker.close()
 
