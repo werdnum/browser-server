@@ -242,6 +242,9 @@ class SessionRegistry:
     def list_sessions(self) -> list[BrowserSession]:
         return sorted(self.sessions.values(), key=lambda item: item.created_at)
 
+    def active_session_count(self) -> int:
+        return sum(1 for item in self.sessions.values() if item.state not in TERMINAL_STATES)
+
     def _jar_lock(self, jar_id: str) -> asyncio.Lock:
         return self.jar_locks.setdefault(jar_id, asyncio.Lock())
 

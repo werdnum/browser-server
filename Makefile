@@ -1,4 +1,4 @@
-.PHONY: check format lint pre-commit test typecheck
+.PHONY: check format install-macos-agent lint pre-commit test typecheck uninstall-macos-agent
 
 lint:
 	.venv/bin/ruff check .
@@ -19,3 +19,9 @@ check: lint typecheck test
 
 pre-commit:
 	.venv/bin/pre-commit run --all-files
+
+install-macos-agent:
+	python3 scripts/macos/install_launch_agent.py
+
+uninstall-macos-agent:
+	python3 scripts/macos/install_launch_agent.py --uninstall

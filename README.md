@@ -502,3 +502,28 @@ A configured authenticated-site session still uses its pinned alias and rejects
 requests for another account. An ordinary on-demand session intentionally has no
 per-site account allowlist: access is governed by Keychute's browser-server client
 policy. Its acting-user context is audit information, not separate user identity.
+
+## macOS LaunchAgent (Tart VM / Aqua Metal GPU)
+
+On macOS hosts (where `Xvfb`/`x11vnc`/`noVNC` are absent), headed Chrome runs natively
+on the logged-in Aqua session with Metal-backed WebGL, and human handoffs automatically
+stream **only the session's active tab** via a per-tab CDP screencast WebSocket
+(`/v1/sessions/{session_id}/screencast`, without enabling `Runtime.enable`) rather than
+sharing the macOS desktop.
+
+To install the supervised Aqua `LaunchAgent` plus its 5-minute idle-safe self-updater
+(`dev.andrewgarrett.browser-server` and `dev.andrewgarrett.browser-server-updater`):
+
+```bash
+git clone https://github.com/werdnum/browser-server.git ~/browser-server
+cd ~/browser-server
+make install-macos-agent
+# Edit ~/.config/browser-server/env (mode 0600) with BROWSER_HANDOFF_SERVICE_TOKEN
+# (and optionally ~/.config/browser-server/keychute.token), then load:
+make install-macos-agent
+```
+
+`scripts/macos/self_update.sh` polls `origin/main` every 300 seconds, defers updates
+whenever `/healthz` reports `active_sessions > 0`, fast-forwards and syncs `.venv`
+(rolling back on failure), and restarts `dev.andrewgarrett.browser-server` via
+`launchctl kickstart -k`.

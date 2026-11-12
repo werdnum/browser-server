@@ -387,6 +387,26 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
     }
     .viewport.connected { display: block; }
     .viewport iframe { width: 100%; height: 100%; border: 0; display: block; }
+    .screencast-shell { width: 100%; height: 100%; display: flex; flex-direction: column; background: var(--surface-2); }
+    .screencast-bar {
+      flex: 0 0 auto; display: flex; align-items: center; gap: .35rem; padding: .35rem .5rem;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+    }
+    .screencast-bar button {
+      font: inherit; font-size: .85rem; padding: .3rem .6rem; min-height: 32px;
+      border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+      color: var(--text); cursor: pointer;
+    }
+    .screencast-bar button:hover { background: var(--surface-2); }
+    .screencast-url {
+      flex: 1 1 auto; min-width: 0; font: inherit; font-size: .85rem; padding: .3rem .55rem; min-height: 32px;
+      border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text);
+    }
+    .screencast-canvas {
+      flex: 1 1 auto; width: 100%; min-height: 0; object-fit: contain; display: block;
+      background: #000; outline: none; touch-action: none; cursor: default;
+    }
+    .screencast-canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--primary); }
     .copy-label { font-weight: 600; font-size: .85rem; margin: .9rem 0 .3rem; }
     .copy-row { display: flex; align-items: stretch; gap: .4rem; margin: .35rem 0; }
     .copy-row code, .copy-row pre {
@@ -555,7 +575,177 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       if (json.state) document.querySelector("#state").textContent = json.state;
       return json;
     }
+    let activeScreencastCleanup = null;
+    function mountScreencast(viewport, wsUrl) {
+      const shell = document.createElement("div");
+      shell.className = "screencast-shell";
+      const bar = document.createElement("div");
+      bar.className = "screencast-bar";
+      const backBtn = document.createElement("button");
+      backBtn.type = "button";
+      backBtn.title = "Back";
+      backBtn.textContent = "←";
+      const reloadBtn = document.createElement("button");
+      reloadBtn.type = "button";
+      reloadBtn.title = "Reload";
+      reloadBtn.textContent = "↻";
+      const urlInput = document.createElement("input");
+      urlInput.type = "text";
+      urlInput.className = "screencast-url";
+      urlInput.placeholder = "https://...";
+      urlInput.setAttribute("aria-label", "Page URL");
+      const goBtn = document.createElement("button");
+      goBtn.type = "button";
+      goBtn.textContent = "Go";
+      bar.append(backBtn, reloadBtn, urlInput, goBtn);
+      const canvas = document.createElement("canvas");
+      canvas.className = "screencast-canvas";
+      canvas.tabIndex = 0;
+      canvas.setAttribute("aria-label", "Remote browser tab");
+      shell.append(bar, canvas);
+      viewport.replaceChildren(shell);
+      viewport.classList.add("connected");
+
+      const ctx = canvas.getContext("2d");
+      const ws = new WebSocket(wsUrl);
+      let deviceWidth = {{ viewport_width }};
+      let deviceHeight = {{ viewport_height }};
+      let moveQueued = false;
+      let pendingMove = null;
+      const send = (payload) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+      };
+      const toDeviceCoords = (event) => {
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return {x: 0, y: 0};
+        const scale = Math.min(rect.width / deviceWidth, rect.height / deviceHeight);
+        const drawW = deviceWidth * scale;
+        const drawH = deviceHeight * scale;
+        const offsetX = (rect.width - drawW) / 2;
+        const offsetY = (rect.height - drawH) / 2;
+        return {
+          x: Math.max(0, Math.min(deviceWidth, (event.clientX - rect.left - offsetX) / scale)),
+          y: Math.max(0, Math.min(deviceHeight, (event.clientY - rect.top - offsetY) / scale)),
+        };
+      };
+      const buttonName = (b) => (b === 1 ? "middle" : b === 2 ? "right" : "left");
+
+      ws.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.type !== "frame" || !msg.data) return;
+        if (msg.width > 0) deviceWidth = msg.width;
+        if (msg.height > 0) deviceHeight = msg.height;
+        if (typeof msg.url === "string" && document.activeElement !== urlInput) {
+          urlInput.value = msg.url;
+        }
+        const img = new Image();
+        img.onload = () => {
+          if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+          }
+          ctx.drawImage(img, 0, 0);
+        };
+        img.src = "data:image/jpeg;base64," + msg.data;
+      };
+      ws.onclose = () => {
+        if (shell.isConnected) {
+          viewport.classList.remove("connected");
+          viewport.textContent = "Remote viewport disconnected";
+        }
+      };
+
+      const goUrl = () => {
+        let raw = urlInput.value.trim();
+        if (!raw) return;
+        if (!/^https?:[/][/]/i.test(raw)) raw = "https://" + raw;
+        send({type: "navigate", action: "goto", url: raw});
+        canvas.focus();
+      };
+      backBtn.onclick = () => { send({type: "navigate", action: "back"}); canvas.focus(); };
+      reloadBtn.onclick = () => { send({type: "navigate", action: "reload"}); canvas.focus(); };
+      goBtn.onclick = goUrl;
+      urlInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); goUrl(); }
+      });
+
+      canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+      canvas.addEventListener("pointerdown", (e) => {
+        canvas.focus();
+        try { canvas.setPointerCapture(e.pointerId); } catch {}
+        const pt = toDeviceCoords(e);
+        send({type: "mouse", action: "down", x: pt.x, y: pt.y, button: buttonName(e.button), clickCount: e.detail || 1});
+      });
+      canvas.addEventListener("pointerup", (e) => {
+        try { canvas.releasePointerCapture(e.pointerId); } catch {}
+        const pt = toDeviceCoords(e);
+        send({type: "mouse", action: "up", x: pt.x, y: pt.y, button: buttonName(e.button), clickCount: e.detail || 1});
+      });
+      canvas.addEventListener("pointermove", (e) => {
+        pendingMove = toDeviceCoords(e);
+        if (moveQueued) return;
+        moveQueued = true;
+        requestAnimationFrame(() => {
+          moveQueued = false;
+          if (pendingMove) send({type: "mouse", action: "move", x: pendingMove.x, y: pendingMove.y});
+        });
+      });
+      canvas.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        send({type: "wheel", deltaX: e.deltaX, deltaY: e.deltaY});
+      }, {passive: false});
+
+      const specialKeys = new Set([
+        "Enter", "Tab", "Backspace", "Delete", "Escape",
+        "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+        "Home", "End", "PageUp", "PageDown",
+      ]);
+      canvas.addEventListener("keydown", (e) => {
+        if (e.metaKey || e.ctrlKey) {
+          if (e.key.toLowerCase() === "a") {
+            e.preventDefault();
+            send({type: "shortcut", action: "select_all"});
+          } else if (e.key === "Backspace") {
+            e.preventDefault();
+            send({type: "shortcut", action: "backspace_word"});
+          }
+          return;
+        }
+        if (e.altKey && e.key === "Backspace") {
+          e.preventDefault();
+          send({type: "shortcut", action: "backspace_word"});
+          return;
+        }
+        if (specialKeys.has(e.key)) {
+          e.preventDefault();
+          send({type: "key", key: (e.shiftKey ? "Shift+" : "") + e.key});
+          return;
+        }
+        if (e.key.length === 1 && !e.altKey) {
+          e.preventDefault();
+          send({type: "text", text: e.key});
+        }
+      });
+      const onPaste = (e) => {
+        if (document.activeElement !== canvas) return;
+        const pasted = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+        if (pasted) {
+          e.preventDefault();
+          send({type: "text", text: pasted});
+        }
+      };
+      window.addEventListener("paste", onPaste);
+      activeScreencastCleanup = () => {
+        window.removeEventListener("paste", onPaste);
+        try { ws.close(); } catch {}
+      };
+    }
     async function connectViewport() {
+      if (activeScreencastCleanup) {
+        activeScreencastCleanup();
+        activeScreencastCleanup = null;
+      }
       const viewport = document.querySelector("#viewport");
       viewport.classList.remove("connected");
       viewport.textContent = "Connecting remote viewport...";
@@ -566,16 +756,20 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
       } catch {
         json = {};
       }
-      if (!remote.ok || !json.novnc_url) {
+      if (!remote.ok || (!json.novnc_url && !json.screencast_url)) {
         viewport.textContent = json.detail || "Remote viewport unavailable";
         return;
       }
-      const frame = document.createElement("iframe");
-      frame.title = "noVNC remote browser session";
-      frame.src = json.novnc_url;
-      frame.allow = "clipboard-read; clipboard-write";
-      viewport.replaceChildren(frame);
-      viewport.classList.add("connected");
+      if (json.novnc_url) {
+        const frame = document.createElement("iframe");
+        frame.title = "noVNC remote browser session";
+        frame.src = json.novnc_url;
+        frame.allow = "clipboard-read; clipboard-write";
+        viewport.replaceChildren(frame);
+        viewport.classList.add("connected");
+        return;
+      }
+      mountScreencast(viewport, json.screencast_url);
     }
     document.querySelector("#claim").onclick = action(async () => {
       const claim = await post(`/v1/sessions/${sid}/claim`, {token});
@@ -910,7 +1104,11 @@ async def landing_page(request: Request):
 @app.get("/health")
 @app.get("/healthz")
 async def health():
-    return {"ok": True, "remote_display": remote_display_status().__dict__}
+    return {
+        "ok": True,
+        "active_sessions": registry.active_session_count(),
+        "remote_display": remote_display_status().__dict__,
+    }
 
 
 @app.post("/v1/sessions")
@@ -1281,29 +1479,47 @@ async def remote(session_id: str, token: str, request: Request):
     except Exception as exc:
         raise map_errors(exc) from exc
     status = remote_display_status()
-    if not status.available:
-        raise HTTPException(status_code=503, detail=status.reason)
     worker = registry.workers.get(session.worker_id or "")
     remote_url = getattr(worker, "remote_url", None)
-    if not remote_url:
-        raise HTTPException(status_code=503, detail="session was not started with headed noVNC runtime")
     base_url = public_base_url(request)
-    response = JSONResponse(
-        {
-            "session_id": session_id,
-            "novnc_url": novnc_proxy_url(session_id, base_url, remote_url),
-        }
-    )
     secure_cookie = urlsplit(base_url).scheme == "https"
-    response.set_cookie(
-        _novnc_cookie_name(session_id),
-        token,
-        httponly=True,
-        samesite="lax",
-        secure=secure_cookie,
-        path=_novnc_cookie_path(base_url, session_id),
-    )
-    return response
+    if status.available and remote_url:
+        response = JSONResponse(
+            {
+                "session_id": session_id,
+                "mode": "novnc",
+                "novnc_url": novnc_proxy_url(session_id, base_url, remote_url),
+            }
+        )
+        response.set_cookie(
+            _novnc_cookie_name(session_id),
+            token,
+            httponly=True,
+            samesite="lax",
+            secure=secure_cookie,
+            path=_novnc_cookie_path(base_url, session_id),
+        )
+        return response
+    if getattr(worker, "supports_cdp_screencast", False):
+        response = JSONResponse(
+            {
+                "session_id": session_id,
+                "mode": "screencast",
+                "screencast_url": screencast_proxy_url(session_id, base_url),
+            }
+        )
+        response.set_cookie(
+            _screencast_cookie_name(session_id),
+            token,
+            httponly=True,
+            samesite="lax",
+            secure=secure_cookie,
+            path=_screencast_cookie_path(base_url, session_id),
+        )
+        return response
+    if not status.available:
+        raise HTTPException(status_code=503, detail=status.reason)
+    raise HTTPException(status_code=503, detail="session was not started with headed noVNC runtime")
 
 
 @app.get("/v1/sessions/{session_id}/novnc/{asset_path:path}")
@@ -1367,6 +1583,42 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
             await websocket.close(code=1011)
         except RuntimeError:
             pass
+
+
+@app.websocket("/v1/sessions/{session_id}/screencast")
+async def screencast_websocket(session_id: str, websocket: WebSocket):
+    raw_token = websocket.query_params.get("token")
+    cookie_token = websocket.cookies.get(_screencast_cookie_name(session_id))
+    try:
+        session = await _authorize_novnc_request(session_id, raw_token, cookie_token)
+    except Exception:
+        await websocket.close(code=1008)
+        return
+    worker = registry.workers.get(session.worker_id or "")
+    open_screencast = getattr(worker, "open_screencast", None)
+    if not getattr(worker, "supports_cdp_screencast", False) or not callable(open_screencast):
+        await websocket.close(code=1011)
+        return
+
+    try:
+        screencast = await open_screencast()
+    except Exception:
+        await websocket.close(code=1011)
+        return
+
+    auth_token = raw_token or cookie_token or ""
+    try:
+        await websocket.accept()
+        await _bridge_screencast(websocket, screencast, session_id=session_id, token=auth_token)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        try:
+            await websocket.close(code=1011)
+        except RuntimeError:
+            pass
+    finally:
+        await screencast.close()
 
 
 async def _novnc_stream_authorized(session_id: str, token: str, upstream) -> bool:
@@ -1475,6 +1727,23 @@ def _novnc_cookie_path(base_url: str, session_id: str) -> str:
     return f"{prefix}/v1/sessions/{session_id}/novnc"
 
 
+def screencast_proxy_url(session_id: str, public_base_url: str) -> str:
+    public = urlsplit(public_base_url)
+    prefix = public.path.rstrip("/")
+    scheme = "wss" if public.scheme == "https" else "ws"
+    screencast_path = f"{prefix}/v1/sessions/{session_id}/screencast"
+    return urlunsplit((scheme, public.netloc, screencast_path, "", ""))
+
+
+def _screencast_cookie_name(session_id: str) -> str:
+    return f"screencast_{session_id}"
+
+
+def _screencast_cookie_path(base_url: str, session_id: str) -> str:
+    prefix = urlsplit(base_url).path.rstrip("/")
+    return f"{prefix}/v1/sessions/{session_id}/screencast"
+
+
 async def _authorize_novnc_request(session_id: str, token: str | None, cookie_token: str | None):
     auth_token = token or cookie_token or ""
     return await registry.authorize_remote(session_id, auth_token)
@@ -1532,5 +1801,64 @@ async def _bridge_websockets(client: WebSocket, upstream, *, session_id: str, to
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
+    for task in done:
+        task.result()
+
+
+_SCREENCAST_MAX_WS_BYTES = 65536
+
+
+async def _screencast_stream_authorized(session_id: str, token: str, client: WebSocket) -> bool:
+    try:
+        await registry.authorize_remote(session_id, token)
+    except (AuthorizationError, SessionInactiveError, NotFoundError):
+        try:
+            await client.close(code=1008)
+        except RuntimeError:
+            pass
+        return False
+    return True
+
+
+async def _bridge_screencast(client: WebSocket, screencast, *, session_id: str, token: str) -> None:
+    async def client_to_browser() -> None:
+        while True:
+            message = await client.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if not await _screencast_stream_authorized(session_id, token, client):
+                return
+            raw_text = message.get("text")
+            if not isinstance(raw_text, str) or len(raw_text) > _SCREENCAST_MAX_WS_BYTES:
+                continue
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                await screencast.dispatch_input(payload)
+
+    async def browser_to_client() -> None:
+        while True:
+            event = await screencast.next_event()
+            if not await _screencast_stream_authorized(session_id, token, client):
+                return
+            await client.send_text(json.dumps(event))
+
+    async def revocation_watchdog() -> None:
+        while True:
+            await asyncio.sleep(5)
+            if not await _screencast_stream_authorized(session_id, token, client):
+                return
+
+    tasks = {
+        asyncio.create_task(client_to_browser()),
+        asyncio.create_task(browser_to_client()),
+        asyncio.create_task(revocation_watchdog()),
+    }
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     for task in done:
         task.result()
