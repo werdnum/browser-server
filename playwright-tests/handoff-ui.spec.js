@@ -88,7 +88,7 @@ test("human can interact with CDP screencast canvas and address bar when noVNC i
   const session = await created.json();
 
   const handoff = await api(`/v1/sessions/${session.session_id}/handoff`, {
-    reason: "login",
+    reason: "credentials",
     handoff_note: "Sign in via screencast"
   });
   expect(handoff.ok).toBeTruthy();
