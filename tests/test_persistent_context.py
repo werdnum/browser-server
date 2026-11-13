@@ -13,6 +13,7 @@ leaked — on both the re-raise path and the persistent local-display fallback.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, cast
@@ -441,3 +442,135 @@ async def test_channel_env_passes_to_incognito_launch(monkeypatch: pytest.Monkey
         assert stub.chromium.launch_calls[0]["channel"] == "chromium"
     finally:
         await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_passes_timezone_and_locale_via_process_not_cdp_emulation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent contexts must not pass timezone_id or locale via Playwright
+    context_kwargs (which attach CDP Emulation.setTimezoneOverride/setLocaleOverride
+    to cross-origin Turnstile OOPIFs); TZ env and --lang carry them instead."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setenv("BROWSER_LOCALE", "en-AU")
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    worker = PlaywrightBrowserWorker("worker_persistent_tz", timezone_id="Australia/Sydney")
+    await worker.start()
+    try:
+        call = stub.chromium.persistent_calls[0]
+        assert "timezone_id" not in call
+        assert "locale" not in call
+        assert call["env"]["TZ"] == "Australia/Sydney"
+        assert "--lang=en-AU" in call["args"]
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_rejects_invalid_timezone_id_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    for bad_tz in ("Not/A_Real_Zone", "/etc/localtime", "../UTC"):
+        worker = PlaywrightBrowserWorker("worker_bad_tz", timezone_id=bad_tz)
+        with pytest.raises(RuntimeUnavailable, match="invalid timezone_id"):
+            await worker.start()
+    assert stub.chromium.persistent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_headed_start_polls_until_nonzero_outer_window_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On macOS Aqua, launch_persistent_context returns before NSWindow outer bounds
+    reach RenderWidgetHost; start() must poll until outerWidth/outerHeight > 0."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setattr(runtime_module, "_WINDOW_GEOMETRY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(runtime_module, "_WINDOW_GEOMETRY_TIMEOUT_SECONDS", 0.5)
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+
+    probes: list[str] = []
+    responses = [False, False, True]
+
+    class _DelayedGeometryPage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+
+        async def evaluate(self, expression: str) -> Any:
+            probes.append(expression)
+            return responses.pop(0)
+
+    async def _launch_delayed(user_data_dir: str, **kwargs: Any) -> _StubContext:
+        stub.chromium.persistent_calls.append({"user_data_dir": user_data_dir, **kwargs})
+        return _StubContext(cast(Any, [_DelayedGeometryPage()]))
+
+    monkeypatch.setattr(stub.chromium, "launch_persistent_context", _launch_delayed)
+    worker = PlaywrightBrowserWorker("worker_geom_wait")
+    await worker.start()
+    try:
+        assert len(probes) == 3
+        assert responses == []
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_headed_start_geometry_timeout_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setattr(runtime_module, "_WINDOW_GEOMETRY_POLL_SECONDS", 0.002)
+    monkeypatch.setattr(runtime_module, "_WINDOW_GEOMETRY_TIMEOUT_SECONDS", 0.01)
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+
+    class _ZeroGeometryPage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+
+        async def evaluate(self, _expression: str) -> Any:
+            return False
+
+    async def _launch_zero(user_data_dir: str, **kwargs: Any) -> _StubContext:
+        stub.chromium.persistent_calls.append({"user_data_dir": user_data_dir, **kwargs})
+        return _StubContext(cast(Any, [_ZeroGeometryPage()]))
+
+    monkeypatch.setattr(stub.chromium, "launch_persistent_context", _launch_zero)
+    worker = PlaywrightBrowserWorker("worker_geom_timeout")
+    await worker.start()
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_headed_start_stalled_geometry_evaluate_is_bounded_by_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung page.evaluate() during startup must be cancelled by the geometry
+    deadline rather than blocking worker.start() indefinitely."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setattr(runtime_module, "_WINDOW_GEOMETRY_TIMEOUT_SECONDS", 0.02)
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    never = asyncio.Event()
+
+    class _StalledGeometryPage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+
+        async def evaluate(self, _expression: str) -> Any:
+            await never.wait()
+            return False
+
+    async def _launch_stalled(user_data_dir: str, **kwargs: Any) -> _StubContext:
+        stub.chromium.persistent_calls.append({"user_data_dir": user_data_dir, **kwargs})
+        return _StubContext(cast(Any, [_StalledGeometryPage()]))
+
+    monkeypatch.setattr(stub.chromium, "launch_persistent_context", _launch_stalled)
+    worker = PlaywrightBrowserWorker("worker_geom_stalled")
+    async with asyncio.timeout(0.5):
+        await worker.start()
+    await worker.close()
