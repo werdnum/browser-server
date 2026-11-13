@@ -4,17 +4,20 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import random
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -59,6 +62,28 @@ def persistent_context_enabled() -> bool:
     Chrome installed (``patchright install chrome``).
     """
     return os.environ.get("BROWSER_CONTEXT_PERSISTENT", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+REMOTE_MODE_ENV = "BROWSER_REMOTE_MODE"
+RemoteViewportMode = Literal["auto", "novnc", "screencast"]
+
+
+def remote_viewport_mode() -> RemoteViewportMode:
+    """Select the human handoff viewport transport (``auto``, ``novnc``, or ``screencast``).
+
+    ``auto`` (default) uses noVNC when the X11/noVNC stack is available on the session
+    and falls back to CDP ``Page.startScreencast`` otherwise. ``novnc`` disables the
+    CDP screencast fallback, and ``screencast`` forces CDP screencast even on Linux
+    hosts with ``Xvfb`` installed (spawning ``Xvfb`` without ``x11vnc``/``websockify``).
+    """
+    raw = os.environ.get(REMOTE_MODE_ENV, "").strip().lower()
+    if not raw or raw == "auto":
+        return "auto"
+    if raw == "novnc":
+        return "novnc"
+    if raw == "screencast":
+        return "screencast"
+    raise RuntimeUnavailable(f"{REMOTE_MODE_ENV} must be 'auto', 'novnc', or 'screencast' (got {raw!r})")
 
 
 # Runs in every frame (main + iframes) before page scripts on each navigation.
@@ -1288,6 +1313,7 @@ class PlaywrightBrowserWorker:
             ignore_default_args = ["--enable-automation"] if self.stealth else None
             if self.stealth:
                 args += ["--no-first-run", "--no-default-browser-check"]
+            viewport_mode = remote_viewport_mode()
             if self.headed:
                 display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
                 # Assigned before start(): a start() failure after a subprocess was
@@ -1297,16 +1323,18 @@ class PlaywrightBrowserWorker:
                 # close and discard it safely.
                 self._display = display
                 try:
-                    self.remote_url = display.start()
+                    if viewport_mode == "screencast":
+                        display.start_xvfb_only()
+                    else:
+                        self.remote_url = display.start()
                 except RuntimeUnavailable:
                     # A failed start can leave spawned processes behind; close()
                     # terminates them (a no-op when nothing was spawned).
                     display.close()
-                    if not self.persistent:
+                    if viewport_mode == "novnc" or (not self.persistent and viewport_mode != "screencast"):
                         raise
                     # A host with its own display (e.g. a macOS machine) heads the
-                    # browser on the local screen; there is no noVNC mirror for the
-                    # human UI to embed for such a session.
+                    # browser on the local screen; CDP screencast streams the tab.
                     display = None
                 self._display = display
                 if display is not None:
@@ -1771,8 +1799,6 @@ class PlaywrightBrowserWorker:
                 return {"error": str(exc), "url": redact_url(page.url)[0]}
             return {"result": result, "url": redact_url(page.url)[0]}
         if request.type == "wait":
-            from typing import Literal
-
             from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
             selector = request.args.get("selector")
@@ -2126,6 +2152,332 @@ class PlaywrightBrowserWorker:
             self._display.close()
             self._display = None
 
+    @property
+    def supports_cdp_screencast(self) -> bool:
+        return not self.closed and self._context is not None and self._page is not None
+
+    def _active_open_page(self) -> Any:
+        if self._context is not None:
+            open_pages = [
+                page for page in getattr(self._context, "pages", []) if not getattr(page, "is_closed", lambda: False)()
+            ]
+            if open_pages:
+                latest = open_pages[-1]
+                self._page = latest
+                return latest
+        if self._page is not None and not getattr(self._page, "is_closed", lambda: False)():
+            return self._page
+        raise RuntimeError("worker has no open page")
+
+    async def open_screencast(self) -> CDPScreencastSession:
+        if not self.supports_cdp_screencast or self._context is None:
+            raise RuntimeUnavailable("worker is closed or does not support CDP screencast")
+        session = CDPScreencastSession(self)
+        await session.start()
+        return session
+
+
+_SCREENCAST_ALLOWED_KEYS = frozenset(
+    {
+        "Enter",
+        "Tab",
+        "Backspace",
+        "Delete",
+        "Escape",
+        "ArrowLeft",
+        "ArrowRight",
+        "ArrowUp",
+        "ArrowDown",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        " ",
+        "Space",
+    }
+)
+_SCREENCAST_MAX_TEXT_CHARS = 16384
+_SCREENCAST_NAV_TIMEOUT_MS = 15_000
+
+
+def _clamp_coord(value: Any, *, low: float = 0.0, high: float = 16384.0) -> float | None:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return max(low, min(high, num))
+
+
+class CDPScreencastSession:
+    """Per-tab interactive viewport stream backed by Chromium's Page.startScreencast.
+
+    Used on hosts without Xvfb/x11vnc/noVNC (such as macOS Aqua/Metal VMs), streaming
+    only the session's active tab rather than the host desktop and detaching when the
+    human disconnects. Deliberately never calls ``Runtime.enable``.
+    """
+
+    def __init__(self, worker: PlaywrightBrowserWorker) -> None:
+        self._worker = worker
+        self._page: Any = None
+        self._cdp: Any = None
+        self._closed = False
+        self._frame_received = False
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=2)
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._watch_task: asyncio.Task[None] | None = None
+        self._rebind_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        await self._bind_page(self._worker._active_open_page())
+        self._watch_task = asyncio.create_task(self._watch_loop())
+
+    async def _bind_page(self, page: Any) -> None:
+        context = self._worker._context
+        if context is None or self._worker.closed:
+            raise RuntimeUnavailable("worker is closed")
+        await self._detach_cdp()
+        cdp = await context.new_cdp_session(page)
+        self._page = page
+        self._cdp = cdp
+        self._frame_received = False
+
+        def on_frame(params: dict[str, Any]) -> None:
+            if self._closed or self._cdp is not cdp:
+                return
+            self._frame_received = True
+            if self._queue.full():
+                try:
+                    dropped = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    dropped = None
+                if dropped is not None and dropped.get("_ack_id") is not None:
+                    self._spawn_bg(self._ack(dropped["_cdp"], dropped["_ack_id"]))
+            raw_metadata = params.get("metadata")
+            metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+            width = int(metadata.get("deviceWidth") or self._worker.width)
+            height = int(metadata.get("deviceHeight") or self._worker.height)
+            item = {
+                "type": "frame",
+                "data": str(params.get("data") or ""),
+                "width": width,
+                "height": height,
+                "url": redact_url(getattr(page, "url", "") or "")[0],
+                "_cdp": cdp,
+                "_ack_id": params.get("sessionId"),
+            }
+            try:
+                self._queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+
+        cdp.on("Page.screencastFrame", on_frame)
+        await cdp.send(
+            "Page.startScreencast",
+            {
+                "format": "jpeg",
+                "quality": 80,
+                "maxWidth": max(self._worker.width, 1280),
+                "maxHeight": max(self._worker.height, 960),
+                "everyNthFrame": 1,
+            },
+        )
+        self._spawn_bg(self._seed_initial_frame(cdp, page))
+
+    def _spawn_bg(self, coro: Awaitable[Any]) -> None:
+        task = asyncio.create_task(self._run_bg(coro))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _run_bg(self, coro: Awaitable[Any]) -> None:
+        try:
+            await coro
+        except Exception:
+            return
+
+    async def _seed_initial_frame(self, cdp: Any, page: Any) -> None:
+        await asyncio.sleep(0.25)
+        if self._closed or self._cdp is not cdp or self._frame_received:
+            return
+        shot = await cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 80})
+        data = shot.get("data") if isinstance(shot, dict) else None
+        if not isinstance(data, str) or not data or self._frame_received or self._closed:
+            return
+        item = {
+            "type": "frame",
+            "data": data,
+            "width": self._worker.width,
+            "height": self._worker.height,
+            "url": redact_url(getattr(page, "url", "") or "")[0],
+            "_cdp": None,
+            "_ack_id": None,
+        }
+        if not self._queue.full():
+            self._queue.put_nowait(item)
+
+    async def _ack(self, cdp: Any, ack_id: Any) -> None:
+        if cdp is None or ack_id is None:
+            return
+        try:
+            await cdp.send("Page.screencastFrameAck", {"sessionId": ack_id})
+        except Exception:
+            pass
+
+    async def _watch_loop(self) -> None:
+        while not self._closed and not self._worker.closed:
+            await asyncio.sleep(0.5)
+            try:
+                await self._sync_active_page()
+            except Exception:
+                pass
+
+    async def _sync_active_page(self) -> Any:
+        async with self._rebind_lock:
+            page = self._worker._active_open_page()
+            if page is not self._page:
+                await self._bind_page(page)
+            return page
+
+    async def next_event(self) -> dict[str, Any]:
+        item = await self._queue.get()
+        await self._ack(item.get("_cdp"), item.get("_ack_id"))
+        return {
+            "type": item["type"],
+            "data": item["data"],
+            "width": item["width"],
+            "height": item["height"],
+            "url": item["url"],
+        }
+
+    async def dispatch_input(self, message: dict[str, Any]) -> None:
+        if self._closed or self._worker.closed:
+            return
+        try:
+            page = await self._sync_active_page()
+        except RuntimeUnavailable:
+            raise
+        except Exception:
+            if self._worker.closed:
+                raise RuntimeUnavailable("worker is closed") from None
+            logger.debug("Screencast failed to bind active page for input", exc_info=True)
+            return
+        msg_type = message.get("type")
+        try:
+            if msg_type == "mouse":
+                await self._dispatch_mouse(page, message)
+            elif msg_type == "wheel":
+                dx = _clamp_coord(message.get("deltaX", 0.0), low=-16384.0, high=16384.0)
+                dy = _clamp_coord(message.get("deltaY", 0.0), low=-16384.0, high=16384.0)
+                if dx is not None and dy is not None:
+                    await page.mouse.wheel(dx, dy)
+            elif msg_type == "text":
+                text = str(message.get("text") or "")[:_SCREENCAST_MAX_TEXT_CHARS]
+                if len(text) == 1:
+                    await page.keyboard.type(text)
+                elif text:
+                    await page.keyboard.insert_text(text)
+            elif msg_type == "key":
+                raw_key = str(message.get("key") or "")
+                shift_prefix = "Shift+" if raw_key.startswith("Shift+") else ""
+                base_key = raw_key.removeprefix("Shift+")
+                if base_key in _SCREENCAST_ALLOWED_KEYS:
+                    normalized_base = "Space" if base_key == " " else base_key
+                    await page.keyboard.press(f"{shift_prefix}{normalized_base}")
+            elif msg_type == "shortcut":
+                action = message.get("action")
+                if action == "select_all":
+                    await page.keyboard.press("ControlOrMeta+KeyA")
+                elif action == "backspace_word":
+                    await page.keyboard.press("Alt+Backspace" if sys.platform == "darwin" else "Control+Backspace")
+            elif msg_type == "navigate":
+                await self._dispatch_navigate(page, message)
+        except Exception:
+            if self._worker.closed:
+                raise RuntimeUnavailable("worker is closed") from None
+            logger.debug("Screencast ignored recoverable %s dispatch error", msg_type, exc_info=True)
+
+    async def _dispatch_mouse(self, page: Any, message: dict[str, Any]) -> None:
+        x = _clamp_coord(message.get("x"))
+        y = _clamp_coord(message.get("y"))
+        if x is None or y is None:
+            return
+        raw_button = message.get("button", "left")
+        button: Literal["left", "middle", "right"] = "left"
+        if raw_button == "middle":
+            button = "middle"
+        elif raw_button == "right":
+            button = "right"
+        try:
+            click_count = max(1, min(int(message.get("clickCount", 1)), 3))
+        except (TypeError, ValueError):
+            click_count = 1
+        action = message.get("action")
+        if action == "move":
+            await page.mouse.move(x, y)
+        elif action == "down":
+            await page.mouse.move(x, y)
+            await page.mouse.down(button=button, click_count=click_count)
+        elif action == "up":
+            await page.mouse.move(x, y)
+            await page.mouse.up(button=button, click_count=click_count)
+        elif action == "click":
+            await page.mouse.click(x, y, button=button, click_count=click_count)
+
+    async def _dispatch_navigate(self, page: Any, message: dict[str, Any]) -> None:
+        action = message.get("action")
+        if action == "back":
+            await page.go_back(wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
+            return
+        if action == "forward":
+            await page.go_forward(wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
+            return
+        if action == "reload":
+            await page.reload(wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
+            return
+        if action == "goto":
+            url = str(message.get("url") or "").strip()
+            parts = urlsplit(url)
+            if parts.scheme not in {"http", "https"} or not parts.netloc:
+                return
+            if (
+                self._worker.confine_origins
+                and self._worker._confinement_active
+                and origin_of(url) not in set(self._worker.confine_origins)
+            ):
+                return
+            await page.goto(url, wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
+
+    async def _detach_cdp(self) -> None:
+        cdp = self._cdp
+        self._cdp = None
+        if cdp is None:
+            return
+        try:
+            await cdp.send("Page.stopScreencast")
+        except Exception:
+            pass
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._watch_task is not None:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+            self._watch_task = None
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
+        await self._detach_cdp()
+
 
 @dataclass(frozen=True)
 class RemoteDisplayStatus:
@@ -2210,6 +2562,29 @@ class LocalNovncDisplay:
         # viewport container, which the UI sizes to match the session aspect ratio.
         self.novnc_url = f"http://127.0.0.1:{novnc_port}/vnc.html?autoconnect=1&resize=scale"
         return self.novnc_url
+
+    def start_xvfb_only(self) -> None:
+        xvfb_path = shutil.which("Xvfb")
+        if not xvfb_path:
+            raise RuntimeUnavailable("missing Xvfb binary")
+        display_number = _free_display_number()
+        self.display = f":{display_number}"
+        xvfb = subprocess.Popen(
+            [
+                xvfb_path,
+                self.display,
+                "-screen",
+                "0",
+                f"{self.width}x{self.height}x24",
+                "+extension",
+                "GLX",
+                "-nolisten",
+                "tcp",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(xvfb)
 
     def close(self) -> None:
         for proc in reversed(self._procs):

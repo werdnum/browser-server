@@ -52,3 +52,87 @@ test("human can claim, extend, mark sensitive, and complete from the handoff UI"
   expect(denied.status).toBe(410);
 });
 
+test("human can interact with CDP screencast canvas and address bar when noVNC is unavailable", async ({ page, baseURL }) => {
+  const api = async (path, body) => fetch(`${baseURL}${path}`, {
+    method: "POST",
+    headers: { ...serviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const wsBase = baseURL.replace(/^http/i, "ws");
+  const receivedMessages = [];
+  // 1x1 valid JPEG base64
+  const tinyJpeg = "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
+
+  await page.route("**/v1/sessions/*/remote?**", async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ mode: "screencast", screencast_url: `${wsBase}/mock-screencast` })
+    });
+  });
+  await page.routeWebSocket("**/mock-screencast", ws => {
+    ws.send(JSON.stringify({
+      type: "frame",
+      data: tinyJpeg,
+      width: 1280,
+      height: 800,
+      url: "https://example.com/login"
+    }));
+    ws.onMessage(message => {
+      const parsed = JSON.parse(String(message));
+      receivedMessages.push(parsed);
+      if (parsed.type === "navigate" && parsed.action === "goto") {
+        ws.send(JSON.stringify({
+          type: "frame",
+          data: tinyJpeg,
+          width: 1280,
+          height: 800,
+          url: "chrome-error://chromewebdata/"
+        }));
+      } else if (parsed.type === "navigate" && parsed.action === "reload") {
+        ws.send(JSON.stringify({
+          type: "frame",
+          data: tinyJpeg,
+          width: 1280,
+          height: 800,
+          url: "https://example.org/dashboard"
+        }));
+      }
+    });
+  });
+
+  const created = await api("/v1/sessions", { conversation_id: "conv_ui_screencast" });
+  expect(created.ok).toBeTruthy();
+  const session = await created.json();
+
+  const handoff = await api(`/v1/sessions/${session.session_id}/handoff`, {
+    reason: "credentials",
+    handoff_note: "Sign in via screencast"
+  });
+  expect(handoff.ok).toBeTruthy();
+  const handoffJson = await handoff.json();
+
+  await page.goto(handoffJson.handoff_url);
+  await page.getByRole("button", { name: "Claim" }).click();
+  await expect(page.locator("#state")).toHaveText("human_active");
+
+  const canvas = page.locator("#viewport canvas.screencast-canvas");
+  await expect(canvas).toBeVisible();
+  const urlInput = page.locator("#viewport input.screencast-url");
+  await expect(urlInput).toHaveValue("https://example.com/login");
+
+  await urlInput.fill("example.org/dashboard");
+  await page.locator("#viewport .screencast-bar").getByRole("button", { name: "Go" }).click();
+  await expect.poll(() => receivedMessages.some(
+    m => m.type === "navigate" && m.action === "goto" && m.url === "https://example.org/dashboard"
+  )).toBeTruthy();
+  await expect(urlInput).toHaveValue("example.org/dashboard");
+
+  await page.locator("#viewport .screencast-bar").getByTitle("Reload").click();
+  await expect(urlInput).toHaveValue("https://example.org/dashboard");
+
+  await page.getByRole("button", { name: "Complete" }).click();
+  await expect(page.locator("#state")).toHaveText("completed");
+});
+
+

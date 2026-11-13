@@ -330,3 +330,44 @@ async def test_headed_novnc_assets_are_served_through_authenticated_service_prox
         denied = await client.get(novnc_url)
     assert denied.status_code == 403
     await registry.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_cdp_screencast_streams_jpeg_and_dispatches_input(monkeypatch):
+    import asyncio
+
+    monkeypatch.delenv("BROWSER_RUNTIME", raising=False)
+    worker = PlaywrightBrowserWorker("real_screencast_test", headed=False, width=800, height=600)
+    try:
+        await worker.start()
+    except RuntimeUnavailable as exc:
+        pytest.skip(f"real local Chromium unavailable on this host: {exc}")
+
+    screencast = None
+    try:
+        html = (
+            "<!doctype html><html><body style='margin:0;background:#1d4ed8'>"
+            "<input id='box' style='position:absolute;left:20px;top:20px;width:240px;height:48px;font-size:20px' />"
+            "</body></html>"
+        )
+        data_url = "data:text/html," + urllib.parse.quote(html)
+        await worker.command(AgentCommandRequest(type="navigate", args={"url": data_url}))
+
+        screencast = await worker.open_screencast()
+        frame = await asyncio.wait_for(screencast.next_event(), timeout=5.0)
+        assert frame["type"] == "frame"
+        raw = base64.b64decode(frame["data"])
+        assert raw[:3] == b"\xff\xd8\xff"
+        assert frame["width"] > 0
+        assert frame["height"] > 0
+
+        await screencast.dispatch_input({"type": "mouse", "action": "click", "x": 60, "y": 40, "button": "left"})
+        await screencast.dispatch_input({"type": "text", "text": "hello tart"})
+        val = await worker.command(
+            AgentCommandRequest(type="exec", args={"code": "document.getElementById('box').value"})
+        )
+        assert val["result"] == "hello tart"
+    finally:
+        if screencast is not None:
+            await screencast.close()
+        await worker.close()
