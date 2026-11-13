@@ -13,6 +13,7 @@ import os
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import anyio
 import httpx
 import jwt
 import websockets
@@ -1882,9 +1883,14 @@ async def _bridge_screencast(client: WebSocket, screencast, *, session_id: str, 
         asyncio.create_task(browser_to_client()),
         asyncio.create_task(revocation_watchdog()),
     }
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    done = set()
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        with anyio.CancelScope(shield=True):
+            await asyncio.gather(*tasks, return_exceptions=True)
     for task in done:
         task.result()

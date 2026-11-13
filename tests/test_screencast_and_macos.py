@@ -229,8 +229,20 @@ def test_screencast_websocket_auth_streaming_input_and_revocation(monkeypatch: p
             with client.websocket_connect(f"/v1/sessions/{session_id}/screencast?token=wrong") as ws:
                 ws.receive_text()
 
-        # Authorized session streams frames, forwards input, and closes cleanly on completion.
-        with client.websocket_connect(f"/v1/sessions/{session_id}/screencast?token={control_token}") as ws:
+        # Missing both ?token= and screencast_<id> cookie is rejected with 1008.
+        with pytest.raises(Exception):
+            with client.websocket_connect(f"/v1/sessions/{session_id}/screencast") as ws:
+                ws.receive_text()
+
+        # /remote sets the path-scoped screencast_<id> cookie so /screencast without ?token= succeeds.
+        remote_res = client.get(f"/v1/sessions/{session_id}/remote", params={"token": control_token})
+        assert remote_res.status_code == 200
+        assert remote_res.json()["mode"] == "screencast"
+        assert "token=" not in remote_res.json()["screencast_url"]
+        assert client.cookies.get(f"screencast_{session_id}") == control_token
+
+        # Authorized session (via cookie alone, matching browser UI) streams frames, forwards input, and closes cleanly.
+        with client.websocket_connect(f"/v1/sessions/{session_id}/screencast") as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "frame"
             assert first["data"] == "ZmFrZS1qcGVn"
@@ -528,6 +540,12 @@ def test_macos_launch_agent_plist_generation_and_env_seed(tmp_path: Path, monkey
     written_upd = plistlib.loads((fake_home / "Library" / "LaunchAgents" / f"{UPDATER_LABEL}.plist").read_bytes())
     assert written_svc["EnvironmentVariables"]["BROWSER_SERVER_ENV_FILE"] == str(custom_env.resolve())
     assert written_upd["EnvironmentVariables"]["BROWSER_SERVER_ENV_FILE"] == str(custom_env.resolve())
+
+    repo_dir = Path(__file__).resolve().parents[1]
+    run_service_text = (repo_dir / "scripts" / "macos" / "run_service.sh").read_text(encoding="utf-8")
+    dockerfile_text = (repo_dir / "Dockerfile").read_text(encoding="utf-8")
+    assert 'WEBSOCKETS_MAX_LINE_LENGTH="${WEBSOCKETS_MAX_LINE_LENGTH:-65536}"' in run_service_text
+    assert "WEBSOCKETS_MAX_LINE_LENGTH=65536" in dockerfile_text
 
 
 def test_macos_self_update_defers_while_busy_and_updates_when_idle(tmp_path: Path) -> None:
