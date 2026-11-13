@@ -13,11 +13,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anyio
 import httpx
@@ -1194,6 +1196,11 @@ DEFAULT_DISPLAY_HEIGHT = 720
 _PROFILE_CLEANUP_ATTEMPTS = 3
 _PROFILE_CLEANUP_RETRY_SECONDS = 1.0
 
+# Headed window placement settle budget on macOS Aqua / X11 WMs before the first
+# navigation runs, preventing initial-load window.outerWidth/outerHeight == 0.
+_WINDOW_GEOMETRY_TIMEOUT_SECONDS = 2.0
+_WINDOW_GEOMETRY_POLL_SECONDS = 0.02
+
 
 class PlaywrightBrowserWorker:
     def __init__(
@@ -1395,14 +1402,29 @@ class PlaywrightBrowserWorker:
             if demasked:
                 context_kwargs["user_agent"] = demasked
             # Apply the resolved IANA timezone so in-page new Date()/Intl report the
-            # caller's local time. Chromium/ICU validates the id; an unknown zone
-            # surfaces as a RuntimeUnavailable when the context is created.
-            if self.timezone_id:
-                context_kwargs["timezone_id"] = self.timezone_id
-            if self.stealth:
-                # A stable, common locale beats Chromium's possibly-empty default
-                # (headless builds can report navigator.languages == []).
-                context_kwargs["locale"] = os.environ.get("BROWSER_LOCALE", "").strip() or "en-US"
+            # caller's local time. On the persistent real-profile path, pass timezone
+            # and locale via process env (TZ) and CLI (--lang) rather than Playwright
+            # context_kwargs: Playwright implements context timezone_id/locale via CDP
+            # Emulation.setTimezoneOverride / setLocaleOverride on every attached
+            # target (including cross-origin Turnstile OOPIFs), which Turnstile flags
+            # as an automation signal (cf_chl_rc_ni / interactive escalation).
+            locale = os.environ.get("BROWSER_LOCALE", "").strip() or "en-US"
+            if self.persistent:
+                if self.timezone_id:
+                    try:
+                        ZoneInfo(self.timezone_id)
+                    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+                        raise RuntimeUnavailable(f"invalid timezone_id: {self.timezone_id}") from exc
+                    env["TZ"] = self.timezone_id
+                if self.stealth:
+                    args.append(f"--lang={locale}")
+            else:
+                if self.timezone_id:
+                    context_kwargs["timezone_id"] = self.timezone_id
+                if self.stealth:
+                    # A stable, common locale beats Chromium's possibly-empty default
+                    # (headless builds can report navigator.languages == []).
+                    context_kwargs["locale"] = locale
             if self._storage_state is not None:
                 context_kwargs["storage_state"] = self._storage_state
             if self.confine_origins:
@@ -1438,11 +1460,44 @@ class PlaywrightBrowserWorker:
                     # Chrome plugin surfaces back on top of the base stealth patches.
                     await self._context.add_init_script(STEALTH_INIT_SCRIPT + "\n" + PLUGIN_SYNTHESIS_SCRIPT)
                 self._page = await self._context.new_page()
+            if self.headed:
+                await self._await_headed_window_geometry(self._page)
             if self.confine_origins:
                 await self._install_confinement(self._context)
         except Exception as exc:
             await self.close()
             raise RuntimeUnavailable(str(exc)) from exc
+
+    async def _await_headed_window_geometry(self, page: Any) -> None:
+        """Wait briefly for the OS window manager to commit non-zero outer window bounds.
+
+        On macOS Aqua (``launch_persistent_context`` with ``no_viewport=True``), CDP
+        attaches to the initial ``about:blank`` tab milliseconds before AppKit /
+        WindowServer pushes the ``NSWindow`` frame to ``RenderWidgetHost``, so an
+        immediate first navigation can observe ``window.outerWidth === 0`` or
+        ``window.outerHeight === 0`` (a classic headless-browser signal). Polling on
+        ``about:blank`` is bounded and best-effort so session startup never fails on
+        unit-test page stubs or minimal window managers.
+        """
+        if not self.headed or page is None:
+            return
+        evaluate = getattr(page, "evaluate", None)
+        if not callable(evaluate):
+            return
+        deadline = time.monotonic() + _WINDOW_GEOMETRY_TIMEOUT_SECONDS
+        while True:
+            try:
+                ready = await evaluate("window.outerWidth > 0 && window.outerHeight > 0")
+            except Exception:
+                return
+            if not isinstance(ready, bool):
+                return
+            if ready:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(_WINDOW_GEOMETRY_POLL_SECONDS, remaining))
 
     async def _demasked_headless_user_agent(self) -> str | None:
         """Return the browser's own UA with the ``HeadlessChrome`` token rewritten to ``Chrome``,
