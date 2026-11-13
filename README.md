@@ -511,7 +511,16 @@ stream **only the session's active tab** via a per-tab CDP screencast WebSocket
 (`/v1/sessions/{session_id}/screencast`, without enabling `Runtime.enable`) rather than
 sharing the macOS desktop.
 
-To install the supervised Aqua `LaunchAgent` plus its 5-minute idle-safe self-updater
+`BROWSER_REMOTE_MODE` (`auto` | `novnc` | `screencast`, default `auto`) controls the
+human handoff viewport transport:
+
+- `auto` (default): uses `noVNC` when the X11/noVNC stack is active on the session and
+  falls back to CDP screencast otherwise.
+- `novnc`: requires `noVNC` and disables the CDP screencast fallback.
+- `screencast`: forces CDP screencast even on Linux hosts with `Xvfb` installed
+  (spawning `Xvfb` for headed Chrome without `x11vnc`/`websockify`).
+
+To install the supervised Aqua `LaunchAgent` plus its 5-minute self-updater
 (`dev.andrewgarrett.browser-server` and `dev.andrewgarrett.browser-server-updater`):
 
 ```bash
@@ -523,7 +532,8 @@ make install-macos-agent
 make install-macos-agent
 ```
 
-`scripts/macos/self_update.sh` polls `origin/main` every 300 seconds, defers updates
-whenever `/healthz` reports `active_sessions > 0`, fast-forwards and syncs `.venv`
-(rolling back on failure), and restarts `dev.andrewgarrett.browser-server` via
-`launchctl kickstart -k`.
+`scripts/macos/self_update.sh` polls `origin/main` every 300 seconds, checks `/healthz`
+for `active_sessions > 0` both before merging and immediately before restarting (rolling
+back if a session started during dependency sync or if sync fails), and restarts
+`dev.andrewgarrett.browser-server` via `launchctl kickstart -k`. The active-session check
+is best-effort and does not gate concurrent session admission across `launchctl kickstart`.

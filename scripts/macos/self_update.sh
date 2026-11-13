@@ -65,9 +65,13 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
-if HEALTH_JSON="$(curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null)"; then
-  ACTIVE_SESSIONS="$(
-    printf '%s' "$HEALTH_JSON" | "$PYTHON_BIN" -c '
+active_session_count() {
+  local health_json
+  if ! health_json="$(curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null)"; then
+    echo 0
+    return 0
+  fi
+  printf '%s' "$health_json" | "$PYTHON_BIN" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -76,15 +80,7 @@ try:
 except Exception:
     print(0)
 '
-  )"
-  if [[ "${ACTIVE_SESSIONS}" -gt 0 ]]; then
-    echo "browser-server-updater: deferring update (${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}) while ${ACTIVE_SESSIONS} session(s) active"
-    exit 0
-  fi
-fi
-
-echo "browser-server-updater: updating ${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}"
-git merge --ff-only --quiet "$REMOTE_SHA"
+}
 
 sync_deps() {
   if [[ "${BROWSER_SERVER_SKIP_DEP_SYNC:-0}" == "1" ]]; then
@@ -97,10 +93,32 @@ sync_deps() {
   fi
 }
 
+# Best-effort idle check: we do not gate in-process session admission, so a
+# session created in the brief window after the post-sync check can still be
+# interrupted by `launchctl kickstart -k`. Checking both before git merge and
+# immediately after dependency sync avoids restarting over the multi-second
+# fetch/sync window while keeping the updater stateless.
+ACTIVE_SESSIONS="$(active_session_count)"
+if [[ "${ACTIVE_SESSIONS}" -gt 0 ]]; then
+  echo "browser-server-updater: deferring update (${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}) while ${ACTIVE_SESSIONS} session(s) active"
+  exit 0
+fi
+
+echo "browser-server-updater: updating ${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}"
+git merge --ff-only --quiet "$REMOTE_SHA"
+
 if ! sync_deps; then
   echo "browser-server-updater: dependency sync failed; rolling back to $LOCAL_SHA" >&2
   git reset --hard "$LOCAL_SHA" >&2
   exit 1
+fi
+
+ACTIVE_SESSIONS="$(active_session_count)"
+if [[ "${ACTIVE_SESSIONS}" -gt 0 ]]; then
+  echo "browser-server-updater: session became active during sync (${ACTIVE_SESSIONS}); rolling back to ${LOCAL_SHA:0:7} and deferring restart"
+  git reset --hard "$LOCAL_SHA" --quiet
+  sync_deps || true
+  exit 0
 fi
 
 launchctl kickstart -k "gui/$(id -u)/${SERVICE_LABEL}"

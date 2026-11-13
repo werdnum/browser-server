@@ -13,7 +13,13 @@ from typing import Any
 import pytest
 from browser_handoff_service import main
 from browser_handoff_service.main import app, registry, screencast_proxy_url
-from browser_handoff_service.runtime import CDPScreencastSession, PlaywrightBrowserWorker, RemoteDisplayStatus
+from browser_handoff_service.runtime import (
+    CDPScreencastSession,
+    PlaywrightBrowserWorker,
+    RemoteDisplayStatus,
+    RuntimeUnavailable,
+    remote_viewport_mode,
+)
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from scripts.macos.install_launch_agent import (
@@ -143,6 +149,57 @@ async def test_remote_falls_back_to_screencast_when_novnc_unavailable(monkeypatc
         assert f"screencast_{session_id}=" in cookie
         assert f"Path=/browser/v1/sessions/{session_id}/screencast" in cookie
         assert "secure" in cookie.lower()
+
+
+@pytest.mark.asyncio
+async def test_browser_remote_mode_env_overrides_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "remote_display_status", lambda: RemoteDisplayStatus(available=True))
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_remote_mode", "initial_owner": "human"},
+        )
+        assert created.status_code == 200
+        body = created.json()
+        session_id = body["session_id"]
+        control_token = body["control_token"]
+        worker: Any = registry.workers[body["worker_id"]]
+        worker.remote_url = "http://127.0.0.1:6080/vnc.html?autoconnect=1"
+        worker.supports_cdp_screencast = True
+
+        # Default (auto) prefers noVNC when both are available.
+        monkeypatch.delenv("BROWSER_REMOTE_MODE", raising=False)
+        assert remote_viewport_mode() == "auto"
+        auto_res = await client.get(f"/v1/sessions/{session_id}/remote", params={"token": control_token})
+        assert auto_res.status_code == 200
+        assert auto_res.json()["mode"] == "novnc"
+
+        # BROWSER_REMOTE_MODE=screencast forces CDP screencast and blocks noVNC proxy routes.
+        monkeypatch.setenv("BROWSER_REMOTE_MODE", "screencast")
+        assert remote_viewport_mode() == "screencast"
+        sc_res = await client.get(f"/v1/sessions/{session_id}/remote", params={"token": control_token})
+        assert sc_res.status_code == 200
+        assert sc_res.json()["mode"] == "screencast"
+        novnc_blocked = await client.get(f"/v1/sessions/{session_id}/novnc/vnc.html", params={"token": control_token})
+        assert novnc_blocked.status_code == 503
+
+        # BROWSER_REMOTE_MODE=novnc disables CDP screencast fallback when noVNC is absent.
+        worker.remote_url = None
+        monkeypatch.setattr(main, "remote_display_status", lambda: RemoteDisplayStatus(available=False, reason="macOS"))
+        monkeypatch.setenv("BROWSER_REMOTE_MODE", "novnc")
+        assert remote_viewport_mode() == "novnc"
+        novnc_only = await client.get(f"/v1/sessions/{session_id}/remote", params={"token": control_token})
+        assert novnc_only.status_code == 503
+
+        # Invalid value fails closed with a clear message.
+        monkeypatch.setenv("BROWSER_REMOTE_MODE", "bogus")
+        with pytest.raises(RuntimeUnavailable, match="BROWSER_REMOTE_MODE"):
+            remote_viewport_mode()
+        invalid_res = await client.get(f"/v1/sessions/{session_id}/remote", params={"token": control_token})
+        assert invalid_res.status_code == 500
 
 
 def test_screencast_websocket_auth_streaming_input_and_revocation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,12 +462,12 @@ def test_macos_self_update_defers_while_busy_and_updates_when_idle(tmp_path: Pat
         encoding="utf-8",
     )
     launchctl_stub.chmod(0o755)
-
-    active_state = {"count": 1}
+    health_responses: list[int] = [1]
 
     class _HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            body = json.dumps({"ok": True, "active_sessions": active_state["count"]}).encode("utf-8")
+            count = health_responses.pop(0) if len(health_responses) > 1 else health_responses[0]
+            body = json.dumps({"ok": True, "active_sessions": count}).encode("utf-8")
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.end_headers()
@@ -434,14 +491,22 @@ def test_macos_self_update_defers_while_busy_and_updates_when_idle(tmp_path: Pat
             "BROWSER_SERVER_HEALTH_URL": f"http://127.0.0.1:{port}/healthz",
             "BROWSER_SERVER_SKIP_DEP_SYNC": "1",
         }
-        # 1. Busy session: must defer without advancing HEAD or restarting.
+        # 1. Busy session before merge: must defer without advancing HEAD or restarting.
         busy_run = subprocess.run(["bash", str(script_src)], env=env, check=True, capture_output=True, text=True)
         assert "deferring update" in busy_run.stdout
         assert subprocess.check_output(["git", "-C", str(clone), "rev-parse", "HEAD"], text=True).strip() == initial_sha
         assert not kickstart_log.exists()
 
-        # 2. Idle (active_sessions == 0): must fast-forward HEAD and kickstart the LaunchAgent.
-        active_state["count"] = 0
+        # 2. Session becomes active while sync_deps runs (0 pre-merge -> 1 pre-restart):
+        #    must roll back HEAD and skip restart.
+        health_responses[:] = [0, 1]
+        race_run = subprocess.run(["bash", str(script_src)], env=env, check=True, capture_output=True, text=True)
+        assert "session became active during sync" in race_run.stdout
+        assert subprocess.check_output(["git", "-C", str(clone), "rev-parse", "HEAD"], text=True).strip() == initial_sha
+        assert not kickstart_log.exists()
+
+        # 3. Idle throughout sync (0 pre-merge -> 0 pre-restart): must fast-forward HEAD and kickstart.
+        health_responses[:] = [0, 0]
         idle_run = subprocess.run(["bash", str(script_src)], env=env, check=True, capture_output=True, text=True)
         assert "restarted" in idle_run.stdout
         assert subprocess.check_output(["git", "-C", str(clone), "rev-parse", "HEAD"], text=True).strip() == new_sha

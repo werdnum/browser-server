@@ -52,7 +52,7 @@ from .models import (
     form_factor_profile,
 )
 from .registry import AuthorizationError, ConflictError, NotFoundError, SessionInactiveError, SessionRegistry
-from .runtime import remote_display_status
+from .runtime import RuntimeUnavailable, remote_display_status, remote_viewport_mode
 from .transitions import TransitionError
 
 SERVICE_TOKEN_ENV = "BROWSER_HANDOFF_SERVICE_TOKEN"
@@ -1478,12 +1478,16 @@ async def remote(session_id: str, token: str, request: Request):
         session = await registry.authorize_remote(session_id, token)
     except Exception as exc:
         raise map_errors(exc) from exc
+    try:
+        mode = remote_viewport_mode()
+    except RuntimeUnavailable as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     status = remote_display_status()
     worker = registry.workers.get(session.worker_id or "")
     remote_url = getattr(worker, "remote_url", None)
     base_url = public_base_url(request)
     secure_cookie = urlsplit(base_url).scheme == "https"
-    if status.available and remote_url:
+    if mode != "screencast" and status.available and remote_url:
         response = JSONResponse(
             {
                 "session_id": session_id,
@@ -1500,7 +1504,7 @@ async def remote(session_id: str, token: str, request: Request):
             path=_novnc_cookie_path(base_url, session_id),
         )
         return response
-    if getattr(worker, "supports_cdp_screencast", False):
+    if mode != "novnc" and getattr(worker, "supports_cdp_screencast", False):
         response = JSONResponse(
             {
                 "session_id": session_id,
@@ -1517,6 +1521,8 @@ async def remote(session_id: str, token: str, request: Request):
             path=_screencast_cookie_path(base_url, session_id),
         )
         return response
+    if mode == "screencast":
+        raise HTTPException(status_code=503, detail="session runtime does not support CDP screencast")
     if not status.available:
         raise HTTPException(status_code=503, detail=status.reason)
     raise HTTPException(status_code=503, detail="session was not started with headed noVNC runtime")
@@ -1528,6 +1534,12 @@ async def novnc_http_proxy(session_id: str, asset_path: str, request: Request, t
         session = await _authorize_novnc_request(session_id, token, request.cookies.get(_novnc_cookie_name(session_id)))
     except Exception as exc:
         raise map_errors(exc) from exc
+    try:
+        mode = remote_viewport_mode()
+    except RuntimeUnavailable as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if mode == "screencast":
+        raise HTTPException(status_code=503, detail="noVNC disabled by BROWSER_REMOTE_MODE=screencast")
     worker = registry.workers.get(session.worker_id or "")
     remote_url = getattr(worker, "remote_url", None)
     if not remote_url:
@@ -1558,6 +1570,13 @@ async def novnc_websocket_proxy(session_id: str, websocket: WebSocket):
         )
     except Exception:
         await websocket.close(code=1008)
+        return
+    try:
+        if remote_viewport_mode() == "screencast":
+            await websocket.close(code=1011)
+            return
+    except RuntimeUnavailable:
+        await websocket.close(code=1011)
         return
     worker = registry.workers.get(session.worker_id or "")
     remote_url = getattr(worker, "remote_url", None)
@@ -1593,6 +1612,13 @@ async def screencast_websocket(session_id: str, websocket: WebSocket):
         session = await _authorize_novnc_request(session_id, raw_token, cookie_token)
     except Exception:
         await websocket.close(code=1008)
+        return
+    try:
+        if remote_viewport_mode() == "novnc":
+            await websocket.close(code=1011)
+            return
+    except RuntimeUnavailable:
+        await websocket.close(code=1011)
         return
     worker = registry.workers.get(session.worker_id or "")
     open_screencast = getattr(worker, "open_screencast", None)

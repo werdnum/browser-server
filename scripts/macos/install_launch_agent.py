@@ -3,7 +3,7 @@
 
 Writes two per-user LaunchAgents under ``~/Library/LaunchAgents``:
 - ``dev.andrewgarrett.browser-server`` (KeepAlive uvicorn service in Aqua session)
-- ``dev.andrewgarrett.browser-server-updater`` (every 5 minutes idle-safe git updater)
+- ``dev.andrewgarrett.browser-server-updater`` (every 5 minutes git updater with best-effort active-session deferral)
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ BROWSER_HANDOFF_SERVICE_TOKEN=REPLACE_WITH_SERVICE_TOKEN
 # BROWSER_HEADED=1
 # BROWSER_CONTEXT_PERSISTENT=1
 # BROWSER_CHROMIUM_CHANNEL=chrome
+# BROWSER_REMOTE_MODE=auto
 # BROWSER_TIMEZONE=Australia/Sydney
 # BROWSER_HANDOFF_PUBLIC_URL=https://browser.andrewgarrett.dev
 # UVICORN_HOST=0.0.0.0

@@ -64,6 +64,28 @@ def persistent_context_enabled() -> bool:
     return os.environ.get("BROWSER_CONTEXT_PERSISTENT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+REMOTE_MODE_ENV = "BROWSER_REMOTE_MODE"
+RemoteViewportMode = Literal["auto", "novnc", "screencast"]
+
+
+def remote_viewport_mode() -> RemoteViewportMode:
+    """Select the human handoff viewport transport (``auto``, ``novnc``, or ``screencast``).
+
+    ``auto`` (default) uses noVNC when the X11/noVNC stack is available on the session
+    and falls back to CDP ``Page.startScreencast`` otherwise. ``novnc`` disables the
+    CDP screencast fallback, and ``screencast`` forces CDP screencast even on Linux
+    hosts with ``Xvfb`` installed (spawning ``Xvfb`` without ``x11vnc``/``websockify``).
+    """
+    raw = os.environ.get(REMOTE_MODE_ENV, "").strip().lower()
+    if not raw or raw == "auto":
+        return "auto"
+    if raw == "novnc":
+        return "novnc"
+    if raw == "screencast":
+        return "screencast"
+    raise RuntimeUnavailable(f"{REMOTE_MODE_ENV} must be 'auto', 'novnc', or 'screencast' (got {raw!r})")
+
+
 # Runs in every frame (main + iframes) before page scripts on each navigation.
 # Covers the cheap JS-level tells: ``navigator.webdriver``, the missing
 # ``window.chrome`` object of a non-Chrome UA, the empty plugins/mimeTypes arrays
@@ -1291,6 +1313,7 @@ class PlaywrightBrowserWorker:
             ignore_default_args = ["--enable-automation"] if self.stealth else None
             if self.stealth:
                 args += ["--no-first-run", "--no-default-browser-check"]
+            viewport_mode = remote_viewport_mode()
             if self.headed:
                 display = LocalNovncDisplay(self.worker_id, width=self.width, height=self.height)
                 # Assigned before start(): a start() failure after a subprocess was
@@ -1300,16 +1323,18 @@ class PlaywrightBrowserWorker:
                 # close and discard it safely.
                 self._display = display
                 try:
-                    self.remote_url = display.start()
+                    if viewport_mode == "screencast":
+                        display.start_xvfb_only()
+                    else:
+                        self.remote_url = display.start()
                 except RuntimeUnavailable:
                     # A failed start can leave spawned processes behind; close()
                     # terminates them (a no-op when nothing was spawned).
                     display.close()
-                    if not self.persistent:
+                    if viewport_mode == "novnc" or (not self.persistent and viewport_mode != "screencast"):
                         raise
                     # A host with its own display (e.g. a macOS machine) heads the
-                    # browser on the local screen; there is no noVNC mirror for the
-                    # human UI to embed for such a session.
+                    # browser on the local screen; CDP screencast streams the tab.
                     display = None
                 self._display = display
                 if display is not None:
@@ -2523,6 +2548,29 @@ class LocalNovncDisplay:
         # viewport container, which the UI sizes to match the session aspect ratio.
         self.novnc_url = f"http://127.0.0.1:{novnc_port}/vnc.html?autoconnect=1&resize=scale"
         return self.novnc_url
+
+    def start_xvfb_only(self) -> None:
+        xvfb_path = shutil.which("Xvfb")
+        if not xvfb_path:
+            raise RuntimeUnavailable("missing Xvfb binary")
+        display_number = _free_display_number()
+        self.display = f":{display_number}"
+        xvfb = subprocess.Popen(
+            [
+                xvfb_path,
+                self.display,
+                "-screen",
+                "0",
+                f"{self.width}x{self.height}x24",
+                "+extension",
+                "GLX",
+                "-nolisten",
+                "tcp",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(xvfb)
 
     def close(self) -> None:
         for proc in reversed(self._procs):
