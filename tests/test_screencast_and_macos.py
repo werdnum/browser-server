@@ -490,28 +490,44 @@ def test_screencast_websocket_survives_navigation_failure(monkeypatch: pytest.Mo
             ]
 
 
-def test_macos_launch_agent_plist_generation_and_env_seed(tmp_path: Path) -> None:
+def test_macos_launch_agent_plist_generation_and_env_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.macos import install_launch_agent
+
     repo_root = tmp_path / "Application Support" / "browser-server"
     log_dir = tmp_path / "Logs"
-    svc = plistlib.loads(build_service_plist(repo_root, log_dir))
-    upd = plistlib.loads(build_updater_plist(repo_root, log_dir, interval_seconds=300))
+    custom_env = tmp_path / "custom-config" / "browser.env"
+    svc = plistlib.loads(build_service_plist(repo_root, log_dir, env_file=custom_env))
+    upd = plistlib.loads(build_updater_plist(repo_root, log_dir, interval_seconds=300, env_file=custom_env))
 
     assert svc["Label"] == SERVICE_LABEL
     assert svc["LimitLoadToSessionType"] == "Aqua"
     assert svc["KeepAlive"] is True
     assert svc["RunAtLoad"] is True
     assert svc["ProgramArguments"][1].endswith("scripts/macos/run_service.sh")
+    assert svc["EnvironmentVariables"] == {"BROWSER_SERVER_ENV_FILE": str(custom_env.resolve())}
 
     assert upd["Label"] == UPDATER_LABEL
     assert upd["LimitLoadToSessionType"] == "Aqua"
     assert upd["StartInterval"] == 300
     assert upd["ProgramArguments"][1].endswith("scripts/macos/self_update.sh")
+    assert upd["EnvironmentVariables"] == {"BROWSER_SERVER_ENV_FILE": str(custom_env.resolve())}
 
     env_file = tmp_path / "cfg" / "env"
     assert _ensure_env_file(env_file) is False
     assert (env_file.stat().st_mode & 0o777) == 0o600
     env_file.write_text("BROWSER_HANDOFF_SERVICE_TOKEN=real-secret-token\n", encoding="utf-8")
     assert _ensure_env_file(env_file) is True
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("BROWSER_SERVER_ENV_FILE", str(custom_env))
+    monkeypatch.setattr(install_launch_agent, "_ensure_venv_and_chrome", lambda _root: None)
+    assert install_launch_agent.main(["--no-load"]) == 0
+    written_svc = plistlib.loads((fake_home / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist").read_bytes())
+    written_upd = plistlib.loads((fake_home / "Library" / "LaunchAgents" / f"{UPDATER_LABEL}.plist").read_bytes())
+    assert written_svc["EnvironmentVariables"]["BROWSER_SERVER_ENV_FILE"] == str(custom_env.resolve())
+    assert written_upd["EnvironmentVariables"]["BROWSER_SERVER_ENV_FILE"] == str(custom_env.resolve())
 
 
 def test_macos_self_update_defers_while_busy_and_updates_when_idle(tmp_path: Path) -> None:

@@ -40,10 +40,12 @@ BROWSER_HANDOFF_SERVICE_TOKEN=REPLACE_WITH_SERVICE_TOKEN
 """
 
 
-def build_service_plist(repo_root: Path, log_dir: Path) -> bytes:
+def build_service_plist(repo_root: Path, log_dir: Path, env_file: Path | None = None) -> bytes:
+    resolved_env_file = (env_file or (Path.home() / ".config" / "browser-server" / "env")).expanduser().resolve()
     payload = {
         "Label": SERVICE_LABEL,
         "ProgramArguments": ["/bin/bash", str(repo_root / "scripts" / "macos" / "run_service.sh")],
+        "EnvironmentVariables": {"BROWSER_SERVER_ENV_FILE": str(resolved_env_file)},
         "WorkingDirectory": str(repo_root),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -55,10 +57,17 @@ def build_service_plist(repo_root: Path, log_dir: Path) -> bytes:
     return plistlib.dumps(payload)
 
 
-def build_updater_plist(repo_root: Path, log_dir: Path, interval_seconds: int = 300) -> bytes:
+def build_updater_plist(
+    repo_root: Path,
+    log_dir: Path,
+    interval_seconds: int = 300,
+    env_file: Path | None = None,
+) -> bytes:
+    resolved_env_file = (env_file or (Path.home() / ".config" / "browser-server" / "env")).expanduser().resolve()
     payload = {
         "Label": UPDATER_LABEL,
         "ProgramArguments": ["/bin/bash", str(repo_root / "scripts" / "macos" / "self_update.sh")],
+        "EnvironmentVariables": {"BROWSER_SERVER_ENV_FILE": str(resolved_env_file)},
         "WorkingDirectory": str(repo_root),
         "RunAtLoad": True,
         "StartInterval": interval_seconds,
@@ -133,7 +142,12 @@ def main(argv: list[str] | None = None) -> int:
     home = Path.home()
     agents_dir = home / "Library" / "LaunchAgents"
     log_dir = home / "Library" / "Logs" / "browser-server"
-    env_file = Path(os.environ.get("BROWSER_SERVER_ENV_FILE", str(home / ".config" / "browser-server" / "env")))
+    raw_env_file = os.environ.get("BROWSER_SERVER_ENV_FILE", "").strip()
+    env_file = (
+        Path(raw_env_file).expanduser().resolve()
+        if raw_env_file
+        else (home / ".config" / "browser-server" / "env").resolve()
+    )
 
     service_plist = agents_dir / f"{SERVICE_LABEL}.plist"
     updater_plist = agents_dir / f"{UPDATER_LABEL}.plist"
@@ -152,8 +166,10 @@ def main(argv: list[str] | None = None) -> int:
 
     agents_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    service_plist.write_bytes(build_service_plist(repo_root, log_dir))
-    updater_plist.write_bytes(build_updater_plist(repo_root, log_dir, interval_seconds=args.update_interval))
+    service_plist.write_bytes(build_service_plist(repo_root, log_dir, env_file=env_file))
+    updater_plist.write_bytes(
+        build_updater_plist(repo_root, log_dir, interval_seconds=args.update_interval, env_file=env_file)
+    )
 
     print(f"Wrote {service_plist}")
     print(f"Wrote {updater_plist}")
