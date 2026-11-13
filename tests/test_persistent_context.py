@@ -13,6 +13,7 @@ leaked — on both the re-raise path and the persistent local-display fallback.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, cast
@@ -541,4 +542,35 @@ async def test_headed_start_geometry_timeout_is_best_effort(
     monkeypatch.setattr(stub.chromium, "launch_persistent_context", _launch_zero)
     worker = PlaywrightBrowserWorker("worker_geom_timeout")
     await worker.start()
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_headed_start_stalled_geometry_evaluate_is_bounded_by_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung page.evaluate() during startup must be cancelled by the geometry
+    deadline rather than blocking worker.start() indefinitely."""
+    monkeypatch.setenv("BROWSER_CONTEXT_PERSISTENT", "1")
+    monkeypatch.setattr(runtime_module, "_WINDOW_GEOMETRY_TIMEOUT_SECONDS", 0.02)
+    stub = _patch_playwright(monkeypatch)
+    _no_remote_display(monkeypatch)
+    never = asyncio.Event()
+
+    class _StalledGeometryPage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+
+        async def evaluate(self, _expression: str) -> Any:
+            await never.wait()
+            return False
+
+    async def _launch_stalled(user_data_dir: str, **kwargs: Any) -> _StubContext:
+        stub.chromium.persistent_calls.append({"user_data_dir": user_data_dir, **kwargs})
+        return _StubContext(cast(Any, [_StalledGeometryPage()]))
+
+    monkeypatch.setattr(stub.chromium, "launch_persistent_context", _launch_stalled)
+    worker = PlaywrightBrowserWorker("worker_geom_stalled")
+    async with asyncio.timeout(0.5):
+        await worker.start()
     await worker.close()

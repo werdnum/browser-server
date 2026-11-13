@@ -13,7 +13,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1484,20 +1483,15 @@ class PlaywrightBrowserWorker:
         evaluate = getattr(page, "evaluate", None)
         if not callable(evaluate):
             return
-        deadline = time.monotonic() + _WINDOW_GEOMETRY_TIMEOUT_SECONDS
-        while True:
-            try:
-                ready = await evaluate("window.outerWidth > 0 && window.outerHeight > 0")
-            except Exception:
-                return
-            if not isinstance(ready, bool):
-                return
-            if ready:
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(_WINDOW_GEOMETRY_POLL_SECONDS, remaining))
+        try:
+            async with asyncio.timeout(_WINDOW_GEOMETRY_TIMEOUT_SECONDS):
+                while True:
+                    ready = await evaluate("window.outerWidth > 0 && window.outerHeight > 0")
+                    if not isinstance(ready, bool) or ready:
+                        return
+                    await asyncio.sleep(_WINDOW_GEOMETRY_POLL_SECONDS)
+        except Exception:
+            return
 
     async def _demasked_headless_user_agent(self) -> str | None:
         """Return the browser's own UA with the ``HeadlessChrome`` token rewritten to ``Chrome``,
