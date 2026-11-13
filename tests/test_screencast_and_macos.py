@@ -294,19 +294,41 @@ class _StubPage:
         self.mouse = _StubMouse()
         self.keyboard = _StubKeyboard()
         self.nav_calls: list[tuple[str, str]] = []
+        self.fail_next_nav: Exception | None = None
+        self.on_goto: Any = None
 
     def is_closed(self) -> bool:
         return self.closed
 
     async def goto(self, url: str, **_kwargs: Any) -> None:
-        self.url = url
         self.nav_calls.append(("goto", url))
+        try:
+            if self.fail_next_nav is not None:
+                err = self.fail_next_nav
+                self.fail_next_nav = None
+                self.url = "chrome-error://chromewebdata/"
+                raise err
+            self.url = url
+        finally:
+            if callable(self.on_goto):
+                self.on_goto()
 
-    async def go_back(self) -> None:
+    async def go_back(self, **_kwargs: Any) -> None:
         self.nav_calls.append(("back", ""))
+        if self.fail_next_nav is not None:
+            err = self.fail_next_nav
+            self.fail_next_nav = None
+            raise err
+
+    async def go_forward(self, **_kwargs: Any) -> None:
+        self.nav_calls.append(("forward", ""))
 
     async def reload(self, **_kwargs: Any) -> None:
         self.nav_calls.append(("reload", ""))
+        if self.fail_next_nav is not None:
+            err = self.fail_next_nav
+            self.fail_next_nav = None
+            raise err
 
 
 class _StubCDPSession:
@@ -390,6 +412,16 @@ async def test_cdp_screencast_session_never_enables_runtime_and_enforces_confine
         await sc.dispatch_input({"type": "navigate", "action": "goto", "url": "https://allowed.example/mfa"})
         assert page1.nav_calls == [("goto", "https://allowed.example/mfa")]
 
+        # Recoverable navigation errors (DNS/TLS/timeout) do not raise out of dispatch_input.
+        page1.fail_next_nav = RuntimeError("Page.goto: net::ERR_NAME_NOT_RESOLVED")
+        await sc.dispatch_input({"type": "navigate", "action": "goto", "url": "https://allowed.example/broken"})
+        await sc.dispatch_input({"type": "navigate", "action": "goto", "url": "https://allowed.example/recovered"})
+        assert page1.url == "https://allowed.example/recovered"
+        assert page1.nav_calls[-2:] == [
+            ("goto", "https://allowed.example/broken"),
+            ("goto", "https://allowed.example/recovered"),
+        ]
+
         # Opening a popup rebinds the CDP screencast session to the popup and updates worker._page.
         popup = _StubPage("https://allowed.example/popup")
         ctx.pages.append(popup)
@@ -401,6 +433,61 @@ async def test_cdp_screencast_session_never_enables_runtime_and_enforces_confine
     finally:
         await sc.close()
         assert ctx.cdp_sessions[-1][1].detached is True
+
+
+def test_screencast_websocket_survives_navigation_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "remote_display_status", lambda: RemoteDisplayStatus(available=False, reason="macOS"))
+    headers = {"authorization": f"Bearer {TEST_SERVICE_TOKEN}"}
+    pw_worker = PlaywrightBrowserWorker("w_ws_nav", width=800, height=600)
+    page1 = _StubPage("https://example.com/login")
+    ctx = _StubContext([page1])
+    pw_worker._context = ctx  # type: ignore[assignment]
+    pw_worker._page = page1  # type: ignore[assignment]
+
+    def _emit_nav_frame() -> None:
+        _, cdp = ctx.cdp_sessions[-1]
+        cdp.handlers["Page.screencastFrame"](
+            {
+                "data": "ZnJhbWU=",
+                "sessionId": len(page1.nav_calls) + 10,
+                "metadata": {"deviceWidth": 800, "deviceHeight": 600},
+            }
+        )
+
+    page1.on_goto = _emit_nav_frame
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"conversation_id": "conv_ws_nav_err", "initial_owner": "human"},
+        )
+        assert created.status_code == 200
+        session_id = created.json()["session_id"]
+        control_token = created.json()["control_token"]
+        registry.workers[created.json()["worker_id"]] = pw_worker
+
+        with client.websocket_connect(f"/v1/sessions/{session_id}/screencast?token={control_token}") as ws:
+            _, cdp = ctx.cdp_sessions[0]
+            cdp.handlers["Page.screencastFrame"](
+                {"data": "Zmlyc3Q=", "sessionId": 1, "metadata": {"deviceWidth": 800, "deviceHeight": 600}}
+            )
+            first = json.loads(ws.receive_text())
+            assert first["url"] == "https://example.com/login"
+
+            # Trigger a DNS/TLS failure via goto, then recover with a valid URL on the same WebSocket.
+            page1.fail_next_nav = RuntimeError("Page.goto: net::ERR_CERT_AUTHORITY_INVALID")
+            ws.send_text(json.dumps({"type": "navigate", "action": "goto", "url": "https://typo.example/"}))
+            err_frame = json.loads(ws.receive_text())
+            assert err_frame["url"] == "chrome-error://chromewebdata/"
+
+            ws.send_text(json.dumps({"type": "navigate", "action": "goto", "url": "https://example.com/fixed"}))
+            recovered = json.loads(ws.receive_text())
+            assert recovered["url"] == "https://example.com/fixed"
+            assert page1.nav_calls == [
+                ("goto", "https://typo.example/"),
+                ("goto", "https://example.com/fixed"),
+            ]
 
 
 def test_macos_launch_agent_plist_generation_and_env_seed(tmp_path: Path) -> None:

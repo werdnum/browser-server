@@ -2197,6 +2197,7 @@ _SCREENCAST_ALLOWED_KEYS = frozenset(
     }
 )
 _SCREENCAST_MAX_TEXT_CHARS = 16384
+_SCREENCAST_NAV_TIMEOUT_MS = 15_000
 
 
 def _clamp_coord(value: Any, *, low: float = 0.0, high: float = 16384.0) -> float | None:
@@ -2352,36 +2353,49 @@ class CDPScreencastSession:
     async def dispatch_input(self, message: dict[str, Any]) -> None:
         if self._closed or self._worker.closed:
             return
-        page = await self._sync_active_page()
+        try:
+            page = await self._sync_active_page()
+        except RuntimeUnavailable:
+            raise
+        except Exception:
+            if self._worker.closed:
+                raise RuntimeUnavailable("worker is closed") from None
+            logger.debug("Screencast failed to bind active page for input", exc_info=True)
+            return
         msg_type = message.get("type")
-        if msg_type == "mouse":
-            await self._dispatch_mouse(page, message)
-        elif msg_type == "wheel":
-            dx = _clamp_coord(message.get("deltaX", 0.0), low=-16384.0, high=16384.0)
-            dy = _clamp_coord(message.get("deltaY", 0.0), low=-16384.0, high=16384.0)
-            if dx is not None and dy is not None:
-                await page.mouse.wheel(dx, dy)
-        elif msg_type == "text":
-            text = str(message.get("text") or "")[:_SCREENCAST_MAX_TEXT_CHARS]
-            if len(text) == 1:
-                await page.keyboard.type(text)
-            elif text:
-                await page.keyboard.insert_text(text)
-        elif msg_type == "key":
-            raw_key = str(message.get("key") or "")
-            shift_prefix = "Shift+" if raw_key.startswith("Shift+") else ""
-            base_key = raw_key.removeprefix("Shift+")
-            if base_key in _SCREENCAST_ALLOWED_KEYS:
-                normalized_base = "Space" if base_key == " " else base_key
-                await page.keyboard.press(f"{shift_prefix}{normalized_base}")
-        elif msg_type == "shortcut":
-            action = message.get("action")
-            if action == "select_all":
-                await page.keyboard.press("ControlOrMeta+KeyA")
-            elif action == "backspace_word":
-                await page.keyboard.press("Alt+Backspace" if sys.platform == "darwin" else "Control+Backspace")
-        elif msg_type == "navigate":
-            await self._dispatch_navigate(page, message)
+        try:
+            if msg_type == "mouse":
+                await self._dispatch_mouse(page, message)
+            elif msg_type == "wheel":
+                dx = _clamp_coord(message.get("deltaX", 0.0), low=-16384.0, high=16384.0)
+                dy = _clamp_coord(message.get("deltaY", 0.0), low=-16384.0, high=16384.0)
+                if dx is not None and dy is not None:
+                    await page.mouse.wheel(dx, dy)
+            elif msg_type == "text":
+                text = str(message.get("text") or "")[:_SCREENCAST_MAX_TEXT_CHARS]
+                if len(text) == 1:
+                    await page.keyboard.type(text)
+                elif text:
+                    await page.keyboard.insert_text(text)
+            elif msg_type == "key":
+                raw_key = str(message.get("key") or "")
+                shift_prefix = "Shift+" if raw_key.startswith("Shift+") else ""
+                base_key = raw_key.removeprefix("Shift+")
+                if base_key in _SCREENCAST_ALLOWED_KEYS:
+                    normalized_base = "Space" if base_key == " " else base_key
+                    await page.keyboard.press(f"{shift_prefix}{normalized_base}")
+            elif msg_type == "shortcut":
+                action = message.get("action")
+                if action == "select_all":
+                    await page.keyboard.press("ControlOrMeta+KeyA")
+                elif action == "backspace_word":
+                    await page.keyboard.press("Alt+Backspace" if sys.platform == "darwin" else "Control+Backspace")
+            elif msg_type == "navigate":
+                await self._dispatch_navigate(page, message)
+        except Exception:
+            if self._worker.closed:
+                raise RuntimeUnavailable("worker is closed") from None
+            logger.debug("Screencast ignored recoverable %s dispatch error", msg_type, exc_info=True)
 
     async def _dispatch_mouse(self, page: Any, message: dict[str, Any]) -> None:
         x = _clamp_coord(message.get("x"))
@@ -2413,13 +2427,13 @@ class CDPScreencastSession:
     async def _dispatch_navigate(self, page: Any, message: dict[str, Any]) -> None:
         action = message.get("action")
         if action == "back":
-            await page.go_back()
+            await page.go_back(wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
             return
         if action == "forward":
-            await page.go_forward()
+            await page.go_forward(wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
             return
         if action == "reload":
-            await page.reload(wait_until="domcontentloaded")
+            await page.reload(wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
             return
         if action == "goto":
             url = str(message.get("url") or "").strip()
@@ -2432,7 +2446,7 @@ class CDPScreencastSession:
                 and origin_of(url) not in set(self._worker.confine_origins)
             ):
                 return
-            await page.goto(url, wait_until="domcontentloaded")
+            await page.goto(url, wait_until="domcontentloaded", timeout=_SCREENCAST_NAV_TIMEOUT_MS)
 
     async def _detach_cdp(self) -> None:
         cdp = self._cdp

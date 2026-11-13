@@ -636,7 +636,7 @@ SESSION_DETAIL_TEMPLATE = templates.from_string(
         if (msg.type !== "frame" || !msg.data) return;
         if (msg.width > 0) deviceWidth = msg.width;
         if (msg.height > 0) deviceHeight = msg.height;
-        if (typeof msg.url === "string" && document.activeElement !== urlInput) {
+        if (typeof msg.url === "string" && /^https?:[/][/]/i.test(msg.url) && document.activeElement !== urlInput) {
           urlInput.value = msg.url;
         }
         const img = new Image();

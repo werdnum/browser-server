@@ -79,7 +79,25 @@ test("human can interact with CDP screencast canvas and address bar when noVNC i
       url: "https://example.com/login"
     }));
     ws.onMessage(message => {
-      receivedMessages.push(JSON.parse(String(message)));
+      const parsed = JSON.parse(String(message));
+      receivedMessages.push(parsed);
+      if (parsed.type === "navigate" && parsed.action === "goto") {
+        ws.send(JSON.stringify({
+          type: "frame",
+          data: tinyJpeg,
+          width: 1280,
+          height: 800,
+          url: "chrome-error://chromewebdata/"
+        }));
+      } else if (parsed.type === "navigate" && parsed.action === "reload") {
+        ws.send(JSON.stringify({
+          type: "frame",
+          data: tinyJpeg,
+          width: 1280,
+          height: 800,
+          url: "https://example.org/dashboard"
+        }));
+      }
     });
   });
 
@@ -108,6 +126,10 @@ test("human can interact with CDP screencast canvas and address bar when noVNC i
   await expect.poll(() => receivedMessages.some(
     m => m.type === "navigate" && m.action === "goto" && m.url === "https://example.org/dashboard"
   )).toBeTruthy();
+  await expect(urlInput).toHaveValue("example.org/dashboard");
+
+  await page.locator("#viewport .screencast-bar").getByTitle("Reload").click();
+  await expect(urlInput).toHaveValue("https://example.org/dashboard");
 
   await page.getByRole("button", { name: "Complete" }).click();
   await expect(page.locator("#state")).toHaveText("completed");
