@@ -19,6 +19,7 @@ from functools import lru_cache
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 
 from .models import AgentCommandRequest
@@ -2466,17 +2467,18 @@ class CDPScreencastSession:
         if self._closed:
             return
         self._closed = True
-        if self._watch_task is not None:
-            self._watch_task.cancel()
-            try:
-                await self._watch_task
-            except asyncio.CancelledError:
-                pass
-            self._watch_task = None
-        for task in list(self._bg_tasks):
-            task.cancel()
-        self._bg_tasks.clear()
-        await self._detach_cdp()
+        with anyio.CancelScope(shield=True):
+            if self._watch_task is not None:
+                self._watch_task.cancel()
+                try:
+                    await self._watch_task
+                except asyncio.CancelledError:
+                    pass
+                self._watch_task = None
+            for task in list(self._bg_tasks):
+                task.cancel()
+            self._bg_tasks.clear()
+            await self._detach_cdp()
 
 
 @dataclass(frozen=True)
