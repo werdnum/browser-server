@@ -62,9 +62,14 @@ RUN mkdir -p /etc/apt/keyrings \
 COPY pyproject.toml README.md ./
 COPY browser_handoff_service ./browser_handoff_service
 
+# pip is removed once the install is done: nothing at runtime uses it, and it vendors its own
+# copies of setuptools (pkg_resources), urllib3, certifi and others that vulnerability scanners
+# report and that no dependency upgrade here can reach.
 RUN python -m pip install --no-cache-dir --upgrade pip \
   && python -m pip install --no-cache-dir . \
   && patchright install chromium \
+  && python -m pip uninstall --yes pip \
+  && ! python -c 'import pip' 2>/dev/null \
   && useradd --create-home --shell /usr/sbin/nologin appuser \
   && mkdir -p /var/lib/browser-handoff/jars \
   && chown -R appuser:appuser /app /ms-playwright /var/lib/browser-handoff
