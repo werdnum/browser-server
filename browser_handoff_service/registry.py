@@ -79,6 +79,7 @@ class SessionInactiveError(ConflictError):
 PAGE_STATE_COMMANDS = {
     "navigate",
     "click",
+    "hover",
     "type_text",
     "select",
     "press_key",

@@ -864,17 +864,28 @@ class BrowserRuntime(Protocol):
     ) -> dict[str, Any]: ...
 
 
+DEFAULT_DISPLAY_WIDTH = 1280
+DEFAULT_DISPLAY_HEIGHT = 720
+
+
 class FakeBrowserWorker:
     def __init__(
         self,
         worker_id: str,
         *,
+        width: int = DEFAULT_DISPLAY_WIDTH,
+        height: int = DEFAULT_DISPLAY_HEIGHT,
         storage_state: dict[str, Any] | None = None,
         confine_origins: list[str] | None = None,
         timezone_id: str | None = None,
         mask_protected: bool = False,
     ) -> None:
         self.worker_id = worker_id
+        self.width = width
+        self.height = height
+        self.device_pixel_ratio: float = 1.0
+        self.scroll_x: float = 0.0
+        self.scroll_y: float = 0.0
         self.closed = False
         self.remote_url: str | None = None
         self.url: str | None = None
@@ -1006,7 +1017,7 @@ class FakeBrowserWorker:
             # A new document takes the autofill nonce with it, exactly as the real one does.
             self._autofill_nonce = None
             return {"url": redact_url(target)[0], "title": self.title}
-        if request.type in {"click", "type_text", "select", "press_key"}:
+        if request.type in {"click", "hover", "type_text", "select", "press_key"}:
             raw_ref = request.args.get("ref") if request.type != "press_key" else None
             if raw_ref is not None:
                 url = redact_url(self.url)[0] if self.url else None
@@ -1037,7 +1048,16 @@ class FakeBrowserWorker:
             png = base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
             )
-            return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}
+            return {
+                "mime_type": "image/png",
+                "image_base64": base64.b64encode(png).decode("ascii"),
+                "url": redact_url(self.url)[0] if self.url else None,
+                "viewport_width": float(self.width),
+                "viewport_height": float(self.height),
+                "device_pixel_ratio": float(self.device_pixel_ratio),
+                "scroll_x": float(self.scroll_x),
+                "scroll_y": float(self.scroll_y),
+            }
         if request.type == "current_page":
             return {"url": redact_url(self.url)[0] if self.url else None, "title": self.title}
         if request.type == "extract":
@@ -1184,9 +1204,6 @@ class FakeBrowserWorker:
     async def close(self) -> None:
         self.closed = True
 
-
-DEFAULT_DISPLAY_WIDTH = 1280
-DEFAULT_DISPLAY_HEIGHT = 720
 
 # Persistent-profile deletion at session close: a just-exited Chromium (crashpad
 # handler, SingletonLock) can still hold profile files for a moment on Linux, so
@@ -1670,6 +1687,10 @@ class PlaywrightBrowserWorker:
             else:
                 await page.locator(target).click(timeout=timeout)
             return await self._current_page_result({"accepted": True})
+        if request.type == "hover":
+            await self._human_pause(0.05, 0.2)
+            await page.locator(target).hover(timeout=timeout)
+            return await self._current_page_result({"accepted": True})
         if request.type == "type_text":
             locator = page.locator(target)
             text = str(request.args["text"])
@@ -1775,7 +1796,7 @@ class PlaywrightBrowserWorker:
                 }
             title = await self._safe_title(page)
             return {"url": redact_url(page.url)[0], "title": title}
-        if request.type in {"click", "type_text", "select"}:
+        if request.type in {"click", "hover", "type_text", "select"}:
             from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
             target = await self._resolve_action_target(request, page)
@@ -1832,7 +1853,13 @@ class PlaywrightBrowserWorker:
                 )
             else:
                 png = await page.screenshot(type="png", full_page=False)
-            return {"mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii")}
+            geometry = await self._safe_viewport_geometry(page)
+            return {
+                "mime_type": "image/png",
+                "image_base64": base64.b64encode(png).decode("ascii"),
+                "url": redact_url(page.url)[0],
+                **geometry,
+            }
         if request.type == "extract":
             selector = request.args.get("selector")
             if selector:
@@ -2160,6 +2187,36 @@ class PlaywrightBrowserWorker:
         the whole command.
         """
         return await self._with_navigation_recovery(page, page.title, fallback=lambda: "")
+
+    async def _safe_viewport_geometry(self, page: Any) -> dict[str, float]:
+        """Read CSS viewport dimensions, DPR, and scroll offset best-effort.
+
+        Runs inside the trusted worker runtime so credential-protected sessions
+        (where agent ``exec`` is denied) still report the exact coordinate space
+        of the captured screenshot. Falls back to an empty dict on any error so
+        a navigation race never fails a screenshot.
+        """
+        try:
+            async with asyncio.timeout(2.0):
+                raw = await page.evaluate(
+                    "() => ({"
+                    "viewport_width: window.innerWidth, "
+                    "viewport_height: window.innerHeight, "
+                    "device_pixel_ratio: window.devicePixelRatio || 1, "
+                    "scroll_x: window.scrollX, "
+                    "scroll_y: window.scrollY"
+                    "})"
+                )
+        except Exception:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key in ("viewport_width", "viewport_height", "device_pixel_ratio", "scroll_x", "scroll_y"):
+            val = raw.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[key] = float(val)
+        return out
 
     async def close(self) -> None:
         self.closed = True
@@ -2717,6 +2774,8 @@ def make_worker(
     if runtime == "fake":
         return FakeBrowserWorker(
             worker_id,
+            width=width,
+            height=height,
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=resolved_timezone_id,

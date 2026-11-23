@@ -155,6 +155,7 @@ class AgentCommandRequest(BaseModel):
     type: Literal[
         "navigate",
         "click",
+        "hover",
         "type_text",
         "select",
         "press_key",
