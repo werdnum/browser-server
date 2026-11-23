@@ -227,3 +227,64 @@ async def test_playwright_worker_hover_and_screenshot_geometry():
     fallback_shot = await worker._dispatch_command(AgentCommandRequest(type="screenshot"), failing_page)
     assert fallback_shot["mime_type"] == "image/png"
     assert "viewport_width" not in fallback_shot
+
+
+@pytest.mark.asyncio
+async def test_playwright_worker_screenshot_omits_unstable_or_non_finite_geometry():
+    from browser_handoff_service.runtime import PlaywrightBrowserWorker
+
+    class _DriftingPage:
+        def __init__(self) -> None:
+            self.url = "https://example.test/page"
+            self.eval_calls = 0
+
+        async def screenshot(self, **_kwargs: object) -> bytes:
+            return base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            )
+
+        async def evaluate(self, _script: str, _arg: object = None) -> object:
+            self.eval_calls += 1
+            return {
+                "viewport_width": 1280,
+                "viewport_height": 720,
+                "device_pixel_ratio": 1,
+                "scroll_x": 0,
+                "scroll_y": 0 if self.eval_calls == 1 else 300,
+            }
+
+    class _NonFinitePage:
+        url = "https://example.test/page"
+
+        async def screenshot(self, **_kwargs: object) -> bytes:
+            return base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            )
+
+        async def evaluate(self, _script: str, _arg: object = None) -> object:
+            return {
+                "viewport_width": 1280,
+                "viewport_height": 0,
+                "device_pixel_ratio": float("nan"),
+                "scroll_x": float("inf"),
+                "scroll_y": 50,
+            }
+
+    worker = PlaywrightBrowserWorker("w_geom_guard")
+    worker.stealth = False
+
+    drifting = _DriftingPage()
+    worker._page = drifting
+    drift_shot = await worker._dispatch_command(AgentCommandRequest(type="screenshot"), drifting)
+    assert drift_shot["mime_type"] == "image/png"
+    assert "viewport_width" not in drift_shot
+    assert "scroll_y" not in drift_shot
+
+    non_finite = _NonFinitePage()
+    worker._page = non_finite
+    nf_shot = await worker._dispatch_command(AgentCommandRequest(type="screenshot"), non_finite)
+    assert nf_shot["viewport_width"] == 1280.0
+    assert nf_shot["scroll_y"] == 50.0
+    assert "viewport_height" not in nf_shot
+    assert "device_pixel_ratio" not in nf_shot
+    assert "scroll_x" not in nf_shot

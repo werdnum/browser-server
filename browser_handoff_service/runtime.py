@@ -1845,6 +1845,8 @@ class PlaywrightBrowserWorker:
                 result["ucp"] = hint
             return result
         if request.type == "screenshot":
+            url_before = page.url
+            geom_before = await self._safe_viewport_geometry(page)
             if self.mask_protected:
                 # A revealed ("show password") field is a picture of the secret, so the pixels
                 # are masked at the capture itself rather than after the fact.
@@ -1853,11 +1855,16 @@ class PlaywrightBrowserWorker:
                 )
             else:
                 png = await page.screenshot(type="png", full_page=False)
-            geometry = await self._safe_viewport_geometry(page)
+            url_after = page.url
+            geom_after = await self._safe_viewport_geometry(page)
+            # Only attach viewport geometry when the page URL, viewport size, DPR, and scroll
+            # stayed stable across the screenshot capture; omit it on mid-capture drift rather
+            # than pairing the PNG with a later viewport's coordinates.
+            geometry = geom_after if url_before == url_after and geom_before == geom_after else {}
             return {
                 "mime_type": "image/png",
                 "image_base64": base64.b64encode(png).decode("ascii"),
-                "url": redact_url(page.url)[0],
+                "url": redact_url(url_after)[0],
                 **geometry,
             }
         if request.type == "extract":
@@ -2212,10 +2219,13 @@ class PlaywrightBrowserWorker:
         if not isinstance(raw, dict):
             return {}
         out: dict[str, float] = {}
+        positive_keys = {"viewport_width", "viewport_height", "device_pixel_ratio"}
         for key in ("viewport_width", "viewport_height", "device_pixel_ratio", "scroll_x", "scroll_y"):
             val = raw.get(key)
             if isinstance(val, (int, float)) and not isinstance(val, bool):
-                out[key] = float(val)
+                fval = float(val)
+                if math.isfinite(fval) and (key not in positive_keys or fval > 0):
+                    out[key] = fval
         return out
 
     async def close(self) -> None:
