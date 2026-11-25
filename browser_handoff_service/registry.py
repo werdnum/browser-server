@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, cast
@@ -33,9 +34,13 @@ from .models import (
     CookieJarMeta,
     CreateSessionRequest,
     FilledField,
+    FillPaymentRequest,
+    FillPaymentResponse,
     HandoffRequest,
     JarProbeConfig,
     LeaseOwner,
+    PaymentFilledField,
+    PaymentFillRefusal,
     PendingAutofill,
     ProbeResult,
     ProbeResultName,
@@ -46,6 +51,7 @@ from .models import (
     form_factor_profile,
     new_session,
     now_utc,
+    payment_fill_refused,
 )
 from .runtime import BrowserRuntime, RuntimeUnavailable, StorageTooLarge, make_worker
 from .security import hash_token, mint_token, redact_url
@@ -157,6 +163,70 @@ _AUTOFILL_DETAILS = {
     "invalid_ref": "a ref looks like e12",
     "target_invalidated": "the page changed under the request",
 }
+
+_PAYMENT_FILL_DETAILS: dict[str, str] = {
+    "insecure_origin": "payment fill requires an HTTPS document",
+    "wrong_origin": "the current document origin does not match expected_origin",
+    "target_invalidated": "the page changed before the payment fill landed",
+    "untrusted_payment_frame": "candidate payment fields live in an unrecognized third-party frame",
+    "ambiguous_fields": "multiple matching payment fields were found; specify explicit fields by ref",
+    "no_eligible_field": "no eligible payment field on this page can take the fill",
+    "invalid_ref": "a ref must be a valid walker ref (e.g. e12) naming an existing control",
+}
+
+_PAYMENT_REF_RE = re.compile(r"e[0-9]+")
+
+
+def _available_payment_kinds(req: FillPaymentRequest) -> list[str]:
+    """List the payment field kinds this request has values for (in canonical fill order)."""
+    kinds = ["card_number", "card_exp", "card_exp_month", "card_exp_year", "card_cvc"]
+    if req.card.cardholder_name and req.card.cardholder_name.strip():
+        kinds.append("card_name")
+    addr = req.billing_address
+    if addr is not None:
+        for attr, kind in (
+            ("name", "billing_name"),
+            ("line1", "billing_line1"),
+            ("line2", "billing_line2"),
+            ("city", "billing_city"),
+            ("state", "billing_state"),
+            ("postal_code", "billing_postal_code"),
+            ("country", "billing_country"),
+        ):
+            val = getattr(addr, attr)
+            if isinstance(val, str) and val.strip():
+                kinds.append(kind)
+    return kinds
+
+
+def _payment_values(req: FillPaymentRequest) -> dict[str, str]:
+    """Materialize transient plaintext payment strings right before filling; caller clears immediately."""
+    raw_number = req.card.number.get_secret_value().strip()
+    compact_number = re.sub(r"[\s-]+", "", raw_number)
+    values: dict[str, str] = {
+        "card_number": compact_number or raw_number,
+        "card_exp": f"{req.card.exp_month:02d}/{req.card.exp_year % 100:02d}",
+        "card_exp_month": f"{req.card.exp_month:02d}",
+        "card_exp_year": str(req.card.exp_year),
+        "card_cvc": req.card.cvc.get_secret_value().strip(),
+    }
+    if req.card.cardholder_name and req.card.cardholder_name.strip():
+        values["card_name"] = req.card.cardholder_name.strip()
+    addr = req.billing_address
+    if addr is not None:
+        for attr, kind in (
+            ("name", "billing_name"),
+            ("line1", "billing_line1"),
+            ("line2", "billing_line2"),
+            ("city", "billing_city"),
+            ("state", "billing_state"),
+            ("postal_code", "billing_postal_code"),
+            ("country", "billing_country"),
+        ):
+            val = getattr(addr, attr)
+            if isinstance(val, str) and val.strip():
+                values[kind] = val.strip()
+    return values
 
 
 def _origin_host_port(origin: str) -> tuple[str, int]:
@@ -316,6 +386,7 @@ class SessionRegistry:
             session.allow_exec = False
             session.confine_navigation = True
         session.autofill_enabled = req.autofill_enabled or req.authenticated_site
+        session.readback_protected = session.autofill_enabled
         if session.autofill_enabled:
             session.allow_exec = False
         session.confine_origins = list(confine_origins or [])
@@ -331,7 +402,7 @@ class SessionRegistry:
             storage_state=storage_state,
             confine_origins=confine_origins,
             timezone_id=session.timezone_id,
-            mask_protected=session.autofill_enabled,
+            mask_protected=session.readback_protected,
         )
         self.workers[session.worker_id or ""] = worker
         try:
@@ -652,11 +723,12 @@ class SessionRegistry:
             if req.type == "exec" and session.jar_id is not None and not session.allow_exec:
                 raise AuthorizationError("exec is denied in a jar-loaded session unless allow_exec was set")
             # Read-back protection. exec and extract both hand the raw DOM (a filled password
-            # field included) straight to the model, so neither exists in an authenticated-site
-            # session — jar or no jar, and with no opt-in.
-            if session.autofill_enabled and req.type in AUTHENTICATED_SITE_DENIED_COMMANDS:
+            # or payment field included) straight to the model, so neither exists once read-back
+            # protection is active (from creation on autofill/authenticated sessions, or latched
+            # monotonically on blind payment fill).
+            if session.readback_protected and req.type in AUTHENTICATED_SITE_DENIED_COMMANDS:
                 raise AuthorizationError(f"{req.type} is denied in a credential-protected session")
-            if session.autofill_enabled and _is_transfer_chord(req):
+            if session.readback_protected and _is_transfer_chord(req):
                 raise AuthorizationError(
                     "clipboard and transfer key chords are denied in a credential-protected session"
                 )
@@ -916,6 +988,149 @@ class SessionRegistry:
             FilledField(ref=entry.get("ref"), kind=entry["kind"]) for entry in cast(list, result.get("filled") or [])
         ]
         return AutofillResponse(status="filled", filled=filled, origin=origin)
+
+    # -- blind payment fill -------------------------------------------------
+
+    async def fill_payment(self, session_id: str, req: FillPaymentRequest) -> FillPaymentResponse:
+        """Blindly fill a payment card into verified controls on the current HTTPS document.
+
+        Serialized under the session command lock so no concurrent agent command can move the
+        document underneath target resolution and filling; page-initiated navigations are caught
+        by the document nonce. Latches session-level read-back protection monotonically right
+        before credentials touch the page, without enabling Keychute password autofill."""
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if session.state in TERMINAL_STATES:
+                raise SessionInactiveError(f"session is no longer active ({session.state})")
+            if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+                raise AuthorizationError("payment fill is denied unless the agent owns the lease")
+            await self._enforce_jar_not_revoked_locked(session)
+            response = await self._fill_payment_locked(session, req)
+            session.updated_at = now_utc()
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
+            self._event(
+                session,
+                "fill_payment",
+                "agent",
+                metadata={
+                    "status": response.status,
+                    "reason": response.reason,
+                    "origin": response.origin,
+                    "filled_count": len(response.filled),
+                },
+            )
+            return response
+
+    async def _fill_payment_locked(self, session: BrowserSession, req: FillPaymentRequest) -> FillPaymentResponse:
+        worker = self.workers.get(session.worker_id or "")
+        if worker is None or worker.closed:
+            raise ConflictError("worker is not available")
+
+        raw_expected = req.expected_origin.strip()
+        if raw_expected.lower().startswith("http://"):
+            return payment_fill_refused("insecure_origin", _PAYMENT_FILL_DETAILS["insecure_origin"])
+        expected_origin = normalize_origin(raw_expected)
+        if expected_origin is None:
+            return payment_fill_refused("wrong_origin", "expected_origin is not a valid HTTPS origin")
+        if not expected_origin.startswith("https://"):
+            return payment_fill_refused("insecure_origin", _PAYMENT_FILL_DETAILS["insecure_origin"])
+
+        available_kinds = _available_payment_kinds(req)
+        fields_payload: list[dict[str, Any]] | None = None
+        if req.fields is not None:
+            seen_refs: set[str] = set()
+            seen_kinds: set[str] = set()
+            fields_payload = []
+            for spec in req.fields:
+                if not _PAYMENT_REF_RE.fullmatch(spec.ref):
+                    return payment_fill_refused("invalid_ref", _PAYMENT_FILL_DETAILS["invalid_ref"])
+                if spec.ref in seen_refs or spec.kind in seen_kinds:
+                    return payment_fill_refused("ambiguous_fields", _PAYMENT_FILL_DETAILS["ambiguous_fields"])
+                seen_refs.add(spec.ref)
+                seen_kinds.add(spec.kind)
+                if spec.kind not in available_kinds:
+                    return payment_fill_refused(
+                        "no_eligible_field", f"no value provided for requested payment field {spec.kind}"
+                    )
+                fields_payload.append({"ref": spec.ref, "kind": spec.kind})
+
+        nonce = uuid4().hex
+        prepared = await worker.payment_prepare(expected_origin, fields_payload, available_kinds, nonce)
+        if prepared.get("error"):
+            reason = str(prepared.get("reason") or "no_eligible_field")
+            if reason not in _PAYMENT_FILL_DETAILS:
+                reason = "no_eligible_field"
+            return payment_fill_refused(
+                cast(PaymentFillRefusal, reason),
+                _PAYMENT_FILL_DETAILS[reason],
+                origin=prepared.get("origin"),
+            )
+
+        origin = normalize_origin(str(prepared.get("origin") or ""))
+        if origin is None or not origin.startswith("https://"):
+            return payment_fill_refused("insecure_origin", _PAYMENT_FILL_DETAILS["insecure_origin"], origin=origin)
+        if origin != expected_origin:
+            return payment_fill_refused("wrong_origin", _PAYMENT_FILL_DETAILS["wrong_origin"], origin=origin)
+        if session.confine_navigation and origin not in set(session.confine_origins):
+            return payment_fill_refused(
+                "wrong_origin",
+                "the current document is not inside this session's confinement set",
+                origin=origin,
+            )
+
+        targets = list(prepared.get("targets") or [])
+        if not targets:
+            return payment_fill_refused("no_eligible_field", _PAYMENT_FILL_DETAILS["no_eligible_field"], origin=origin)
+
+        self._raise_if_expired(session)
+        await self._enforce_jar_not_revoked_locked(session)
+
+        # Monotonically latch post-fill read-back protection before any credential touches the page
+        # (denying subsequent exec/extract/transfer chords and masking screenshots/snapshots). This
+        # is narrower than creation-time ``autofill_enabled``: in an ordinary session that already
+        # ran ``exec`` before payment fill, an earlier main-frame listener could observe a top-frame
+        # card input (cross-origin payment iframes are unreachable from main-frame ``exec``). That
+        # single-use virtual card residual is explicitly accepted in the Link Agent Wallet design.
+        session.readback_protected = True
+        session.allow_exec = False
+        await worker.enable_readback_protection()
+
+        values: dict[str, str] = {}
+        try:
+            values = _payment_values(req)
+            result = await worker.payment_fill(
+                nonce,
+                expected_origin,
+                targets,
+                values,
+                exp_month=req.card.exp_month,
+                exp_year=req.card.exp_year,
+            )
+        finally:
+            values.clear()
+
+        if result.get("error"):
+            reason = str(result.get("reason") or "target_invalidated")
+            if reason not in _PAYMENT_FILL_DETAILS:
+                reason = "target_invalidated"
+            return payment_fill_refused(
+                cast(PaymentFillRefusal, reason),
+                _PAYMENT_FILL_DETAILS[reason],
+                origin=origin,
+            )
+
+        filled = [
+            PaymentFilledField(
+                ref=entry.get("ref"),
+                kind=entry["kind"],
+                frame_origin=str(entry["frame_origin"]),
+            )
+            for entry in cast(list[dict[str, Any]], result.get("filled") or [])
+        ]
+        if not filled:
+            return payment_fill_refused("no_eligible_field", _PAYMENT_FILL_DETAILS["no_eligible_field"], origin=origin)
+        return FillPaymentResponse(status="filled", filled=filled, origin=origin)
 
     # -- cookie jars --------------------------------------------------------
     def _require_jars_enabled(self) -> None:

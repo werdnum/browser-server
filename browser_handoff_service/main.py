@@ -18,6 +18,8 @@ import httpx
 import jwt
 import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from jinja2 import Environment, StrictUndefined, select_autoescape
 from pydantic import HttpUrl, TypeAdapter, ValidationError
@@ -44,6 +46,8 @@ from .models import (
     CookieJarMeta,
     CreateSessionRequest,
     ExtendRequest,
+    FillPaymentRequest,
+    FillPaymentResponse,
     HandoffRequest,
     HandoffResponse,
     HandoverRequest,
@@ -896,6 +900,22 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> Response:
+    if request.url.path.rstrip("/").endswith("/fill-payment"):
+        # Never echo raw request payloads (card.number / card.cvc) back in 422 validation errors.
+        sanitized = [
+            {
+                "type": err.get("type", "value_error"),
+                "loc": list(err.get("loc", ())),
+                "msg": err.get("msg", "validation error"),
+            }
+            for err in exc.errors()
+        ]
+        return JSONResponse({"detail": sanitized}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
+
+
 OIDC_JWKS_URL_ENV = "BROWSER_HANDOFF_OIDC_JWKS_URL"
 OIDC_AUDIENCE_ENV = "BROWSER_HANDOFF_OIDC_AUDIENCE"
 OIDC_ISSUER_ENV = "BROWSER_HANDOFF_OIDC_ISSUER"
@@ -1219,6 +1239,22 @@ async def autofill_outcome(session_id: str, req: AutofillOutcomeRequest):
     except Exception as exc:
         raise map_errors(exc) from exc
     return {"session_id": session.session_id, "autofill_bad_password": session.autofill_bad_password}
+
+
+@app.post(
+    "/v1/sessions/{session_id}/fill-payment",
+    response_model=FillPaymentResponse,
+    dependencies=[Depends(require_agent_auth)],
+)
+async def fill_payment(session_id: str, req: FillPaymentRequest):
+    """Blindly fill payment card details into verified controls on the current HTTPS page.
+
+    Policy and page refusals are HTTP 200 with a typed status/reason (matching /autofill),
+    while session/auth/worker infrastructure failures map to HTTP 4xx/5xx."""
+    try:
+        return await registry.fill_payment(session_id, req)
+    except Exception as exc:
+        raise map_errors(exc) from exc
 
 
 @app.post(

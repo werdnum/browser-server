@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, HttpUrl, StringConstraints
+from pydantic import BaseModel, Field, HttpUrl, SecretStr, StringConstraints, field_validator
 
 # A single origin/allowlist string, length-bounded so a save cannot inflate the cleartext jar
 # metadata (which is not covered by the storage/probe byte caps) with megabyte-long entries.
@@ -255,6 +255,10 @@ class BrowserSession(BaseModel):
     authenticated_site: bool = False
     # Credential protection from creation, with per-request Keychute secret selection.
     autofill_enabled: bool = False
+    # Monotonic read-back protection latch: initialized from autofill_enabled at creation and
+    # latched True on blind payment fill, denying exec/extract/transfer chords and masking
+    # screenshots without enabling Keychute password autofill.
+    readback_protected: bool = False
     confine_origins: list[str] = Field(default_factory=list)
     credential_alias: str | None = None
     # Autofill bookkeeping: the deterministic backstop cap, the bad-password latch, and the
@@ -353,6 +357,97 @@ class AutofillResponse(BaseModel):
 
 def autofill_refused(reason: AutofillRefusal, detail: str, origin: str | None = None) -> AutofillResponse:
     return AutofillResponse(status="refused", reason=reason, detail=detail, origin=origin)
+
+
+# --- blind payment fill ---------------------------------------------------
+
+PaymentFieldKind = Literal[
+    "card_number",
+    "card_exp",
+    "card_exp_month",
+    "card_exp_year",
+    "card_cvc",
+    "card_name",
+    "billing_name",
+    "billing_line1",
+    "billing_line2",
+    "billing_city",
+    "billing_state",
+    "billing_postal_code",
+    "billing_country",
+]
+
+PaymentFillRefusal = Literal[
+    "insecure_origin",
+    "wrong_origin",
+    "target_invalidated",
+    "untrusted_payment_frame",
+    "ambiguous_fields",
+    "no_eligible_field",
+    "invalid_ref",
+]
+
+
+class PaymentCard(BaseModel):
+    """Payment card credentials held in SecretStr fields so repr/serialization never leaks them."""
+
+    number: SecretStr = Field(min_length=1, max_length=64)
+    exp_month: int = Field(ge=1, le=12)
+    exp_year: int = Field(ge=2000, le=2199)
+    cvc: SecretStr = Field(min_length=1, max_length=16)
+    cardholder_name: str | None = Field(default=None, max_length=256)
+
+    @field_validator("number", "cvc")
+    @classmethod
+    def _reject_blank_secret(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class PaymentBillingAddress(BaseModel):
+    name: str | None = Field(default=None, max_length=256)
+    line1: str | None = Field(default=None, max_length=256)
+    line2: str | None = Field(default=None, max_length=256)
+    city: str | None = Field(default=None, max_length=128)
+    state: str | None = Field(default=None, max_length=128)
+    postal_code: str | None = Field(default=None, max_length=64)
+    country: str | None = Field(default=None, max_length=128)
+
+
+class PaymentFieldTarget(BaseModel):
+    """A payment control addressed explicitly. ``ref`` is a walker ref (``e12``)."""
+
+    ref: str = Field(min_length=1, max_length=64)
+    kind: PaymentFieldKind
+
+
+class FillPaymentRequest(BaseModel):
+    expected_origin: BoundedOriginStr
+    card: PaymentCard
+    billing_address: PaymentBillingAddress | None = None
+    fields: list[PaymentFieldTarget] | None = Field(default=None, min_length=1, max_length=16)
+
+
+class PaymentFilledField(BaseModel):
+    """What was filled. ``ref`` is null for a field the walker has never stamped."""
+
+    ref: str | None = None
+    kind: PaymentFieldKind
+    frame_origin: str
+
+
+class FillPaymentResponse(BaseModel):
+    status: Literal["filled", "refused"]
+    filled: list[PaymentFilledField] = Field(default_factory=list)
+    origin: str | None = None
+    reason: PaymentFillRefusal | None = None
+    # Human-readable and secret-free by construction: built only from refusal codes and origins.
+    detail: str | None = None
+
+
+def payment_fill_refused(reason: PaymentFillRefusal, detail: str, origin: str | None = None) -> FillPaymentResponse:
+    return FillPaymentResponse(status="refused", reason=reason, detail=detail, origin=origin)
 
 
 class SessionEvent(BaseModel):
