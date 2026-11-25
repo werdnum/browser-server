@@ -752,6 +752,553 @@ _PROTECTED_DRAG_JS = r"""selector => {
   document[installed] = true;
 }"""
 
+# --- blind payment fill ---------------------------------------------------
+
+# Built-in fail-closed allowlist of hosted payment-processor domains permitted for
+# cross-origin payment iframes. Matched strictly on HTTPS standard port (443) with
+# exact domain or subdomain label boundary (never substring suffix matching).
+TRUSTED_PAYMENT_FRAME_DOMAINS: tuple[str, ...] = (
+    "stripe.com",
+    "stripe.network",
+    "adyen.com",
+    "adyenpayments.com",
+    "braintreegateway.com",
+    "braintree-api.com",
+    "paypal.com",
+    "shopifycs.com",
+    "shop.app",
+    "squareup.com",
+    "squarecdn.com",
+    "checkout.com",
+    "recurly.com",
+    "cybersource.com",
+    "authorize.net",
+    "worldpay.com",
+    "spreedly.com",
+    "basistheory.com",
+    "klarna.com",
+    "bluesnap.com",
+    "nmi.com",
+    "cardconnect.com",
+    "chasepaymentech.com",
+    "firstdata.com",
+    "vantiv.com",
+    "paymentech.com",
+    "verygoodvault.com",
+    "verygoodsecurity.com",
+    "ebanx.com",
+    "mollie.com",
+    "razorpay.com",
+    "payu.com",
+    "2checkout.com",
+    "paddle.com",
+    "fastspring.com",
+    "chargebee.com",
+    "zuora.com",
+    "ewaypayments.com",
+    "pinpayments.com",
+    "windcave.com",
+)
+
+_CORE_PAYMENT_CARD_KINDS = frozenset({"card_number", "card_exp", "card_exp_month", "card_exp_year", "card_cvc"})
+_SELECT_ALLOWED_PAYMENT_KINDS = frozenset({"card_exp_month", "card_exp_year", "billing_state", "billing_country"})
+
+_MONTH_NAMES: dict[int, tuple[str, str]] = {
+    1: ("january", "jan"),
+    2: ("february", "feb"),
+    3: ("march", "mar"),
+    4: ("april", "apr"),
+    5: ("may", "may"),
+    6: ("june", "jun"),
+    7: ("july", "jul"),
+    8: ("august", "aug"),
+    9: ("september", "sep"),
+    10: ("october", "oct"),
+    11: ("november", "nov"),
+    12: ("december", "dec"),
+}
+
+
+def is_trusted_payment_frame_origin(frame_origin: str | None, top_origin: str) -> bool:
+    """Whether ``frame_origin`` may hold payment fields for a page at ``top_origin``.
+
+    Both origins must be valid HTTPS origins. Same-origin child frames (exact origin match
+    with ``top_origin``) are always allowed; cross-origin child frames must be on the
+    built-in payment-processor domain allowlist over HTTPS on standard port 443.
+    """
+    normalized_top = origin_of(top_origin)
+    normalized_frame = origin_of(frame_origin)
+    if normalized_top is None or normalized_frame is None:
+        return False
+    if not normalized_top.startswith("https://") or not normalized_frame.startswith("https://"):
+        return False
+    if normalized_frame == normalized_top:
+        return True
+    parsed = urlsplit(normalized_frame)
+    if parsed.scheme != "https" or parsed.port not in (None, 443):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host or host.endswith("."):
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in TRUSTED_PAYMENT_FRAME_DOMAINS)
+
+
+def _format_payment_input_value(
+    kind: str,
+    value: str,
+    placeholder: str,
+    maxlength: int | None,
+    exp_month: int,
+    exp_year: int,
+) -> str:
+    if kind == "card_exp":
+        if re.search(r"yyyy", placeholder, re.IGNORECASE) and (maxlength is None or maxlength >= 7):
+            return f"{exp_month:02d}/{exp_year}"
+        return f"{exp_month:02d}/{exp_year % 100:02d}"
+    if kind == "card_exp_year":
+        if maxlength == 2 or (
+            re.search(r"\byy\b", placeholder, re.IGNORECASE) and not re.search(r"yyyy", placeholder, re.IGNORECASE)
+        ):
+            return f"{exp_year % 100:02d}"
+        return str(exp_year)
+    return value
+
+
+def _match_select_option(
+    kind: str,
+    options: list[dict[str, str]],
+    value: str,
+    exp_month: int,
+    exp_year: int,
+) -> str | None:
+    """Choose the best matching ``<option>`` value for a ``<select>`` payment control."""
+    usable = [opt for opt in options if opt.get("value", "") != "" or opt.get("label", "").strip() != ""]
+    if kind == "card_exp_month":
+        month_targets = {f"{exp_month:02d}", str(exp_month)}
+        for opt in usable:
+            if opt.get("value", "").strip() in month_targets:
+                return opt["value"]
+        for opt in usable:
+            if opt.get("label", "").strip() in month_targets:
+                return opt["value"]
+        for opt in usable:
+            match = re.match(r"^\s*0?(\d{1,2})\b", opt.get("label", ""))
+            if match and int(match.group(1)) == exp_month:
+                return opt["value"]
+        full_name, short_name = _MONTH_NAMES[exp_month]
+        for opt in usable:
+            opt_val = opt.get("value", "").strip().lower()
+            opt_lbl = opt.get("label", "").strip().lower()
+            if opt_val in {full_name, short_name} or opt_lbl in {full_name, short_name}:
+                return opt["value"]
+            if re.search(rf"\b({full_name}|{short_name})\b", opt_lbl):
+                return opt["value"]
+        return None
+    if kind == "card_exp_year":
+        year_targets = [str(exp_year), f"{exp_year % 100:02d}"]
+        for target in year_targets:
+            for opt in usable:
+                if opt.get("value", "").strip() == target:
+                    return opt["value"]
+        for target in year_targets:
+            for opt in usable:
+                if opt.get("label", "").strip() == target:
+                    return opt["value"]
+        return None
+    needle = value.strip().lower()
+    if not needle:
+        return None
+    for opt in usable:
+        if opt.get("value", "").strip().lower() == needle:
+            return opt["value"]
+    for opt in usable:
+        if opt.get("label", "").strip().lower() == needle:
+            return opt["value"]
+    return None
+
+
+_PAYMENT_HELPERS_JS = r"""
+  const PAYMENT_TARGET_ATTR = 'data-fa-payment-target';
+  const PAYMENT_CAND_ATTR = 'data-fa-payment-cand';
+  const PAYMENT_PROTECTED_ATTR = 'data-fa-protected';
+  const PAYMENT_NONCE_KEY = 'faPaymentNonce';
+  const PAYMENT_INPUT_TYPES = new Set(['text', 'tel', 'number', 'password']);
+  const SELECT_ALLOWED_KINDS = new Set([
+    'card_exp_month', 'card_exp_year', 'billing_state', 'billing_country'
+  ]);
+  const NON_PAYMENT_AUTOCOMPLETE = new Set([
+    'username', 'current-password', 'new-password', 'one-time-code', 'email'
+  ]);
+  const STRIPE_STABLE_MAP = {
+    cardnumber: 'card_number',
+    cardexpiry: 'card_exp',
+    cardcvc: 'card_cvc',
+    postalcode: 'billing_postal_code',
+  };
+
+  function payInputType(el) {
+    return (el.getAttribute('type') || 'text').toLowerCase();
+  }
+
+  function payNodeVisible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return false;
+    const style = window.getComputedStyle(el);
+    return style.visibility !== 'hidden' && style.display !== 'none';
+  }
+
+  function payVisible(el) {
+    if (!el || !el.isConnected) return false;
+    let inBody = false;
+    for (let n = el; n; n = n.parentElement) {
+      if (n.nodeType !== 1 || !payNodeVisible(n)) return false;
+      if (n === document.body) { inBody = true; break; }
+    }
+    return inBody;
+  }
+
+  function payNormalize(s) {
+    return String(s || '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .toLowerCase()
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function payLabelText(lbl) {
+    if (!lbl) return '';
+    let out = '';
+    for (const node of lbl.childNodes) {
+      if (node.nodeType === 3) out += ' ' + node.textContent;
+      else if (
+        node.nodeType === 1 &&
+        node.tagName !== 'SELECT' &&
+        node.tagName !== 'INPUT' &&
+        node.tagName !== 'TEXTAREA'
+      ) {
+        out += ' ' + node.textContent;
+      }
+    }
+    return out.trim();
+  }
+
+  function payHintsFor(el) {
+    const parts = [];
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      for (const id of labelledBy.trim().split(/\s+/)) {
+        const target = id && document.getElementById(id);
+        if (target) parts.push(target.textContent || '');
+      }
+    }
+    for (const attr of ['aria-label', 'name', 'id', 'placeholder', 'title']) {
+      const val = el.getAttribute(attr);
+      if (val) parts.push(val);
+    }
+    if (el.id) {
+      const lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (lbl) parts.push(payLabelText(lbl));
+    }
+    const parentLabel = el.closest && el.closest('label');
+    if (parentLabel && parentLabel !== el) parts.push(payLabelText(parentLabel));
+    return payNormalize(parts.join(' '));
+  }
+
+  function payEligible(el, kind) {
+    if (!el || el.nodeType !== 1 || !payVisible(el) || el.disabled || el.readOnly) return false;
+    if (el.tagName === 'SELECT') return SELECT_ALLOWED_KINDS.has(kind);
+    if (el.tagName === 'INPUT') return PAYMENT_INPUT_TYPES.has(payInputType(el));
+    return false;
+  }
+
+  function payClassify(el) {
+    if (!el || el.nodeType !== 1 || !payVisible(el) || el.disabled || el.readOnly) return null;
+    const isSelect = el.tagName === 'SELECT';
+    const isInput = el.tagName === 'INPUT' && PAYMENT_INPUT_TYPES.has(payInputType(el));
+    if (!isSelect && !isInput) return null;
+
+    const acRaw = (el.getAttribute('autocomplete') || '').trim().toLowerCase();
+    const acTokens = acRaw ? acRaw.split(/\s+/) : [];
+    for (const tok of acTokens) {
+      if (NON_PAYMENT_AUTOCOMPLETE.has(tok)) return null;
+    }
+    const isShippingOnly = acTokens.includes('shipping') && !acTokens.includes('billing');
+    let tier1 = null;
+    if (acTokens.includes('cc-number')) tier1 = 'card_number';
+    else if (acTokens.includes('cc-csc')) tier1 = 'card_cvc';
+    else if (acTokens.includes('cc-exp-month')) tier1 = 'card_exp_month';
+    else if (acTokens.includes('cc-exp-year')) tier1 = 'card_exp_year';
+    else if (acTokens.includes('cc-exp')) tier1 = 'card_exp';
+    else if (acTokens.includes('cc-name')) tier1 = 'card_name';
+    else if (!isShippingOnly) {
+      if (acTokens.includes('billing') && acTokens.includes('name')) tier1 = 'billing_name';
+      else if (acTokens.includes('address-line1') || acTokens.includes('street-address')) tier1 = 'billing_line1';
+      else if (acTokens.includes('address-line2')) tier1 = 'billing_line2';
+      else if (acTokens.includes('address-level2')) tier1 = 'billing_city';
+      else if (acTokens.includes('address-level1')) tier1 = 'billing_state';
+      else if (acTokens.includes('postal-code')) tier1 = 'billing_postal_code';
+      else if (acTokens.includes('country') || acTokens.includes('country-name')) tier1 = 'billing_country';
+    }
+    if (tier1) {
+      if (isSelect && !SELECT_ALLOWED_KINDS.has(tier1)) return null;
+      return { kind: tier1, tier: 1 };
+    }
+
+    const stable = (el.getAttribute('data-elements-stable-field-name') || '').trim().toLowerCase();
+    if (stable && STRIPE_STABLE_MAP[stable]) {
+      const kind = STRIPE_STABLE_MAP[stable];
+      if (!isSelect || SELECT_ALLOWED_KINDS.has(kind)) return { kind, tier: 1 };
+    }
+
+    const hints = payHintsFor(el);
+    const placeholder = (el.getAttribute('placeholder') || '').trim();
+    if (!hints && !placeholder) return null;
+
+    if (/\b(cvc|cvv|cvv2|csc|cvn|security code|card code|verification code|card verification)\b/.test(hints)) {
+      return isInput ? { kind: 'card_cvc', tier: 2 } : null;
+    }
+    if (/\b(exp(ir(y|ation))? month|cc exp month|card exp(ir(y|ation))? month|exp mm|month of exp(ir(y|ation))?)\b/.test(hints)) {
+      return { kind: 'card_exp_month', tier: 2 };
+    }
+    if (/\b(exp(ir(y|ation))? year|cc exp year|card exp(ir(y|ation))? year|exp yy(yy)?|year of exp(ir(y|ation))?)\b/.test(hints)) {
+      return { kind: 'card_exp_year', tier: 2 };
+    }
+    if (/\b(exp(ir(y|ation))?( date)?|cc exp|card exp(ir(y|ation))?|valid thru)\b/.test(hints) || /\bmm\s*\/\s*yy(yy)?\b/i.test(placeholder)) {
+      return isInput ? { kind: 'card_exp', tier: 2 } : null;
+    }
+    if (
+      /\b(card number|credit card number|debit card number|cc num(ber)?|cardnumber|card no|pan)\b/.test(hints) ||
+      /^\s*(?:[0-9x•*]{4}[\s-]){3}[0-9x•*]{3,4}\s*$/i.test(placeholder)
+    ) {
+      return isInput ? { kind: 'card_number', tier: 2 } : null;
+    }
+    if (/\b(cardholder( name)?|card holder( name)?|name on card|cc name|card name)\b/.test(hints)) {
+      return isInput ? { kind: 'card_name', tier: 2 } : null;
+    }
+
+    const shippingText = /\b(shipping|delivery)\b/.test(hints) && !/\bbilling\b/.test(hints);
+    if (shippingText || isShippingOnly) return null;
+
+    if (/\bbilling (full )?name\b/.test(hints)) {
+      return isInput ? { kind: 'billing_name', tier: 2 } : null;
+    }
+    if (/\b(billing )?(address line ?1|street address|billing address( ?1)?|address ?1)\b/.test(hints)) {
+      return isInput ? { kind: 'billing_line1', tier: 2 } : null;
+    }
+    if (/\b(billing )?(address line ?2|apt|suite|unit|address ?2)\b/.test(hints)) {
+      return isInput ? { kind: 'billing_line2', tier: 2 } : null;
+    }
+    if (/\b(billing )?(city|town|locality)\b/.test(hints)) {
+      return isInput ? { kind: 'billing_city', tier: 2 } : null;
+    }
+    if (/\b(billing )?(state|province|region)\b/.test(hints)) {
+      return { kind: 'billing_state', tier: 2 };
+    }
+    if (/\b(billing )?(postal code|zip( code)?|postcode)\b/.test(hints)) {
+      return isInput ? { kind: 'billing_postal_code', tier: 2 } : null;
+    }
+    if (/\b(billing )?country\b/.test(hints)) {
+      return { kind: 'billing_country', tier: 2 };
+    }
+    return null;
+  }
+
+  function payMeta(el) {
+    const rawRef = el.getAttribute('data-fa-ref');
+    const ref = rawRef && /^e[0-9]+$/.test(rawRef) ? rawRef : null;
+    const rawMax = el.getAttribute('maxlength');
+    const parsedMax = rawMax !== null && /^\d+$/.test(rawMax.trim()) ? parseInt(rawMax.trim(), 10) : null;
+    return {
+      ref,
+      tag: el.tagName.toLowerCase(),
+      placeholder: el.getAttribute('placeholder') || '',
+      maxlength: parsedMax,
+    };
+  }
+"""
+
+PAYMENT_COLLECT_JS = (
+    "() => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  for (const stale of document.querySelectorAll('[' + PAYMENT_TARGET_ATTR + ']')) stale.removeAttribute(PAYMENT_TARGET_ATTR);
+  for (const stale of document.querySelectorAll('[' + PAYMENT_CAND_ATTR + ']')) stale.removeAttribute(PAYMENT_CAND_ATTR);
+  const candidates = [];
+  let idx = 0;
+  for (const el of document.querySelectorAll('input, select')) {
+    const match = payClassify(el);
+    if (!match) continue;
+    const cand = String(idx++);
+    el.setAttribute(PAYMENT_CAND_ATTR, cand);
+    candidates.push(Object.assign({ cand, kind: match.kind, tier: match.tier }, payMeta(el)));
+  }
+  return { origin: location.origin, url: location.href, candidates };
+}
+"""
+)
+
+PAYMENT_PROBE_UNTRUSTED_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  const kinds = [];
+  for (const el of document.querySelectorAll('input, select')) {
+    const match = payClassify(el);
+    if (match) kinds.push(match.kind);
+  }
+  let hasRef = false;
+  for (const ref of (args.refs || [])) {
+    if (document.querySelectorAll('[data-fa-ref="' + ref + '"]').length > 0) {
+      hasRef = true;
+      break;
+    }
+  }
+  return { origin: location.origin, kinds, has_ref: hasRef };
+}
+"""
+)
+
+PAYMENT_RESOLVE_REFS_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + "const checkRef = "
+    + CHECK_REF_JS
+    + ";"
+    + r"""
+  for (const stale of document.querySelectorAll('[' + PAYMENT_TARGET_ATTR + ']')) stale.removeAttribute(PAYMENT_TARGET_ATTR);
+  for (const stale of document.querySelectorAll('[' + PAYMENT_CAND_ATTR + ']')) stale.removeAttribute(PAYMENT_CAND_ATTR);
+  const resolved = [];
+  let idx = 0;
+  for (const spec of args.fields) {
+    const carriers = document.querySelectorAll('[data-fa-ref="' + spec.ref + '"]');
+    if (carriers.length === 0) continue;
+    if (carriers.length > 1) {
+      resolved.push({ ref: spec.ref, kind: spec.kind, status: 'ambiguous' });
+      continue;
+    }
+    const el = carriers[0];
+    if (el.hasAttribute('data-fa-role') || el.hasAttribute('data-fa-name')) {
+      if (!checkRef(spec.ref).ok) {
+        resolved.push({ ref: spec.ref, kind: spec.kind, status: 'invalid_ref' });
+        continue;
+      }
+    }
+    if (!payEligible(el, spec.kind)) {
+      resolved.push({ ref: spec.ref, kind: spec.kind, status: 'no_eligible_field' });
+      continue;
+    }
+    const cand = String(idx++);
+    el.setAttribute(PAYMENT_CAND_ATTR, cand);
+    resolved.push(Object.assign({ status: 'ok', cand, kind: spec.kind }, payMeta(el)));
+  }
+  return { origin: location.origin, resolved };
+}
+"""
+)
+
+PAYMENT_PIN_FRAME_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  if (args.expected_frame_origin && location.origin !== args.expected_frame_origin) {
+    return { error: true, reason: 'target_invalidated' };
+  }
+  for (const pin of (args.pins || [])) {
+    const carriers = document.querySelectorAll('[' + PAYMENT_CAND_ATTR + '="' + pin.cand + '"]');
+    if (carriers.length !== 1 || !payEligible(carriers[0], pin.kind)) {
+      return { error: true, reason: 'target_invalidated' };
+    }
+    carriers[0].setAttribute(PAYMENT_TARGET_ATTR, pin.slot);
+  }
+  for (const el of document.querySelectorAll('[' + PAYMENT_CAND_ATTR + ']')) {
+    el.removeAttribute(PAYMENT_CAND_ATTR);
+  }
+  document.documentElement.dataset[PAYMENT_NONCE_KEY] = args.nonce;
+  return { ok: true, origin: location.origin };
+}
+"""
+)
+
+PAYMENT_VERIFY_MAIN_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  if (document.documentElement.dataset[PAYMENT_NONCE_KEY] !== args.nonce) {
+    return { error: true, reason: 'target_invalidated' };
+  }
+  if (location.origin !== args.expected_origin) {
+    return { error: true, reason: 'target_invalidated' };
+  }
+  return { ok: true };
+}
+"""
+)
+
+PAYMENT_VERIFY_TARGET_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + "const checkRef = "
+    + CHECK_REF_JS
+    + ";"
+    + r"""
+  if (document.documentElement.dataset[PAYMENT_NONCE_KEY] !== args.nonce) {
+    return { error: true, reason: 'target_invalidated' };
+  }
+  if (location.origin !== args.frame_origin) {
+    return { error: true, reason: 'target_invalidated' };
+  }
+  const carriers = document.querySelectorAll('[' + PAYMENT_TARGET_ATTR + '="' + args.slot + '"]');
+  if (carriers.length !== 1) return { error: true, reason: 'target_invalidated' };
+  const el = carriers[0];
+  if (args.ref) {
+    if (el.getAttribute('data-fa-ref') !== args.ref) return { error: true, reason: 'target_invalidated' };
+    if ((el.hasAttribute('data-fa-role') || el.hasAttribute('data-fa-name')) && !checkRef(args.ref).ok) {
+      return { error: true, reason: 'target_invalidated' };
+    }
+  }
+  if (!payEligible(el, args.kind)) return { error: true, reason: 'target_invalidated' };
+  return { ok: true };
+}
+"""
+)
+
+PAYMENT_STAMP_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  for (const el of document.querySelectorAll('[' + PAYMENT_TARGET_ATTR + '="' + args.slot + '"]')) {
+    el.setAttribute(PAYMENT_PROTECTED_ATTR, 'true');
+  }
+}
+"""
+)
+
+PAYMENT_SELECT_OPTIONS_JS = (
+    "(args) => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  const el = document.querySelector('[' + PAYMENT_TARGET_ATTR + '="' + args.slot + '"]');
+  if (!el || el.tagName !== 'SELECT') return [];
+  return Array.from(el.options)
+    .filter(opt => !opt.disabled)
+    .map(opt => ({ value: String(opt.value || ''), label: String(opt.textContent || opt.label || '').trim() }));
+}
+"""
+)
+
+PAYMENT_CLEAR_TARGETS_JS = (
+    "() => {"
+    + _PAYMENT_HELPERS_JS
+    + r"""
+  for (const el of document.querySelectorAll('[' + PAYMENT_TARGET_ATTR + ']')) el.removeAttribute(PAYMENT_TARGET_ATTR);
+  for (const el of document.querySelectorAll('[' + PAYMENT_CAND_ATTR + ']')) el.removeAttribute(PAYMENT_CAND_ATTR);
+}
+"""
+)
+
 _REF_PATTERN = re.compile(r"e[0-9]+")
 # The walker increments the counter in JavaScript, which stops advancing exactly past 2**53 - 1.
 # Capping the starting point 2**32 below that leaves any real walk room to allocate.
@@ -845,10 +1392,50 @@ def _wrap_exec_code(code: str) -> str:
     return f"async () => ({stripped})"
 
 
+def _resolve_payment_candidates(
+    trusted_candidates: list[dict[str, Any]],
+    untrusted_kinds: set[str],
+    available_kinds: list[str],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Select payment targets across trusted frames; return ``(selected, refusal_reason)``."""
+    wanted = set(available_kinds)
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for cand in trusted_candidates:
+        kind = str(cand["kind"])
+        if kind in wanted:
+            by_kind.setdefault(kind, []).append(cand)
+
+    selected_by_kind: dict[str, dict[str, Any]] = {}
+    for kind, items in by_kind.items():
+        if len(items) == 1:
+            selected_by_kind[kind] = items[0]
+            continue
+        tier1 = [item for item in items if item.get("tier") == 1]
+        if len(tier1) == 1:
+            selected_by_kind[kind] = tier1[0]
+            continue
+        return None, "ambiguous_fields"
+
+    if "card_exp" in selected_by_kind and ("card_exp_month" in selected_by_kind or "card_exp_year" in selected_by_kind):
+        return None, "ambiguous_fields"
+
+    if untrusted_kinds & _CORE_PAYMENT_CARD_KINDS:
+        return None, "untrusted_payment_frame"
+
+    if "card_number" not in selected_by_kind:
+        if untrusted_kinds & (_CORE_PAYMENT_CARD_KINDS | {"card_name"}):
+            return None, "untrusted_payment_frame"
+        return None, "no_eligible_field"
+
+    ordered = [selected_by_kind[kind] for kind in available_kinds if kind in selected_by_kind]
+    return ordered, None
+
+
 class BrowserRuntime(Protocol):
     worker_id: str
     closed: bool
     remote_url: str | None
+    mask_protected: bool
 
     async def start(self) -> None: ...
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]: ...
@@ -858,9 +1445,27 @@ class BrowserRuntime(Protocol):
     def set_confinement_active(self, enabled: bool) -> None: ...
     def set_confine_origins(self, origins: list[str]) -> None: ...
     async def evict_off_scope_page(self) -> None: ...
+    async def enable_readback_protection(self) -> None: ...
     async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]: ...
     async def autofill_fill(
         self, nonce: str, origin: str, targets: list[dict[str, Any]], values: dict[str, str]
+    ) -> dict[str, Any]: ...
+    async def payment_prepare(
+        self,
+        expected_origin: str,
+        fields: list[dict[str, Any]] | None,
+        available_kinds: list[str],
+        nonce: str,
+    ) -> dict[str, Any]: ...
+    async def payment_fill(
+        self,
+        nonce: str,
+        expected_origin: str,
+        targets: list[dict[str, Any]],
+        values: dict[str, str],
+        *,
+        exp_month: int,
+        exp_year: int,
     ) -> dict[str, Any]: ...
 
 
@@ -920,6 +1525,10 @@ class FakeBrowserWorker:
         self.mask_protected = mask_protected
         self._autofill_nonce: str | None = None
         self._autofill_targets: list[dict[str, Any]] = []
+        self.payment_fields: list[dict[str, Any]] = []
+        self.payment_filled: list[dict[str, Any]] = []
+        self._payment_nonce: str | None = None
+        self.on_payment_fill: Callable[[dict[str, Any]], None] | None = None
 
     async def _ucp_fetch(self, url: str) -> Any:
         return self.ucp_documents.get(url)
@@ -1003,8 +1612,9 @@ class FakeBrowserWorker:
             self.url = target
             self.title = f"Fixture page at {redact_url(target)[1] or target}"
             self._ref = None
-            # A new document takes the autofill nonce with it, exactly as the real one does.
+            # A new document takes the autofill/payment nonces with it, exactly as the real one does.
             self._autofill_nonce = None
+            self._payment_nonce = None
             return {"url": redact_url(target)[0], "title": self.title}
         if request.type in {"click", "type_text", "select", "press_key"}:
             raw_ref = request.args.get("ref") if request.type != "press_key" else None
@@ -1085,6 +1695,31 @@ class FakeBrowserWorker:
                 "tag": "input",
                 "input_type": field.get("input_type", "text"),
             }
+            value = next((entry["value"] for entry in self.filled if entry["ref"] == ref), None)
+            if field.get("input_type") == "password" or ref in self.protected_refs:
+                node["value_masked"] = True
+                node["has_value"] = value is not None
+            elif value is not None:
+                node["value"] = value
+            nodes.append(node)
+        top_origin = origin_of(self.url)
+        for field in self.payment_fields:
+            frame_origin = origin_of(field.get("frame_origin")) if field.get("frame_origin") else top_origin
+            if frame_origin != top_origin or not field.get("visible", True):
+                continue
+            raw_ref = field.get("ref")
+            if not raw_ref:
+                continue
+            ref = str(raw_ref)
+            tag = str(field.get("tag", "input")).lower()
+            node = {
+                "ref": ref,
+                "role": "combobox" if tag == "select" else "textbox",
+                "name": field.get("name", ""),
+                "tag": tag,
+            }
+            if tag == "input":
+                node["input_type"] = field.get("input_type", "text")
             value = next((entry["value"] for entry in self.filled if entry["ref"] == ref), None)
             if field.get("input_type") == "password" or ref in self.protected_refs:
                 node["value_masked"] = True
@@ -1181,6 +1816,178 @@ class FakeBrowserWorker:
             filled.append({"ref": ref, "kind": target["kind"]})
         return {"ok": True, "filled": filled}
 
+    async def enable_readback_protection(self) -> None:
+        self.mask_protected = True
+
+    def _fake_payment_eligible(self, field: dict[str, Any], kind: str) -> bool:
+        if not field.get("visible", True) or field.get("disabled", False) or field.get("readonly", False):
+            return False
+        tag = str(field.get("tag", "input")).lower()
+        if tag == "select":
+            return kind in _SELECT_ALLOWED_PAYMENT_KINDS
+        if tag == "input":
+            return str(field.get("input_type", "text")).lower() in {"text", "tel", "number", "password"}
+        return False
+
+    async def payment_prepare(
+        self,
+        expected_origin: str,
+        fields: list[dict[str, Any]] | None,
+        available_kinds: list[str],
+        nonce: str,
+    ) -> dict[str, Any]:
+        actual_origin = origin_of(self.url)
+        if actual_origin is None or not actual_origin.startswith("https://"):
+            return {"error": True, "reason": "insecure_origin", "origin": actual_origin}
+        if actual_origin != expected_origin:
+            return {"error": True, "reason": "wrong_origin", "origin": actual_origin}
+
+        trusted_entries: list[tuple[dict[str, Any], str]] = []
+        untrusted_entries: list[tuple[dict[str, Any], str | None]] = []
+        for field in self.payment_fields:
+            raw_frame = field.get("frame_origin")
+            frame_origin = origin_of(str(raw_frame)) if raw_frame is not None else actual_origin
+            if is_trusted_payment_frame_origin(frame_origin, actual_origin):
+                assert frame_origin is not None
+                trusted_entries.append((field, frame_origin))
+            else:
+                untrusted_entries.append((field, frame_origin))
+
+        chosen: list[dict[str, Any]] = []
+        if fields is not None:
+            for spec in fields:
+                ref = str(spec["ref"])
+                kind = str(spec["kind"])
+                if not _REF_PATTERN.fullmatch(ref):
+                    return {"error": True, "reason": "invalid_ref", "origin": actual_origin}
+                matches = [(f, fo) for f, fo in trusted_entries if f.get("ref") == ref]
+                if len(matches) > 1:
+                    return {"error": True, "reason": "ambiguous_fields", "origin": actual_origin}
+                if not matches:
+                    if any(f.get("ref") == ref for f, _ in untrusted_entries):
+                        return {"error": True, "reason": "untrusted_payment_frame", "origin": actual_origin}
+                    return {"error": True, "reason": "invalid_ref", "origin": actual_origin}
+                field, frame_origin = matches[0]
+                if not self._fake_payment_eligible(field, kind):
+                    return {"error": True, "reason": "no_eligible_field", "origin": actual_origin}
+                chosen.append(
+                    {
+                        "ref": ref,
+                        "kind": kind,
+                        "frame_origin": frame_origin,
+                        "tag": str(field.get("tag", "input")).lower(),
+                        "placeholder": str(field.get("placeholder", "")),
+                        "maxlength": field.get("maxlength"),
+                        "options": field.get("options"),
+                    }
+                )
+        else:
+            trusted_candidates: list[dict[str, Any]] = []
+            for field, frame_origin in trusted_entries:
+                kind = field.get("kind")
+                if not kind or not self._fake_payment_eligible(field, str(kind)):
+                    continue
+                trusted_candidates.append(
+                    {
+                        "ref": str(field["ref"]) if field.get("ref") is not None else None,
+                        "kind": str(kind),
+                        "tier": int(field.get("tier", 1 if field.get("autocomplete") else 2)),
+                        "frame_origin": frame_origin,
+                        "tag": str(field.get("tag", "input")).lower(),
+                        "placeholder": str(field.get("placeholder", "")),
+                        "maxlength": field.get("maxlength"),
+                        "options": field.get("options"),
+                    }
+                )
+            untrusted_kinds = {
+                str(field["kind"])
+                for field, _ in untrusted_entries
+                if field.get("kind") and self._fake_payment_eligible(field, str(field["kind"]))
+            }
+            selected, reason = _resolve_payment_candidates(trusted_candidates, untrusted_kinds, available_kinds)
+            if reason is not None or selected is None:
+                return {"error": True, "reason": reason or "no_eligible_field", "origin": actual_origin}
+            chosen = selected
+
+        self._payment_nonce = nonce
+        targets = [
+            {
+                "slot": str(idx),
+                "ref": item["ref"],
+                "kind": item["kind"],
+                "frame_origin": item["frame_origin"],
+                "tag": item["tag"],
+                "placeholder": item["placeholder"],
+                "maxlength": item["maxlength"],
+                "options": item.get("options"),
+            }
+            for idx, item in enumerate(chosen)
+        ]
+        return {"ok": True, "origin": actual_origin, "targets": targets}
+
+    async def payment_fill(
+        self,
+        nonce: str,
+        expected_origin: str,
+        targets: list[dict[str, Any]],
+        values: dict[str, str],
+        *,
+        exp_month: int,
+        exp_year: int,
+    ) -> dict[str, Any]:
+        if self._payment_nonce != nonce or origin_of(self.url) != expected_origin:
+            return {"error": True, "reason": "target_invalidated"}
+        filled: list[dict[str, Any]] = []
+        for target in targets:
+            if self.on_payment_fill is not None:
+                self.on_payment_fill(target)
+            if self._payment_nonce != nonce or origin_of(self.url) != expected_origin:
+                return {"error": True, "reason": "target_invalidated", "filled": filled}
+            kind = str(target["kind"])
+            raw_value = values.get(kind)
+            if raw_value is None:
+                continue
+            tag = str(target.get("tag", "input")).lower()
+            if tag == "select":
+                options = target.get("options")
+                if isinstance(options, list) and options:
+                    matched = _match_select_option(kind, options, raw_value, exp_month, exp_year)
+                    if matched is None:
+                        continue
+                    final_value = matched
+                else:
+                    final_value = raw_value
+            else:
+                final_value = _format_payment_input_value(
+                    kind,
+                    raw_value,
+                    str(target.get("placeholder", "")),
+                    target.get("maxlength"),
+                    exp_month,
+                    exp_year,
+                )
+            ref = target.get("ref")
+            if ref is not None:
+                ref_str = str(ref)
+                self.protected_refs.add(ref_str)
+                self.filled = [entry for entry in self.filled if entry["ref"] != ref_str]
+                self.filled.append({"ref": ref_str, "kind": kind, "value": final_value})
+            entry = {
+                "ref": str(ref) if ref is not None else None,
+                "kind": kind,
+                "frame_origin": str(target["frame_origin"]),
+                "value": final_value,
+            }
+            self.payment_filled.append(entry)
+            filled.append(
+                {
+                    "ref": entry["ref"],
+                    "kind": kind,
+                    "frame_origin": entry["frame_origin"],
+                }
+            )
+        return {"ok": True, "filled": filled}
+
     async def close(self) -> None:
         self.closed = True
 
@@ -1236,6 +2043,8 @@ class PlaywrightBrowserWorker:
         self._confinement_active = True
         # Authenticated-site read-back protection: screenshots mask every protected control.
         self.mask_protected = mask_protected
+        self._payment_nonce: str | None = None
+        self._payment_target_frames: dict[str, Any] = {}
         # Set by the route guard to the off-scope origin it aborted during the current navigation, so
         # a goto failure can tell an off-scope-redirect block from an in-scope network outage (both
         # can surface as net::ERR_FAILED). Reset before each navigate.
@@ -1590,6 +2399,26 @@ class PlaywrightBrowserWorker:
             except Exception:
                 pass
 
+    async def _apply_frame_protection(self, page: Any) -> None:
+        from patchright.async_api import Error as PlaywrightError
+
+        for frame in page.frames:
+            try:
+                await frame.evaluate(_PROTECTED_DRAG_JS, PROTECTED_SELECTOR)
+                await frame.locator("input[type=password]").evaluate_all(
+                    "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
+                )
+            except PlaywrightError:
+                if not frame.is_detached():
+                    raise
+
+    async def enable_readback_protection(self) -> None:
+        self.mask_protected = True
+        page = self._page
+        if self.closed or page is None:
+            return
+        await self._apply_frame_protection(page)
+
     async def command(self, request: AgentCommandRequest) -> dict[str, Any]:
         if self.closed or self._page is None:
             raise RuntimeError("worker is closed")
@@ -1597,15 +2426,7 @@ class PlaywrightBrowserWorker:
         from patchright.async_api import Error as PlaywrightError
 
         if self.mask_protected:
-            for frame in page.frames:
-                try:
-                    await frame.evaluate(_PROTECTED_DRAG_JS, PROTECTED_SELECTOR)
-                    await frame.locator("input[type=password]").evaluate_all(
-                        "elements => elements.forEach(el => el.setAttribute('data-fa-protected', 'true'))"
-                    )
-                except PlaywrightError:
-                    if not frame.is_detached():
-                        raise
+            await self._apply_frame_protection(page)
 
         # Any action (a click on a link, Enter submitting a form, go_back to an off-scope page) can
         # trigger a navigation the route guard aborts. Reset the flag and, if such an abort escapes
@@ -2019,6 +2840,341 @@ class PlaywrightBrowserWorker:
                 return {"error": True, "reason": "target_invalidated", "filled": filled}
             filled.append({"ref": target.get("ref"), "kind": target["kind"]})
         return {"ok": True, "filled": filled}
+
+    @staticmethod
+    def _frame_chain_trusted(frame: Any, main_frame: Any, top_origin: str) -> bool:
+        """Verify ``frame`` and every ancestor up to ``main_frame`` carry trusted payment origins."""
+        cur = frame
+        while cur is not None and cur != main_frame:
+            if cur.is_detached():
+                return False
+            if not is_trusted_payment_frame_origin(origin_of(cur.url), top_origin):
+                return False
+            cur = cur.parent_frame
+        return cur == main_frame
+
+    async def payment_prepare(
+        self,
+        expected_origin: str,
+        fields: list[dict[str, Any]] | None,
+        available_kinds: list[str],
+        nonce: str,
+    ) -> dict[str, Any]:
+        """Resolve and pin payment targets across the main frame and allowlisted payment iframes."""
+        from patchright.async_api import Error as PlaywrightError
+
+        page = self._page
+        if self.closed or page is None:
+            raise RuntimeError("worker is closed")
+        self._payment_nonce = None
+        self._payment_target_frames.clear()
+
+        main_frame = page.main_frame
+        try:
+            main_info = cast(
+                dict[str, Any],
+                await main_frame.evaluate("() => ({ origin: location.origin, href: location.href })"),
+            )
+        except PlaywrightError:
+            return {"error": True, "reason": "target_invalidated"}
+
+        actual_origin = origin_of(str(main_info.get("href") or "")) or origin_of(str(main_info.get("origin") or ""))
+        if actual_origin is None or not actual_origin.startswith("https://"):
+            return {"error": True, "reason": "insecure_origin", "origin": actual_origin}
+        if actual_origin != expected_origin:
+            return {"error": True, "reason": "wrong_origin", "origin": actual_origin}
+
+        if fields is None:
+            try:
+                await self._snapshot_document(page)
+            except PlaywrightError:
+                return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+
+        trusted_frames: list[tuple[Any, str]] = [(main_frame, actual_origin)]
+        untrusted_frames: list[Any] = []
+        for frame in page.frames:
+            if frame == main_frame or frame.is_detached():
+                continue
+            url_origin = origin_of(frame.url)
+            if url_origin is None or not self._frame_chain_trusted(frame, main_frame, actual_origin):
+                untrusted_frames.append(frame)
+                continue
+            try:
+                live_raw = await frame.evaluate("() => location.origin")
+            except PlaywrightError:
+                continue
+            live_origin = origin_of(str(live_raw or ""))
+            if (
+                live_origin is not None
+                and live_origin == url_origin
+                and is_trusted_payment_frame_origin(live_origin, actual_origin)
+            ):
+                trusted_frames.append((frame, live_origin))
+            else:
+                untrusted_frames.append(frame)
+
+        selected: list[dict[str, Any]] = []
+        if fields is not None:
+            for spec in fields:
+                ref = str(spec["ref"])
+                if not _REF_PATTERN.fullmatch(ref):
+                    return {"error": True, "reason": "invalid_ref", "origin": actual_origin}
+            per_ref: dict[str, list[dict[str, Any]]] = {str(spec["ref"]): [] for spec in fields}
+            for frame, frame_origin in trusted_frames:
+                try:
+                    res = cast(
+                        dict[str, Any],
+                        await frame.evaluate(PAYMENT_RESOLVE_REFS_JS, {"fields": fields}),
+                    )
+                except PlaywrightError:
+                    if frame == main_frame:
+                        return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+                    continue
+                if origin_of(str(res.get("origin") or "")) != frame_origin:
+                    return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+                for item in cast(list[dict[str, Any]], res.get("resolved") or []):
+                    item["frame"] = frame
+                    item["frame_origin"] = frame_origin
+                    per_ref[str(item["ref"])].append(item)
+
+            missing_refs: list[str] = []
+            for spec in fields:
+                ref = str(spec["ref"])
+                matches = per_ref.get(ref) or []
+                if not matches:
+                    missing_refs.append(ref)
+                    continue
+                if len(matches) > 1 or any(m.get("status") == "ambiguous" for m in matches):
+                    return {"error": True, "reason": "ambiguous_fields", "origin": actual_origin}
+                match = matches[0]
+                status = str(match.get("status") or "")
+                if status == "invalid_ref":
+                    return {"error": True, "reason": "invalid_ref", "origin": actual_origin}
+                if status != "ok":
+                    return {"error": True, "reason": "no_eligible_field", "origin": actual_origin}
+                selected.append(match)
+
+            if missing_refs:
+                for uframe in untrusted_frames:
+                    if uframe.is_detached():
+                        continue
+                    try:
+                        probe = cast(
+                            dict[str, Any],
+                            await uframe.evaluate(PAYMENT_PROBE_UNTRUSTED_JS, {"refs": missing_refs}),
+                        )
+                    except PlaywrightError:
+                        continue
+                    if probe.get("has_ref"):
+                        return {"error": True, "reason": "untrusted_payment_frame", "origin": actual_origin}
+                return {"error": True, "reason": "invalid_ref", "origin": actual_origin}
+        else:
+            trusted_candidates: list[dict[str, Any]] = []
+            for frame, frame_origin in trusted_frames:
+                try:
+                    collected = cast(dict[str, Any], await frame.evaluate(PAYMENT_COLLECT_JS))
+                except PlaywrightError:
+                    if frame == main_frame:
+                        return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+                    continue
+                if origin_of(str(collected.get("origin") or "")) != frame_origin:
+                    return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+                for cand in cast(list[dict[str, Any]], collected.get("candidates") or []):
+                    cand["frame"] = frame
+                    cand["frame_origin"] = frame_origin
+                    trusted_candidates.append(cand)
+
+            untrusted_kinds: set[str] = set()
+            for uframe in untrusted_frames:
+                if uframe.is_detached():
+                    continue
+                try:
+                    probe = cast(
+                        dict[str, Any],
+                        await uframe.evaluate(PAYMENT_PROBE_UNTRUSTED_JS, {"refs": []}),
+                    )
+                except PlaywrightError:
+                    continue
+                for kind in cast(list[str], probe.get("kinds") or []):
+                    untrusted_kinds.add(str(kind))
+
+            resolved_candidates, refusal = _resolve_payment_candidates(
+                trusted_candidates, untrusted_kinds, available_kinds
+            )
+            if refusal is not None or resolved_candidates is None:
+                return {"error": True, "reason": refusal or "no_eligible_field", "origin": actual_origin}
+            selected = resolved_candidates
+
+        # Pin main frame (always) and every child frame carrying a selected target.
+        pins_by_frame: dict[Any, list[dict[str, str]]] = {main_frame: []}
+        frame_origin_by_frame: dict[Any, str] = {main_frame: actual_origin}
+        targets: list[dict[str, Any]] = []
+        target_frames: dict[str, Any] = {}
+        for idx, item in enumerate(selected):
+            slot = str(idx)
+            frame = item["frame"]
+            frame_origin = str(item["frame_origin"])
+            pins_by_frame.setdefault(frame, []).append(
+                {"cand": str(item["cand"]), "slot": slot, "kind": str(item["kind"])}
+            )
+            frame_origin_by_frame[frame] = frame_origin
+            target_frames[slot] = frame
+            targets.append(
+                {
+                    "slot": slot,
+                    "ref": item.get("ref"),
+                    "kind": str(item["kind"]),
+                    "frame_origin": frame_origin,
+                    "tag": str(item.get("tag") or "input"),
+                    "placeholder": str(item.get("placeholder") or ""),
+                    "maxlength": item.get("maxlength"),
+                    "explicit": fields is not None,
+                }
+            )
+
+        for frame, pins in pins_by_frame.items():
+            try:
+                pinned = cast(
+                    dict[str, Any],
+                    await frame.evaluate(
+                        PAYMENT_PIN_FRAME_JS,
+                        {
+                            "nonce": nonce,
+                            "expected_frame_origin": frame_origin_by_frame[frame],
+                            "pins": pins,
+                        },
+                    ),
+                )
+            except PlaywrightError:
+                return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+            if not pinned.get("ok"):
+                return {"error": True, "reason": "target_invalidated", "origin": actual_origin}
+
+        # Clear any leftover candidate markers on trusted frames that had no selected targets.
+        for frame, _ in trusted_frames:
+            if frame not in pins_by_frame and not frame.is_detached():
+                try:
+                    await frame.evaluate(PAYMENT_CLEAR_TARGETS_JS)
+                except PlaywrightError:
+                    pass
+
+        self._payment_nonce = nonce
+        self._payment_target_frames = target_frames
+        return {"ok": True, "origin": actual_origin, "targets": targets}
+
+    async def payment_fill(
+        self,
+        nonce: str,
+        expected_origin: str,
+        targets: list[dict[str, Any]],
+        values: dict[str, str],
+        *,
+        exp_month: int,
+        exp_year: int,
+    ) -> dict[str, Any]:
+        """Re-verify top-level and frame nonces before stamping protected and filling each target."""
+        from patchright.async_api import Error as PlaywrightError
+
+        page = self._page
+        if self.closed or page is None:
+            raise RuntimeError("worker is closed")
+        if self._payment_nonce != nonce:
+            return {"error": True, "reason": "target_invalidated"}
+
+        main_frame = page.main_frame
+        touched_frames: set[Any] = {main_frame}
+        filled: list[dict[str, Any]] = []
+        try:
+            main_check = cast(
+                dict[str, Any],
+                await main_frame.evaluate(PAYMENT_VERIFY_MAIN_JS, {"nonce": nonce, "expected_origin": expected_origin}),
+            )
+            if not main_check.get("ok"):
+                return {"error": True, "reason": "target_invalidated"}
+
+            for target in targets:
+                slot = str(target["slot"])
+                kind = str(target["kind"])
+                frame_origin = str(target["frame_origin"])
+                raw_value = values.get(kind)
+                if raw_value is None:
+                    continue
+                frame = self._payment_target_frames.get(slot)
+                if frame is None or frame.is_detached():
+                    return {"error": True, "reason": "target_invalidated", "filled": filled}
+                touched_frames.add(frame)
+
+                try:
+                    main_check = cast(
+                        dict[str, Any],
+                        await main_frame.evaluate(
+                            PAYMENT_VERIFY_MAIN_JS, {"nonce": nonce, "expected_origin": expected_origin}
+                        ),
+                    )
+                    if not main_check.get("ok"):
+                        return {"error": True, "reason": "target_invalidated", "filled": filled}
+
+                    target_check = cast(
+                        dict[str, Any],
+                        await frame.evaluate(
+                            PAYMENT_VERIFY_TARGET_JS,
+                            {
+                                "nonce": nonce,
+                                "frame_origin": frame_origin,
+                                "slot": slot,
+                                "kind": kind,
+                                "ref": target.get("ref"),
+                            },
+                        ),
+                    )
+                    if not target_check.get("ok"):
+                        return {"error": True, "reason": "target_invalidated", "filled": filled}
+
+                    # Stamp data-fa-protected="true" BEFORE filling so even a partial fill or
+                    # in-page input listener cannot observe an unprotected control.
+                    await frame.evaluate(PAYMENT_STAMP_JS, {"slot": slot})
+                    locator = frame.locator(f'[data-fa-payment-target="{slot}"]')
+
+                    if str(target.get("tag") or "input").lower() == "select":
+                        options = cast(
+                            list[dict[str, str]],
+                            await frame.evaluate(PAYMENT_SELECT_OPTIONS_JS, {"slot": slot}),
+                        )
+                        matched = _match_select_option(kind, options, raw_value, exp_month, exp_year)
+                        if matched is None:
+                            if target.get("explicit") or kind in _CORE_PAYMENT_CARD_KINDS:
+                                return {"error": True, "reason": "no_eligible_field", "filled": filled}
+                            continue
+                        await locator.select_option(value=matched, timeout=self.action_timeout_ms)
+                    else:
+                        final_value = _format_payment_input_value(
+                            kind,
+                            raw_value,
+                            str(target.get("placeholder") or ""),
+                            target.get("maxlength"),
+                            exp_month,
+                            exp_year,
+                        )
+                        await locator.fill(final_value, timeout=self.action_timeout_ms)
+                except PlaywrightError:
+                    try:
+                        await frame.evaluate(PAYMENT_STAMP_JS, {"slot": slot})
+                    except PlaywrightError:
+                        pass
+                    return {"error": True, "reason": "target_invalidated", "filled": filled}
+
+                filled.append({"ref": target.get("ref"), "kind": kind, "frame_origin": frame_origin})
+            return {"ok": True, "filled": filled}
+        except PlaywrightError:
+            return {"error": True, "reason": "target_invalidated", "filled": filled}
+        finally:
+            self._payment_target_frames.clear()
+            for frame in touched_frames:
+                if not frame.is_detached():
+                    try:
+                        await frame.evaluate(PAYMENT_CLEAR_TARGETS_JS)
+                    except PlaywrightError:
+                        pass
 
     async def export_storage_state(self, max_bytes: int, *, cookies_only: bool = False) -> dict[str, Any]:
         """Export the context's storage_state (cookies + localStorage + IndexedDB).
