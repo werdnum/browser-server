@@ -1086,8 +1086,12 @@ class SessionRegistry:
         self._raise_if_expired(session)
         await self._enforce_jar_not_revoked_locked(session)
 
-        # Monotonically latch read-back protection before any credential touches the page, so even
-        # a mid-fill navigation after the first control cannot leave filled values readable.
+        # Monotonically latch post-fill read-back protection before any credential touches the page
+        # (denying subsequent exec/extract/transfer chords and masking screenshots/snapshots). This
+        # is narrower than creation-time ``autofill_enabled``: in an ordinary session that already
+        # ran ``exec`` before payment fill, an earlier main-frame listener could observe a top-frame
+        # card input (cross-origin payment iframes are unreachable from main-frame ``exec``). That
+        # single-use virtual card residual is explicitly accepted in the Link Agent Wallet design.
         session.readback_protected = True
         session.allow_exec = False
         await worker.enable_readback_protection()

@@ -875,23 +875,39 @@ def _match_select_option(
     usable = [opt for opt in options if opt.get("value", "") != "" or opt.get("label", "").strip() != ""]
     if kind == "card_exp_month":
         month_targets = {f"{exp_month:02d}", str(exp_month)}
+        full_name, short_name = _MONTH_NAMES[exp_month]
+        # Prefer unambiguous month labels (name or leading 1..12 number) before numeric option
+        # values so 0-indexed month selects (value="0" -> "January", value="3" -> "April") do not
+        # pick the wrong month.
         for opt in usable:
-            if opt.get("value", "").strip() in month_targets:
+            opt_lbl = opt.get("label", "").strip().lower()
+            if opt_lbl in {full_name, short_name} or re.search(rf"\b({full_name}|{short_name})\b", opt_lbl):
                 return opt["value"]
         for opt in usable:
-            if opt.get("label", "").strip() in month_targets:
+            opt_lbl = opt.get("label", "").strip()
+            if opt_lbl in month_targets:
                 return opt["value"]
-        for opt in usable:
-            match = re.match(r"^\s*0?(\d{1,2})\b", opt.get("label", ""))
+            match = re.match(r"^\s*0?(\d{1,2})\b", opt_lbl)
             if match and int(match.group(1)) == exp_month:
                 return opt["value"]
-        full_name, short_name = _MONTH_NAMES[exp_month]
         for opt in usable:
             opt_val = opt.get("value", "").strip().lower()
-            opt_lbl = opt.get("label", "").strip().lower()
-            if opt_val in {full_name, short_name} or opt_lbl in {full_name, short_name}:
+            if opt_val in {full_name, short_name}:
                 return opt["value"]
-            if re.search(rf"\b({full_name}|{short_name})\b", opt_lbl):
+        for opt in usable:
+            opt_val = opt.get("value", "").strip()
+            if opt_val not in month_targets:
+                continue
+            opt_lbl = opt.get("label", "").strip().lower()
+            # Reject a numeric value fallback if the displayed label clearly names a different month.
+            other_month_named = any(
+                m != exp_month and re.search(rf"\b({fn}|{sn})\b", opt_lbl) for m, (fn, sn) in _MONTH_NAMES.items()
+            )
+            num_match = re.match(r"^\s*0?(\d{1,2})\b", opt_lbl)
+            other_month_numbered = bool(
+                num_match and 1 <= int(num_match.group(1)) <= 12 and int(num_match.group(1)) != exp_month
+            )
+            if not other_month_named and not other_month_numbered:
                 return opt["value"]
         return None
     if kind == "card_exp_year":

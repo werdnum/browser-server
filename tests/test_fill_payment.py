@@ -152,6 +152,14 @@ def test_select_option_matching_and_input_formatting():
     assert _match_select_option("card_exp_month", month_opts_num, "04", 4, 2031) == "4"
     month_opts_name = [{"value": "apr", "label": "April"}]
     assert _match_select_option("card_exp_month", month_opts_name, "04", 4, 2031) == "apr"
+    month_opts_zero_indexed = [
+        {"value": "0", "label": "January"},
+        {"value": "3", "label": "April"},
+        {"value": "4", "label": "May"},
+    ]
+    assert _match_select_option("card_exp_month", month_opts_zero_indexed, "04", 4, 2031) == "3"
+    month_opts_mismatched_only = [{"value": "4", "label": "May"}]
+    assert _match_select_option("card_exp_month", month_opts_mismatched_only, "04", 4, 2031) is None
 
     year_opts_4 = [{"value": "2030", "label": "2030"}, {"value": "2031", "label": "2031"}]
     assert _match_select_option("card_exp_year", year_opts_4, "2031", 4, 2031) == "2031"
