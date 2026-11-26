@@ -164,23 +164,32 @@ async def test_real_browser_native_blink_webmcp_register_discover_call_and_navig
         assert add_tool["input_schema"]["required"] == ["sku"]
 
         # Invoke native tool (automatically adapts Chromium 151 string args vs Chrome 155+ object args!)
-        res = await worker.webmcp_call("add_to_cart", {"sku": "BOOK-42"}, timeout_seconds=5.0)
+        res = await worker.webmcp_call("add_to_cart", {"sku": "BOOK-42"}, expected_origin=SHOP, timeout_seconds=5.0)
         assert res["status"] == "ok", res
         assert res["navigated"] is False
         assert res["result"]["cart"] == ["BOOK-42"]
 
+        # Origin mismatch is refused without executing the tool
+        wrong_origin = await worker.webmcp_call(
+            "add_to_cart", {"sku": "EVIL"}, expected_origin=EVIL, timeout_seconds=5.0
+        )
+        assert wrong_origin["status"] == "refused"
+        assert wrong_origin["reason"] == "wrong_origin"
+
         # Unknown tool -> tool_not_found
-        missing = await worker.webmcp_call("no_such_tool", {}, timeout_seconds=5.0)
+        missing = await worker.webmcp_call("no_such_tool", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert missing["status"] == "error"
         assert missing["reason"] == "tool_not_found"
 
         # Timeout on hanging handler
-        to_res = await worker.webmcp_call("hang_tool", {}, timeout_seconds=1.0)
+        to_res = await worker.webmcp_call("hang_tool", {}, expected_origin=SHOP, timeout_seconds=1.0)
         assert to_res["status"] == "timeout"
         assert to_res["reason"] == "timeout"
 
         # Async post-return navigation (Shopify pattern)
-        nav_res = await worker.webmcp_call("browse_collection", {"slug": "mens"}, timeout_seconds=5.0)
+        nav_res = await worker.webmcp_call(
+            "browse_collection", {"slug": "mens"}, expected_origin=SHOP, timeout_seconds=5.0
+        )
         assert nav_res["status"] == "ok", nav_res
         assert nav_res["navigated"] is True
         assert nav_res["url"] == f"{SHOP}/collections/mens"
@@ -188,7 +197,7 @@ async def test_real_browser_native_blink_webmcp_register_discover_call_and_navig
 
         # Sync navigation mid-call (execution context destroyed)
         await worker.command(AgentCommandRequest(type="navigate", args={"url": f"{SHOP}/"}))
-        sync_nav = await worker.webmcp_call("sync_checkout", {}, timeout_seconds=5.0)
+        sync_nav = await worker.webmcp_call("sync_checkout", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert sync_nav["status"] == "navigated", sync_nav
         assert sync_nav["navigated"] is True
         assert sync_nav["url"] == f"{SHOP}/checkout"
@@ -210,7 +219,7 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         # Plain page with no WebMCP degrades cleanly
         snap_plain = await worker.command(AgentCommandRequest(type="snapshot"))
         assert "webmcp_tools" not in snap_plain
-        unsupported = await worker.webmcp_call("anything", {}, timeout_seconds=5.0)
+        unsupported = await worker.webmcp_call("anything", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert unsupported["status"] == "error"
         assert unsupported["reason"] == "unsupported"
 
@@ -252,10 +261,12 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         snap_155 = await worker.command(AgentCommandRequest(type="snapshot"))
         assert [t["name"] for t in snap_155["webmcp_tools"]] == ["search_catalog"]
         assert snap_155["webmcp_tools"][0]["annotations"] == {"readOnlyHint": True, "consequentialHint": False}
-        res_155 = await worker.webmcp_call("search_catalog", {"q": "wool runner"}, timeout_seconds=5.0)
+        res_155 = await worker.webmcp_call(
+            "search_catalog", {"q": "wool runner"}, expected_origin=SHOP, timeout_seconds=5.0
+        )
         assert res_155["status"] == "ok"
         assert res_155["result"] == {"hits": ["wool runner"]}
-        spoof = await worker.webmcp_call("cross_origin_spoof", {}, timeout_seconds=5.0)
+        spoof = await worker.webmcp_call("cross_origin_spoof", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert spoof["status"] == "error"
         assert spoof["reason"] == "tool_not_found"
 
@@ -292,7 +303,7 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
             "type": "object",
             "properties": {"limit": {"type": "integer"}},
         }
-        res_151 = await worker.webmcp_call("list_books", {"limit": 1}, timeout_seconds=5.0)
+        res_151 = await worker.webmcp_call("list_books", {"limit": 1}, expected_origin=SHOP, timeout_seconds=5.0)
         assert res_151["status"] == "ok"
         assert res_151["result"] == {"books": ["A"]}
 
@@ -351,25 +362,25 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert len(raw_from_page[0]["description"]) == WEBMCP_MAX_DESCRIPTION_CHARS
         assert raw_from_page[0]["input_schema"] == {"_truncated": True}
 
-        big_out = await worker.webmcp_call("tool_0", {}, timeout_seconds=5.0)
+        big_out = await worker.webmcp_call("tool_0", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert big_out["status"] == "ok"
         assert big_out["truncated"] is True
         assert len(big_out["result"].encode("utf-8")) <= WEBMCP_MAX_RESULT_BYTES
 
-        nan_out = await worker.webmcp_call("tool_1", {}, timeout_seconds=5.0)
+        nan_out = await worker.webmcp_call("tool_1", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert nan_out["status"] == "ok"
         assert nan_out["result"] is None
 
-        inf_out = await worker.webmcp_call("tool_2", {}, timeout_seconds=5.0)
+        inf_out = await worker.webmcp_call("tool_2", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert inf_out["status"] == "ok"
         assert inf_out["result"] is None
 
-        err_out = await worker.webmcp_call("tool_3", {}, timeout_seconds=5.0)
+        err_out = await worker.webmcp_call("tool_3", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert err_out["status"] == "error"
         assert err_out["reason"] == "tool_error"
         assert len(err_out["detail"]) <= WEBMCP_MAX_DETAIL_CHARS
 
-        abort_out = await worker.webmcp_call("tool_4", {}, timeout_seconds=0.3)
+        abort_out = await worker.webmcp_call("tool_4", {}, expected_origin=SHOP, timeout_seconds=0.3)
         assert abort_out["status"] == "timeout"
         assert abort_out["reason"] == "timeout"
         assert await worker._page.evaluate("() => window.__webmcpAborted") is True
@@ -406,7 +417,7 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert await worker._page.evaluate(WEBMCP_LIST_JS) == []
         assert await worker._page.evaluate("() => window.__webmcpInspected") == WEBMCP_MAX_INSPECTED_TOOLS
         await worker._page.evaluate("() => { window.__webmcpInspected = 0; }")
-        past_cap = await worker.webmcp_call("past_cap", {}, timeout_seconds=5.0)
+        past_cap = await worker.webmcp_call("past_cap", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert past_cap["status"] == "error"
         assert past_cap["reason"] == "tool_not_found"
         assert await worker._page.evaluate("() => window.__webmcpInspected") == WEBMCP_MAX_INSPECTED_TOOLS
@@ -467,11 +478,11 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         schema_reads = await worker._page.evaluate("() => window.__webmcpSchemaReads")
         assert 0 < schema_reads < 100
 
-        spoof_sentinel = await worker.webmcp_call("sentinel_spoof", {}, timeout_seconds=5.0)
+        spoof_sentinel = await worker.webmcp_call("sentinel_spoof", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert spoof_sentinel["status"] == "ok"
         assert spoof_sentinel["result"] == {"__webmcpTimeout": True, "ok": 1}
 
-        huge_obj_res = await worker.webmcp_call("huge_object", {}, timeout_seconds=5.0)
+        huge_obj_res = await worker.webmcp_call("huge_object", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert huge_obj_res["status"] == "ok"
         assert huge_obj_res["truncated"] is True
         assert isinstance(huge_obj_res["result"], str)
@@ -492,7 +503,7 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
             }"""
         )
         assert await worker._page.evaluate(WEBMCP_LIST_JS) == []
-        gt_err = await worker.webmcp_call("anything", {}, timeout_seconds=5.0)
+        gt_err = await worker.webmcp_call("anything", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert gt_err["status"] == "error"
         assert gt_err["reason"] == "tool_error"
         assert len(gt_err["detail"]) <= WEBMCP_MAX_DETAIL_CHARS
@@ -527,7 +538,7 @@ async def test_real_browser_webmcp_confined_off_scope_navigation_blocked():
         if not has_native:
             pytest.skip("This Chromium build does not expose native document.modelContext under WebMCPTesting")
 
-        res = await worker.webmcp_call("escape", {}, timeout_seconds=5.0)
+        res = await worker.webmcp_call("escape", {}, expected_origin=SHOP, timeout_seconds=5.0)
         assert res["status"] == "refused", res
         assert res["reason"] == "off_scope_blocked"
         assert res["target_origin"] == EVIL

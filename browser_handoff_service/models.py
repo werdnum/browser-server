@@ -461,11 +461,13 @@ WebMCPCallReason = Literal[
     "timeout",
     "off_scope_blocked",
     "arguments_too_large",
+    "wrong_origin",
 ]
 
 
 class WebMCPCallRequest(BaseModel):
     tool_name: str = Field(min_length=1, max_length=128)
+    expected_origin: BoundedOriginStr
     arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = Field(default=15.0, ge=1.0, le=30.0)
 

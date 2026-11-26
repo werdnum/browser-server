@@ -59,7 +59,7 @@ from .models import (
 from .runtime import BrowserRuntime, RuntimeUnavailable, StorageTooLarge, make_worker
 from .security import hash_token, mint_token, redact_url
 from .transitions import transition
-from .webmcp import WEBMCP_MAX_ARGS_BYTES
+from .webmcp import WEBMCP_MAX_ARGS_BYTES, is_webmcp_eligible_origin
 
 logger = logging.getLogger(__name__)
 
@@ -1157,6 +1157,17 @@ class SessionRegistry:
                 raise AuthorizationError("WebMCP calls are denied unless the agent owns the lease")
             await self._enforce_jar_not_revoked_locked(session)
 
+            expected_origin = normalize_origin(req.expected_origin)
+            if expected_origin is None or not is_webmcp_eligible_origin(expected_origin):
+                return WebMCPCallResponse(
+                    status="refused",
+                    tool_name=req.tool_name,
+                    reason="wrong_origin",
+                    detail="expected_origin is not a valid WebMCP-eligible origin",
+                    url=session.current_url_redacted,
+                    title=session.current_title_redacted,
+                )
+
             encoded_args = json.dumps(req.arguments, ensure_ascii=False).encode("utf-8")
             if len(encoded_args) > WEBMCP_MAX_ARGS_BYTES:
                 return WebMCPCallResponse(
@@ -1176,7 +1187,12 @@ class SessionRegistry:
                 self._event(session, "worker_failed", "service", metadata={"reason": "missing_worker"})
                 raise ConflictError("worker is not available")
 
-            raw = await worker.webmcp_call(req.tool_name, req.arguments, timeout_seconds=req.timeout_seconds)
+            raw = await worker.webmcp_call(
+                req.tool_name,
+                req.arguments,
+                expected_origin=expected_origin,
+                timeout_seconds=req.timeout_seconds,
+            )
             reason_raw = raw.get("reason")
             reason: WebMCPCallReason | None = (
                 cast(WebMCPCallReason, reason_raw)
@@ -1188,6 +1204,7 @@ class SessionRegistry:
                     "timeout",
                     "off_scope_blocked",
                     "arguments_too_large",
+                    "wrong_origin",
                 }
                 else None
             )

@@ -260,7 +260,11 @@ async def test_http_webmcp_call_success_navigation_and_events(monkeypatch):
         res = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "get_cart", "arguments": {"currency": "AUD"}},
+            json={
+                "tool_name": "get_cart",
+                "expected_origin": "https://shop.example.com",
+                "arguments": {"currency": "AUD"},
+            },
         )
         assert res.status_code == 200, res.text
         body = res.json()
@@ -273,7 +277,11 @@ async def test_http_webmcp_call_success_navigation_and_events(monkeypatch):
         nav_res = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "proceed_to_checkout", "arguments": {}},
+            json={
+                "tool_name": "proceed_to_checkout",
+                "expected_origin": "https://shop.example.com",
+                "arguments": {},
+            },
         )
         assert nav_res.status_code == 200, nav_res.text
         nav_body = nav_res.json()
@@ -313,11 +321,38 @@ async def test_http_webmcp_call_errors_timeouts_and_arg_cap(monkeypatch):
             json={"type": "navigate", "args": {"url": "https://shop.example.com/"}},
         )
 
+        # Missing expected_origin fails request validation (422)
+        r_no_origin = await client.post(
+            f"/v1/sessions/{session_id}/webmcp-call",
+            headers=_headers(),
+            json={"tool_name": "missing"},
+        )
+        assert r_no_origin.status_code == 422
+
+        # Non-eligible or mismatched expected_origin is refused with wrong_origin
+        r_bad_origin = await client.post(
+            f"/v1/sessions/{session_id}/webmcp-call",
+            headers=_headers(),
+            json={"tool_name": "missing", "expected_origin": "http://shop.example.com"},
+        )
+        assert r_bad_origin.status_code == 200
+        assert r_bad_origin.json()["status"] == "refused"
+        assert r_bad_origin.json()["reason"] == "wrong_origin"
+
+        r_wrong_origin = await client.post(
+            f"/v1/sessions/{session_id}/webmcp-call",
+            headers=_headers(),
+            json={"tool_name": "missing", "expected_origin": "https://other.example.com"},
+        )
+        assert r_wrong_origin.status_code == 200
+        assert r_wrong_origin.json()["status"] == "refused"
+        assert r_wrong_origin.json()["reason"] == "wrong_origin"
+
         # Unsupported when no tools registered
         r = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "missing"},
+            json={"tool_name": "missing", "expected_origin": "https://shop.example.com"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "error"
@@ -340,7 +375,7 @@ async def test_http_webmcp_call_errors_timeouts_and_arg_cap(monkeypatch):
         r_missing = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "other_tool"},
+            json={"tool_name": "other_tool", "expected_origin": "https://shop.example.com"},
         )
         assert r_missing.json()["status"] == "error"
         assert r_missing.json()["reason"] == "tool_not_found"
@@ -349,7 +384,7 @@ async def test_http_webmcp_call_errors_timeouts_and_arg_cap(monkeypatch):
         r_err = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "broken_tool"},
+            json={"tool_name": "broken_tool", "expected_origin": "https://shop.example.com"},
         )
         assert r_err.json()["status"] == "error"
         assert r_err.json()["reason"] == "tool_error"
@@ -359,7 +394,7 @@ async def test_http_webmcp_call_errors_timeouts_and_arg_cap(monkeypatch):
         r_to = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "slow_tool", "timeout_seconds": 1.0},
+            json={"tool_name": "slow_tool", "expected_origin": "https://shop.example.com", "timeout_seconds": 1.0},
         )
         assert r_to.json()["status"] == "timeout"
         assert r_to.json()["reason"] == "timeout"
@@ -368,7 +403,11 @@ async def test_http_webmcp_call_errors_timeouts_and_arg_cap(monkeypatch):
         r_big = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "broken_tool", "arguments": {"blob": "x" * (WEBMCP_MAX_ARGS_BYTES + 100)}},
+            json={
+                "tool_name": "broken_tool",
+                "expected_origin": "https://shop.example.com",
+                "arguments": {"blob": "x" * (WEBMCP_MAX_ARGS_BYTES + 100)},
+            },
         )
         assert r_big.status_code == 200
         assert r_big.json()["status"] == "refused"
@@ -426,7 +465,11 @@ async def test_http_webmcp_call_allowed_in_authenticated_site_and_readback_prote
         ok_res = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "add_to_cart", "arguments": {"sku": "SHOE-10"}},
+            json={
+                "tool_name": "add_to_cart",
+                "expected_origin": "https://shop.example.com",
+                "arguments": {"sku": "SHOE-10"},
+            },
         )
         assert ok_res.status_code == 200
         assert ok_res.json()["status"] == "ok"
@@ -436,7 +479,7 @@ async def test_http_webmcp_call_allowed_in_authenticated_site_and_readback_prote
         blocked = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "off_scope_nav"},
+            json={"tool_name": "off_scope_nav", "expected_origin": "https://shop.example.com"},
         )
         assert blocked.status_code == 200
         assert blocked.json()["status"] == "refused"
@@ -451,7 +494,10 @@ async def test_http_webmcp_call_denied_during_human_handoff_and_after_close(monk
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         # Unauthorized without service token
-        unauth = await client.post("/v1/sessions/bs_none/webmcp-call", json={"tool_name": "get_cart"})
+        unauth = await client.post(
+            "/v1/sessions/bs_none/webmcp-call",
+            json={"tool_name": "get_cart", "expected_origin": "https://shop.example.com"},
+        )
         assert unauth.status_code in {401, 403}
 
         created = await client.post("/v1/sessions", headers=_headers(), json={"conversation_id": "conv_handoff"})
@@ -467,7 +513,7 @@ async def test_http_webmcp_call_denied_during_human_handoff_and_after_close(monk
         denied = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "get_cart"},
+            json={"tool_name": "get_cart", "expected_origin": "https://shop.example.com"},
         )
         assert denied.status_code == 403
 
@@ -477,7 +523,7 @@ async def test_http_webmcp_call_denied_during_human_handoff_and_after_close(monk
         gone = await client.post(
             f"/v1/sessions/{session_id}/webmcp-call",
             headers=_headers(),
-            json={"tool_name": "get_cart"},
+            json={"tool_name": "get_cart", "expected_origin": "https://shop.example.com"},
         )
         assert gone.status_code == 410
 
@@ -504,10 +550,19 @@ async def test_playwright_worker_webmcp_call_context_destroyed_and_off_scope():
             return None
 
     worker._page = _NavStubPage()
-    res = await worker.webmcp_call("begin_checkout", {}, timeout_seconds=5.0)
+    res = await worker.webmcp_call(
+        "begin_checkout", {}, expected_origin="https://shop.example.com", timeout_seconds=5.0
+    )
     assert res["status"] == "navigated"
     assert res["navigated"] is True
     assert res["url"] == "https://shop.example.com/checkout"
+
+    # Origin mismatch is refused without evaluating
+    wrong = await worker.webmcp_call(
+        "begin_checkout", {}, expected_origin="https://other.example.com", timeout_seconds=5.0
+    )
+    assert wrong["status"] == "refused"
+    assert wrong["reason"] == "wrong_origin"
 
     # Off-scope abort during tool call surfaces refused(off_scope_blocked)
     class _OffScopeStubPage(_NavStubPage):
@@ -516,7 +571,9 @@ async def test_playwright_worker_webmcp_call_context_destroyed_and_off_scope():
             raise PlaywrightError("net::ERR_ABORTED")
 
     worker._page = _OffScopeStubPage()
-    blocked = await worker.webmcp_call("begin_checkout", {}, timeout_seconds=5.0)
+    blocked = await worker.webmcp_call(
+        "begin_checkout", {}, expected_origin="https://shop.example.com", timeout_seconds=5.0
+    )
     assert blocked["status"] == "refused"
     assert blocked["reason"] == "off_scope_blocked"
     assert blocked["target_origin"] == "https://idp.example.com"
@@ -533,7 +590,9 @@ async def test_playwright_worker_webmcp_call_context_destroyed_and_off_scope():
 
     worker._page = _WedgedStubPage()
     worker._nav_off_scope_block = None
-    timed_out = await worker.webmcp_call("stuck_tool", {}, timeout_seconds=0.05)
+    timed_out = await worker.webmcp_call(
+        "stuck_tool", {}, expected_origin="https://shop.example.com", timeout_seconds=0.05
+    )
     assert timed_out["status"] == "timeout"
     assert timed_out["reason"] == "timeout"
     assert timed_out["title"] == ""

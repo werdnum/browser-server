@@ -233,8 +233,9 @@ async () => {
 }
 """
 
-# ``({ toolName, arguments, timeoutMs }) => { ok, result?, truncated?, reason?, detail?, url }``:
-# looks up a same-origin tool by name and invokes ``document.modelContext.executeTool``.
+# ``({ toolName, arguments, expectedOrigin, timeoutMs }) => { ok, result?, truncated?, reason?, detail?, url }``:
+# looks up a same-origin tool by name and invokes ``document.modelContext.executeTool``
+# only when the live document origin matches ``expectedOrigin``.
 # Feature-detects Chromium 151's string-serialized ``executeTool(tool, jsonString)``
 # contract versus Chrome 155+'s object contract via ``typeof tool.inputSchema === 'string'``.
 # Passes an ``AbortController.signal`` via ``executeTool``'s third options argument and
@@ -243,7 +244,7 @@ async () => {
 # Bounds result payloads and error strings inside the page context before crossing CDP
 # and normalizes non-finite numbers (NaN/Infinity) to ``null`` so JSON serialization never fails.
 WEBMCP_CALL_JS = r"""
-async ({ toolName, arguments: argsObj, timeoutMs }) => {
+async ({ toolName, arguments: argsObj, expectedOrigin, timeoutMs }) => {
   const MAX_INSPECTED = 256;
   const MAX_RESULT_BYTES = 65536;
   const MAX_DETAIL_CHARS = 1000;
@@ -345,6 +346,14 @@ async ({ toolName, arguments: argsObj, timeoutMs }) => {
     visit(root, 0);
     return { json: chunks.join(''), truncated };
   };
+  if (typeof expectedOrigin !== 'string' || !expectedOrigin || location.origin !== expectedOrigin) {
+    return {
+      ok: false,
+      reason: 'wrong_origin',
+      detail: `current document origin (${location.origin}) does not match expected origin (${expectedOrigin})`,
+      url: location.href,
+    };
+  }
   const mc = document.modelContext;
   if (!mc || typeof mc.getTools !== 'function' || typeof mc.executeTool !== 'function') {
     return {
@@ -396,6 +405,14 @@ async ({ toolName, arguments: argsObj, timeoutMs }) => {
     }
     if (timedOut || raw === TIMEOUT_SENTINEL) {
       return timeoutResult();
+    }
+    if (location.origin !== expectedOrigin) {
+      return {
+        ok: false,
+        reason: 'wrong_origin',
+        detail: `current document origin (${location.origin}) does not match expected origin (${expectedOrigin})`,
+        url: location.href,
+      };
     }
     if (!Array.isArray(raw)) {
       return {

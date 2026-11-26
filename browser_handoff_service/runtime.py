@@ -1493,7 +1493,7 @@ class BrowserRuntime(Protocol):
         exp_year: int,
     ) -> dict[str, Any]: ...
     async def webmcp_call(
-        self, tool_name: str, arguments: dict[str, Any], *, timeout_seconds: float
+        self, tool_name: str, arguments: dict[str, Any], *, expected_origin: str, timeout_seconds: float
     ) -> dict[str, Any]: ...
 
 
@@ -2043,12 +2043,24 @@ class FakeBrowserWorker:
             )
         return {"ok": True, "filled": filled}
 
-    async def webmcp_call(self, tool_name: str, arguments: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
+    async def webmcp_call(
+        self, tool_name: str, arguments: dict[str, Any], *, expected_origin: str, timeout_seconds: float
+    ) -> dict[str, Any]:
         from inspect import isawaitable
 
         if self.closed:
             raise RuntimeError("worker is closed")
         page_origin = origin_of(self.url)
+        norm_expected = origin_of(expected_origin)
+        if norm_expected is None or page_origin != norm_expected:
+            return {
+                "status": "refused",
+                "tool_name": tool_name,
+                "reason": "wrong_origin",
+                "detail": f"current document origin ({page_origin}) does not match expected origin ({expected_origin})",
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+            }
         tools = sanitize_webmcp_tools(self.webmcp_tools, page_origin)
         if not tools and self.webmcp_handler is None:
             return {
@@ -2921,7 +2933,9 @@ class PlaywrightBrowserWorker:
             return []
         return sanitize_webmcp_tools(raw, page_origin)
 
-    async def webmcp_call(self, tool_name: str, arguments: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
+    async def webmcp_call(
+        self, tool_name: str, arguments: dict[str, Any], *, expected_origin: str, timeout_seconds: float
+    ) -> dict[str, Any]:
         """Invoke a same-origin WebMCP tool via ``document.modelContext.executeTool``."""
         from patchright.async_api import Error as PlaywrightError
         from patchright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -2929,6 +2943,18 @@ class PlaywrightBrowserWorker:
         page = self._page
         if self.closed or page is None:
             raise RuntimeError("worker is closed")
+
+        norm_expected = origin_of(expected_origin)
+        current_origin = origin_of(page.url)
+        if norm_expected is None or current_origin != norm_expected:
+            return {
+                "status": "refused",
+                "tool_name": tool_name,
+                "reason": "wrong_origin",
+                "detail": f"current document origin ({current_origin}) does not match expected origin ({expected_origin})",
+                "url": redact_url(page.url)[0],
+                "title": await self._safe_title(page),
+            }
 
         url_before = page.url
         self._nav_off_scope_block = None
@@ -2959,6 +2985,7 @@ class PlaywrightBrowserWorker:
                             {
                                 "toolName": tool_name,
                                 "arguments": arguments,
+                                "expectedOrigin": norm_expected,
                                 "timeoutMs": int(timeout_seconds * 1000),
                             },
                         ),
@@ -3055,7 +3082,7 @@ class PlaywrightBrowserWorker:
                         "target_origin": self._nav_off_scope_block,
                     }
                 reason = str(raw_res.get("reason") or "tool_error") if isinstance(raw_res, dict) else "tool_error"
-                if reason not in {"unsupported", "tool_not_found", "tool_error", "timeout"}:
+                if reason not in {"unsupported", "tool_not_found", "tool_error", "timeout", "wrong_origin"}:
                     reason = "tool_error"
                 detail_raw = (
                     str(raw_res.get("detail") or "WebMCP tool call failed")
@@ -3068,7 +3095,7 @@ class PlaywrightBrowserWorker:
                     else detail_raw[: WEBMCP_MAX_DETAIL_CHARS - 1] + "…"
                 )
                 return {
-                    "status": "timeout" if reason == "timeout" else "error",
+                    "status": "timeout" if reason == "timeout" else "refused" if reason == "wrong_origin" else "error",
                     "tool_name": tool_name,
                     "reason": reason,
                     "detail": detail,
