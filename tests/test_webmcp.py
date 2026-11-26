@@ -153,6 +153,15 @@ def test_bound_webmcp_result_parses_json_envelope_and_truncates():
     assert isinstance(cut_obj, str)
     assert len(cut_obj.encode("utf-8")) <= WEBMCP_MAX_RESULT_BYTES
 
+    # Non-finite floats (NaN/Infinity/-Infinity) normalize to JSON-safe None
+    for bad_num in (float("nan"), float("inf"), float("-inf")):
+        val, truncated = bound_webmcp_result(bad_num)
+        assert val is None
+        assert truncated is False
+    nested, truncated = bound_webmcp_result({"score": float("nan"), "items": [1.5, float("inf")]})
+    assert nested == {"score": None, "items": [1.5, None]}
+    assert truncated is False
+
 
 # --- FakeBrowserWorker & HTTP endpoint tests ------------------------------
 

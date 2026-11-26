@@ -295,6 +295,68 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         res_151 = await worker.webmcp_call("list_books", {"limit": 1}, timeout_seconds=5.0)
         assert res_151["status"] == "ok"
         assert res_151["result"] == {"books": ["A"]}
+
+        # 3) Verify in-page discovery bounds, in-page output/error bounds, and NaN/Infinity handling
+        await worker._page.evaluate(
+            """() => {
+              const hugeTools = [];
+              for (let i = 0; i < 60; i++) {
+                hugeTools.push({
+                  name: 'tool_' + i,
+                  title: 'T'.repeat(500),
+                  description: 'D'.repeat(2000),
+                  inputSchema: { type: 'object', properties: { p: { description: 'S'.repeat(6000) } } },
+                  origin: location.origin,
+                });
+              }
+              Object.defineProperty(document, 'modelContext', {
+                configurable: true,
+                value: {
+                  async getTools() { return hugeTools; },
+                  async executeTool(tool, input) {
+                    if (tool.name === 'tool_0') return 'X'.repeat(200000);
+                    if (tool.name === 'tool_1') return NaN;
+                    if (tool.name === 'tool_2') return Infinity;
+                    if (tool.name === 'tool_3') throw new Error('E'.repeat(5000));
+                    return { ok: true };
+                  },
+                },
+              });
+            }"""
+        )
+        # Raw WEBMCP_LIST_JS must already enforce bounds BEFORE Python sanitization
+        from browser_handoff_service.webmcp import (
+            WEBMCP_LIST_JS,
+            WEBMCP_MAX_DESCRIPTION_CHARS,
+            WEBMCP_MAX_DETAIL_CHARS,
+            WEBMCP_MAX_RESULT_BYTES,
+            WEBMCP_MAX_TITLE_CHARS,
+            WEBMCP_MAX_TOOLS,
+        )
+
+        raw_from_page = await worker._page.evaluate(WEBMCP_LIST_JS)
+        assert len(raw_from_page) == WEBMCP_MAX_TOOLS
+        assert len(raw_from_page[0]["title"]) == WEBMCP_MAX_TITLE_CHARS
+        assert len(raw_from_page[0]["description"]) == WEBMCP_MAX_DESCRIPTION_CHARS
+        assert raw_from_page[0]["input_schema"] == {"_truncated": True}
+
+        big_out = await worker.webmcp_call("tool_0", {}, timeout_seconds=5.0)
+        assert big_out["status"] == "ok"
+        assert big_out["truncated"] is True
+        assert len(big_out["result"].encode("utf-8")) <= WEBMCP_MAX_RESULT_BYTES
+
+        nan_out = await worker.webmcp_call("tool_1", {}, timeout_seconds=5.0)
+        assert nan_out["status"] == "ok"
+        assert nan_out["result"] is None
+
+        inf_out = await worker.webmcp_call("tool_2", {}, timeout_seconds=5.0)
+        assert inf_out["status"] == "ok"
+        assert inf_out["result"] is None
+
+        err_out = await worker.webmcp_call("tool_3", {}, timeout_seconds=5.0)
+        assert err_out["status"] == "error"
+        assert err_out["reason"] == "tool_error"
+        assert len(err_out["detail"]) <= WEBMCP_MAX_DETAIL_CHARS
     finally:
         await worker.close()
 

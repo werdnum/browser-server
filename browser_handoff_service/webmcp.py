@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 # WebMCP (Web Model Context Protocol) discovery and invocation helpers.
@@ -23,6 +24,7 @@ WEBMCP_MAX_SCHEMA_BYTES = 4096
 WEBMCP_MAX_TOTAL_TOOLS_BYTES = 32 * 1024
 WEBMCP_MAX_ARGS_BYTES = 32 * 1024
 WEBMCP_MAX_RESULT_BYTES = 64 * 1024
+WEBMCP_MAX_DETAIL_CHARS = 1000
 
 WEBMCP_LIST_TIMEOUT_SECONDS = 2.0
 WEBMCP_CALL_DEFAULT_TIMEOUT_SECONDS = 15.0
@@ -48,27 +50,56 @@ def is_webmcp_eligible_origin(origin: str | None) -> bool:
 # ``() => list[dict]``: reads same-origin WebMCP tools from ``document.modelContext``.
 # Feature-detected so browsers/pages without WebMCP return ``[]`` cleanly.
 # Handles both Chromium 151 (where ``inputSchema`` is a JSON string) and Chrome 155+
-# (where ``inputSchema`` is already a parsed object).
+# (where ``inputSchema`` is already a parsed object). Enforces count, per-field,
+# per-schema, and total byte caps inside the page context before crossing the
+# CDP / ``page.evaluate`` boundary.
 WEBMCP_LIST_JS = r"""
 async () => {
   const mc = document.modelContext;
   if (!mc || typeof mc.getTools !== 'function') return [];
   const raw = await mc.getTools();
   if (!Array.isArray(raw)) return [];
+  const MAX_TOOLS = 32;
+  const MAX_NAME = 128;
+  const MAX_TITLE = 200;
+  const MAX_DESC = 600;
+  const MAX_SCHEMA_BYTES = 4096;
+  const MAX_TOTAL_BYTES = 32768;
+  const enc = new TextEncoder();
+  const byteLen = (s) => enc.encode(s).length;
+  const truncStr = (s, max) => (s.length <= max ? s : s.slice(0, max - 1) + '\u2026');
   const pageOrigin = location.origin;
   const out = [];
+  const seen = new Set();
+  let totalBytes = 2;
   for (const tool of raw) {
-    if (!tool || typeof tool.name !== 'string' || !tool.name) continue;
-    if (typeof tool.origin === 'string' && tool.origin && tool.origin !== pageOrigin) continue;
+    if (out.length >= MAX_TOOLS) break;
+    if (!tool || typeof tool.name !== 'string') continue;
+    const name = tool.name.trim();
+    if (!name || name.length > MAX_NAME || seen.has(name)) continue;
+    const toolOrigin = typeof tool.origin === 'string' && tool.origin.trim() ? tool.origin.trim() : pageOrigin;
+    if (pageOrigin && toolOrigin && toolOrigin !== pageOrigin) continue;
     let schema = null;
     if (typeof tool.inputSchema === 'string') {
+      if (byteLen(tool.inputSchema) > MAX_SCHEMA_BYTES) {
+        schema = { _truncated: true };
+      } else {
+        try {
+          const parsed = JSON.parse(tool.inputSchema);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            schema = byteLen(JSON.stringify(parsed)) <= MAX_SCHEMA_BYTES ? parsed : { _truncated: true };
+          }
+        } catch {
+          schema = null;
+        }
+      }
+    } else if (tool.inputSchema && typeof tool.inputSchema === 'object' && !Array.isArray(tool.inputSchema)) {
       try {
-        schema = JSON.parse(tool.inputSchema);
+        const s = JSON.stringify(tool.inputSchema);
+        schema = s && byteLen(s) <= MAX_SCHEMA_BYTES ? JSON.parse(s) : { _truncated: true };
       } catch {
         schema = null;
       }
-    } else if (tool.inputSchema && typeof tool.inputSchema === 'object' && !Array.isArray(tool.inputSchema)) {
-      schema = tool.inputSchema;
     }
     const annotations = {};
     if (tool.annotations && typeof tool.annotations === 'object') {
@@ -78,25 +109,57 @@ async () => {
         }
       }
     }
-    out.push({
-      name: tool.name,
-      title: typeof tool.title === 'string' ? tool.title : '',
-      description: typeof tool.description === 'string' ? tool.description : '',
+    const entry = {
+      name,
+      title: typeof tool.title === 'string' ? truncStr(tool.title.trim(), MAX_TITLE) : '',
+      description: typeof tool.description === 'string' ? truncStr(tool.description.trim(), MAX_DESC) : '',
       input_schema: schema,
       annotations,
-      origin: typeof tool.origin === 'string' && tool.origin ? tool.origin : pageOrigin,
-    });
+      origin: toolOrigin,
+    };
+    const sep = out.length ? 1 : 0;
+    const entryBytes = byteLen(JSON.stringify(entry)) + sep;
+    if (totalBytes + entryBytes > MAX_TOTAL_BYTES) {
+      if (entry.input_schema !== null) {
+        const compact = { ...entry, input_schema: { _truncated: true } };
+        const compactBytes = byteLen(JSON.stringify(compact)) + sep;
+        if (totalBytes + compactBytes <= MAX_TOTAL_BYTES) {
+          out.push(compact);
+          seen.add(name);
+          totalBytes += compactBytes;
+          continue;
+        }
+      }
+      break;
+    }
+    out.push(entry);
+    seen.add(name);
+    totalBytes += entryBytes;
   }
   return out;
 }
 """
 
-# ``({ toolName, arguments }) => { ok, result?, reason?, detail?, url }``:
+# ``({ toolName, arguments }) => { ok, result?, truncated?, reason?, detail?, url }``:
 # looks up a same-origin tool by name and invokes ``document.modelContext.executeTool``.
 # Feature-detects Chromium 151's string-serialized ``executeTool(tool, jsonString)``
 # contract versus Chrome 155+'s object contract via ``typeof tool.inputSchema === 'string'``.
+# Bounds result payloads and error strings inside the page context before crossing CDP
+# and normalizes non-finite numbers (NaN/Infinity) to ``null`` so JSON serialization never fails.
 WEBMCP_CALL_JS = r"""
 async ({ toolName, arguments: argsObj }) => {
+  const MAX_RESULT_BYTES = 65536;
+  const MAX_DETAIL_CHARS = 1000;
+  const enc = new TextEncoder();
+  const truncUtf8 = (s, maxBytes) => {
+    const bytes = enc.encode(s);
+    if (bytes.length <= maxBytes) return { value: s, truncated: false };
+    let end = maxBytes;
+    while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+    const dec = new TextDecoder('utf-8', { fatal: false });
+    return { value: dec.decode(bytes.subarray(0, end)), truncated: true };
+  };
+  const truncDetail = (s) => (s.length <= MAX_DETAIL_CHARS ? s : s.slice(0, MAX_DETAIL_CHARS - 1) + '\u2026');
   const mc = document.modelContext;
   if (!mc || typeof mc.getTools !== 'function' || typeof mc.executeTool !== 'function') {
     return {
@@ -132,23 +195,48 @@ async ({ toolName, arguments: argsObj }) => {
   try {
     const res = await mc.executeTool(tool, callArg);
     let serialized = null;
-    if (res === undefined) {
+    let truncated = false;
+    if (res === undefined || res === null) {
       serialized = null;
-    } else if (typeof res === 'string' || typeof res === 'number' || typeof res === 'boolean' || res === null) {
+    } else if (typeof res === 'boolean') {
       serialized = res;
+    } else if (typeof res === 'number') {
+      serialized = Number.isFinite(res) ? res : null;
+    } else if (typeof res === 'string') {
+      // Slice oversized strings cheaply before UTF-8 encoding to avoid allocating huge buffers.
+      const preSlice = res.length > MAX_RESULT_BYTES ? res.slice(0, MAX_RESULT_BYTES) : res;
+      const cut = truncUtf8(preSlice, MAX_RESULT_BYTES);
+      serialized = cut.value;
+      truncated = cut.truncated || res.length > MAX_RESULT_BYTES;
     } else {
+      let jsonStr;
       try {
-        serialized = JSON.parse(JSON.stringify(res));
+        jsonStr = JSON.stringify(res);
       } catch {
-        serialized = String(res);
+        jsonStr = String(res);
+      }
+      if (typeof jsonStr !== 'string') {
+        serialized = null;
+      } else if (jsonStr.length > MAX_RESULT_BYTES || enc.encode(jsonStr).length > MAX_RESULT_BYTES) {
+        const preSlice = jsonStr.length > MAX_RESULT_BYTES ? jsonStr.slice(0, MAX_RESULT_BYTES) : jsonStr;
+        const cut = truncUtf8(preSlice, MAX_RESULT_BYTES);
+        serialized = cut.value;
+        truncated = true;
+      } else {
+        try {
+          serialized = JSON.parse(jsonStr);
+        } catch {
+          serialized = jsonStr;
+        }
       }
     }
-    return { ok: true, result: serialized, url: location.href };
+    return { ok: true, result: serialized, truncated, url: location.href };
   } catch (err) {
+    const rawDetail = err && typeof err.message === 'string' ? err.message : String(err);
     return {
       ok: false,
       reason: 'tool_error',
-      detail: err && typeof err.message === 'string' ? err.message : String(err),
+      detail: truncDetail(rawDetail),
       url: location.href,
     };
   }
@@ -292,10 +380,29 @@ def bound_webmcp_result(raw: Any, *, max_bytes: int = WEBMCP_MAX_RESULT_BYTES) -
             return value, False
         return _truncate_utf8(value, max_bytes), True
 
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, (bool, int)):
         return value, False
 
-    serialized = json.dumps(value, ensure_ascii=False)
+    if isinstance(value, float):
+        return (value if math.isfinite(value) else None), False
+
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except ValueError:
+        # Replace any nested non-finite floats (NaN/Infinity) with JSON null so
+        # FastAPI response serialization never raises a 500.
+        value = _strip_non_finite(value)
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False)
     if len(serialized.encode("utf-8")) <= max_bytes:
         return value, False
     return _truncate_utf8(serialized, max_bytes), True
+
+
+def _strip_non_finite(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _strip_non_finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_non_finite(v) for v in value]
+    return value

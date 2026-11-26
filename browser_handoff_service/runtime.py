@@ -30,6 +30,7 @@ from .webmcp import (
     WEBMCP_CALL_JS,
     WEBMCP_LIST_JS,
     WEBMCP_LIST_TIMEOUT_SECONDS,
+    WEBMCP_MAX_DETAIL_CHARS,
     bound_webmcp_result,
     is_webmcp_eligible_origin,
     sanitize_webmcp_tools,
@@ -3042,7 +3043,16 @@ class PlaywrightBrowserWorker:
                 reason = str(raw_res.get("reason") or "tool_error") if isinstance(raw_res, dict) else "tool_error"
                 if reason not in {"unsupported", "tool_not_found", "tool_error"}:
                     reason = "tool_error"
-                detail = str(raw_res.get("detail") or "WebMCP tool call failed") if isinstance(raw_res, dict) else None
+                detail_raw = (
+                    str(raw_res.get("detail") or "WebMCP tool call failed")
+                    if isinstance(raw_res, dict)
+                    else "WebMCP tool call failed"
+                )
+                detail = (
+                    detail_raw
+                    if len(detail_raw) <= WEBMCP_MAX_DETAIL_CHARS
+                    else detail_raw[: WEBMCP_MAX_DETAIL_CHARS - 1] + "…"
+                )
                 return {
                     "status": "error",
                     "tool_name": tool_name,
@@ -3081,12 +3091,12 @@ class PlaywrightBrowserWorker:
                     "target_origin": self._nav_off_scope_block,
                 }
 
-            bounded, truncated = bound_webmcp_result(raw_res.get("result"))
+            bounded, py_truncated = bound_webmcp_result(raw_res.get("result"))
             return {
                 "status": "ok",
                 "tool_name": tool_name,
                 "result": bounded,
-                "truncated": truncated,
+                "truncated": bool(raw_res.get("truncated")) or py_truncated,
                 "navigated": nav_seen or page.url != url_before,
                 "url": redact_url(page.url)[0],
                 "title": await self._safe_title(page),
