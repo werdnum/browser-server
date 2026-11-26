@@ -521,6 +521,23 @@ async def test_playwright_worker_webmcp_call_context_destroyed_and_off_scope():
     assert blocked["reason"] == "off_scope_blocked"
     assert blocked["target_origin"] == "https://idp.example.com"
 
+    # Outer timeout backstop must NOT call page.title() against a wedged renderer
+    class _WedgedStubPage:
+        url = "https://shop.example.com/stuck"
+
+        async def evaluate(self, _script: str, _arg: Any = None) -> Any:
+            await asyncio.sleep(5.0)
+
+        async def title(self) -> str:
+            raise AssertionError("must not read title from timed-out renderer")
+
+    worker._page = _WedgedStubPage()
+    worker._nav_off_scope_block = None
+    timed_out = await worker.webmcp_call("stuck_tool", {}, timeout_seconds=0.05)
+    assert timed_out["status"] == "timeout"
+    assert timed_out["reason"] == "timeout"
+    assert timed_out["title"] == ""
+
 
 @pytest.mark.asyncio
 async def test_playwright_worker_list_webmcp_swallows_errors():

@@ -2975,7 +2975,7 @@ class PlaywrightBrowserWorker:
                         "reason": "off_scope_blocked",
                         "detail": "tool navigation blocked by session origin confinement",
                         "url": redact_url(page.url)[0],
-                        "title": await self._safe_title(page),
+                        "title": "",
                         "target_origin": self._nav_off_scope_block,
                     }
                 return {
@@ -2984,7 +2984,7 @@ class PlaywrightBrowserWorker:
                     "reason": "timeout",
                     "detail": f"WebMCP tool {tool_name!r} timed out after {timeout_seconds:.1f}s",
                     "url": redact_url(page.url)[0],
-                    "title": await self._safe_title(page),
+                    "title": "",
                     "navigated": nav_seen or page.url != url_before,
                 }
             except PlaywrightError as exc:

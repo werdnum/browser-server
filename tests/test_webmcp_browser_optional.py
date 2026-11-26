@@ -411,7 +411,75 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert past_cap["reason"] == "tool_not_found"
         assert await worker._page.evaluate("() => window.__webmcpInspected") == WEBMCP_MAX_INSPECTED_TOOLS
 
-        # 5) getTools() throwing an oversized error must be caught and bounded in-page
+        # 5) Unforgeable timeout sentinel & bounded object serialization (no full JSON.stringify)
+        await worker._page.evaluate(
+            """() => {
+              window.__webmcpArrayReads = 0;
+              window.__webmcpSchemaReads = 0;
+              const hugeSchemaProps = new Proxy({}, {
+                ownKeys() { return Array.from({ length: 5000 }, (_, i) => 'k' + i); },
+                getOwnPropertyDescriptor(_t, prop) {
+                  return { enumerable: true, configurable: true, value: { type: 'string' } };
+                },
+                get(_t, prop) {
+                  if (typeof prop === 'string' && prop.startsWith('k')) window.__webmcpSchemaReads += 1;
+                  return { type: 'string', description: 'D'.repeat(200) };
+                },
+              });
+              const hugeResultArr = new Proxy(new Array(100000), {
+                get(target, prop, receiver) {
+                  if (typeof prop === 'string' && /^\\d+$/.test(prop)) {
+                    window.__webmcpArrayReads += 1;
+                    return { idx: Number(prop), pad: 'P'.repeat(200) };
+                  }
+                  return Reflect.get(target, prop, receiver);
+                },
+              });
+              const tools = [
+                {
+                  name: 'sentinel_spoof',
+                  description: 'Returns a payload containing __webmcpTimeout',
+                  inputSchema: { type: 'object', properties: hugeSchemaProps },
+                  origin: location.origin,
+                },
+                {
+                  name: 'huge_object',
+                  description: 'Returns a giant array',
+                  inputSchema: { type: 'object', properties: {} },
+                  origin: location.origin,
+                },
+              ];
+              Object.defineProperty(document, 'modelContext', {
+                configurable: true,
+                value: {
+                  async getTools() { return tools; },
+                  async executeTool(tool) {
+                    if (tool.name === 'sentinel_spoof') return { __webmcpTimeout: true, ok: 1 };
+                    if (tool.name === 'huge_object') return hugeResultArr;
+                    return null;
+                  },
+                },
+              });
+            }"""
+        )
+        listed_huge_schema = await worker._page.evaluate(WEBMCP_LIST_JS)
+        assert listed_huge_schema[0]["input_schema"] == {"_truncated": True}
+        schema_reads = await worker._page.evaluate("() => window.__webmcpSchemaReads")
+        assert 0 < schema_reads < 100
+
+        spoof_sentinel = await worker.webmcp_call("sentinel_spoof", {}, timeout_seconds=5.0)
+        assert spoof_sentinel["status"] == "ok"
+        assert spoof_sentinel["result"] == {"__webmcpTimeout": True, "ok": 1}
+
+        huge_obj_res = await worker.webmcp_call("huge_object", {}, timeout_seconds=5.0)
+        assert huge_obj_res["status"] == "ok"
+        assert huge_obj_res["truncated"] is True
+        assert isinstance(huge_obj_res["result"], str)
+        assert len(huge_obj_res["result"].encode("utf-8")) <= WEBMCP_MAX_RESULT_BYTES
+        arr_reads = await worker._page.evaluate("() => window.__webmcpArrayReads")
+        assert 0 < arr_reads < 1000
+
+        # 6) getTools() throwing an oversized error must be caught and bounded in-page
         await worker._page.evaluate(
             """() => {
               Object.defineProperty(document, 'modelContext', {
