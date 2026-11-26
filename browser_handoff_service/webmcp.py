@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 from typing import Any
+from urllib.parse import urlsplit
 
 # WebMCP (Web Model Context Protocol) discovery and invocation helpers.
 #
@@ -34,17 +36,28 @@ _ANNOTATION_KEYS = ("readOnlyHint", "consequentialHint", "untrustedContentHint",
 
 
 def is_webmcp_eligible_origin(origin: str | None) -> bool:
-    """Return True for secure-context origins where ``document.modelContext`` can exist.
+    """Return True for potentially trustworthy origins where ``document.modelContext`` can exist.
 
     WebMCP is a ``[SecureContext]`` browser API, so ``about:blank``, ``data:``, and
-    non-loopback plaintext ``http://`` documents can never expose it. Skipping those
-    avoids an extra ``page.evaluate`` round-trip during ``snapshot``.
+    non-loopback plaintext ``http://`` documents can never expose it. Mirrors Chromium's
+    potentially-trustworthy origin check (``https://``, ``localhost`` / ``*.localhost``,
+    and loopback IPs such as ``127.0.0.0/8`` and ``::1``) to avoid an extra
+    ``page.evaluate`` round-trip on ineligible documents.
     """
     if not origin:
         return False
-    if origin.startswith("https://"):
+    parts = urlsplit(origin)
+    if parts.scheme == "https" and parts.hostname:
         return True
-    return origin.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]"))
+    if parts.scheme != "http" or not parts.hostname:
+        return False
+    host = parts.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 # ``() => list[dict]``: reads same-origin WebMCP tools from ``document.modelContext``.

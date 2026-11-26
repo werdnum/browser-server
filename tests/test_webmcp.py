@@ -19,6 +19,7 @@ from browser_handoff_service.webmcp import (
     WEBMCP_MAX_TOOLS,
     WEBMCP_MAX_TOTAL_TOOLS_BYTES,
     bound_webmcp_result,
+    is_webmcp_eligible_origin,
     sanitize_webmcp_tools,
 )
 from httpx import ASGITransport, AsyncClient
@@ -128,6 +129,26 @@ def test_sanitize_truncates_strings_oversized_schemas_and_caps_total():
 def test_sanitize_non_list_returns_empty():
     assert sanitize_webmcp_tools(None, "https://shop.example.com") == []
     assert sanitize_webmcp_tools({"name": "x"}, "https://shop.example.com") == []
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://shop.example.com", True),
+        ("http://localhost:8000", True),
+        ("http://dev.localhost:3000", True),
+        ("http://127.0.0.1:8080", True),
+        ("http://127.0.0.2", True),
+        ("http://[::1]:8000", True),
+        ("http://localhost.evil.com", False),
+        ("http://shop.example.com", False),
+        ("data:text/html,hi", False),
+        ("about:blank", False),
+        (None, False),
+    ],
+)
+def test_is_webmcp_eligible_origin(origin, expected):
+    assert is_webmcp_eligible_origin(origin) is expected
 
 
 def test_bound_webmcp_result_parses_json_envelope_and_truncates():
