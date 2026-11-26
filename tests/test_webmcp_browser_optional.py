@@ -374,7 +374,44 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert abort_out["reason"] == "timeout"
         assert await worker._page.evaluate("() => window.__webmcpAborted") is True
 
-        # 4) getTools() throwing an oversized error must be caught and bounded in-page
+        # 4) getTools() returning thousands of rejected entries must stop at WEBMCP_MAX_INSPECTED_TOOLS
+        await worker._page.evaluate(
+            """() => {
+              window.__webmcpInspected = 0;
+              const arr = new Array(5000);
+              for (let i = 0; i < arr.length; i++) {
+                arr[i] = i === arr.length - 1
+                  ? { name: 'past_cap', description: 'too far', origin: location.origin }
+                  : { name: 'evil_' + i, description: 'cross-origin', origin: 'https://evil.example.net' };
+              }
+              const tracked = new Proxy(arr, {
+                get(target, prop, receiver) {
+                  if (typeof prop === 'string' && /^\\d+$/.test(prop)) {
+                    window.__webmcpInspected += 1;
+                  }
+                  return Reflect.get(target, prop, receiver);
+                },
+              });
+              Object.defineProperty(document, 'modelContext', {
+                configurable: true,
+                value: {
+                  async getTools() { return tracked; },
+                  async executeTool() { return { ok: true }; },
+                },
+              });
+            }"""
+        )
+        from browser_handoff_service.webmcp import WEBMCP_MAX_INSPECTED_TOOLS
+
+        assert await worker._page.evaluate(WEBMCP_LIST_JS) == []
+        assert await worker._page.evaluate("() => window.__webmcpInspected") == WEBMCP_MAX_INSPECTED_TOOLS
+        await worker._page.evaluate("() => { window.__webmcpInspected = 0; }")
+        past_cap = await worker.webmcp_call("past_cap", {}, timeout_seconds=5.0)
+        assert past_cap["status"] == "error"
+        assert past_cap["reason"] == "tool_not_found"
+        assert await worker._page.evaluate("() => window.__webmcpInspected") == WEBMCP_MAX_INSPECTED_TOOLS
+
+        # 5) getTools() throwing an oversized error must be caught and bounded in-page
         await worker._page.evaluate(
             """() => {
               Object.defineProperty(document, 'modelContext', {

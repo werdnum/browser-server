@@ -12,6 +12,7 @@ from browser_handoff_service.runtime import FakeBrowserWorker, PlaywrightBrowser
 from browser_handoff_service.webmcp import (
     WEBMCP_MAX_ARGS_BYTES,
     WEBMCP_MAX_DESCRIPTION_CHARS,
+    WEBMCP_MAX_INSPECTED_TOOLS,
     WEBMCP_MAX_NAME_CHARS,
     WEBMCP_MAX_RESULT_BYTES,
     WEBMCP_MAX_SCHEMA_BYTES,
@@ -116,6 +117,13 @@ def test_sanitize_truncates_strings_oversized_schemas_and_caps_total():
     many = [{"name": f"tool_{i}", "description": f"Tool {i}"} for i in range(WEBMCP_MAX_TOOLS + 10)]
     capped = sanitize_webmcp_tools(many, "https://shop.example.com")
     assert len(capped) == WEBMCP_MAX_TOOLS
+
+    # Rejected descriptors beyond WEBMCP_MAX_INSPECTED_TOOLS stop the scan
+    mostly_invalid = [
+        {"name": f"evil_{i}", "description": "cross-origin", "origin": "https://evil.example.net"}
+        for i in range(WEBMCP_MAX_INSPECTED_TOOLS)
+    ] + [{"name": "after_cap", "description": "past cap", "origin": "https://shop.example.com"}]
+    assert sanitize_webmcp_tools(mostly_invalid, "https://shop.example.com") == []
 
     # Cumulative byte cap across many medium schemas
     medium_schema = {"type": "object", "properties": {"q": {"type": "string", "description": "z" * 3500}}}
