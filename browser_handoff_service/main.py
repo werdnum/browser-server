@@ -54,6 +54,8 @@ from .models import (
     HumanActionRequest,
     SaveJarRequest,
     SessionState,
+    WebMCPCallRequest,
+    WebMCPCallResponse,
     form_factor_profile,
 )
 from .registry import AuthorizationError, ConflictError, NotFoundError, SessionInactiveError, SessionRegistry
@@ -1253,6 +1255,22 @@ async def fill_payment(session_id: str, req: FillPaymentRequest):
     while session/auth/worker infrastructure failures map to HTTP 4xx/5xx."""
     try:
         return await registry.fill_payment(session_id, req)
+    except Exception as exc:
+        raise map_errors(exc) from exc
+
+
+@app.post(
+    "/v1/sessions/{session_id}/webmcp-call",
+    response_model=WebMCPCallResponse,
+    dependencies=[Depends(require_agent_auth)],
+)
+async def webmcp_call(session_id: str, req: WebMCPCallRequest):
+    """Invoke a same-origin WebMCP tool published via ``document.modelContext``.
+
+    Tool-level outcomes (unsupported, not found, error, timeout, off-scope block) return
+    HTTP 200 with a typed status/reason; lease/session/worker failures map to HTTP 4xx/5xx."""
+    try:
+        return await registry.webmcp_call(session_id, req)
     except Exception as exc:
         raise map_errors(exc) from exc
 

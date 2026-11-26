@@ -451,6 +451,38 @@ def payment_fill_refused(reason: PaymentFillRefusal, detail: str, origin: str | 
     return FillPaymentResponse(status="refused", reason=reason, detail=detail, origin=origin)
 
 
+# --- WebMCP ---------------------------------------------------------------
+
+WebMCPCallStatus = Literal["ok", "navigated", "refused", "error", "timeout"]
+WebMCPCallReason = Literal[
+    "unsupported",
+    "tool_not_found",
+    "tool_error",
+    "timeout",
+    "off_scope_blocked",
+    "arguments_too_large",
+]
+
+
+class WebMCPCallRequest(BaseModel):
+    tool_name: str = Field(min_length=1, max_length=128)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=15.0, ge=1.0, le=30.0)
+
+
+class WebMCPCallResponse(BaseModel):
+    status: WebMCPCallStatus
+    tool_name: str
+    result: Any = None
+    truncated: bool = False
+    url: str | None = None
+    title: str | None = None
+    navigated: bool = False
+    reason: WebMCPCallReason | None = None
+    detail: str | None = None
+    target_origin: str | None = None
+
+
 class SessionEvent(BaseModel):
     event_id: str
     session_id: str
