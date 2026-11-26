@@ -47,6 +47,9 @@ from .models import (
     SaveJarRequest,
     SessionEvent,
     SessionState,
+    WebMCPCallReason,
+    WebMCPCallRequest,
+    WebMCPCallResponse,
     autofill_refused,
     form_factor_profile,
     new_session,
@@ -56,6 +59,7 @@ from .models import (
 from .runtime import BrowserRuntime, RuntimeUnavailable, StorageTooLarge, make_worker
 from .security import hash_token, mint_token, redact_url
 from .transitions import transition
+from .webmcp import WEBMCP_MAX_ARGS_BYTES, is_webmcp_eligible_origin
 
 logger = logging.getLogger(__name__)
 
@@ -1132,6 +1136,107 @@ class SessionRegistry:
         if not filled:
             return payment_fill_refused("no_eligible_field", _PAYMENT_FILL_DETAILS["no_eligible_field"], origin=origin)
         return FillPaymentResponse(status="filled", filled=filled, origin=origin)
+
+    # -- WebMCP -------------------------------------------------------------
+
+    async def webmcp_call(self, session_id: str, req: WebMCPCallRequest) -> WebMCPCallResponse:
+        """Invoke a page-declared WebMCP tool on the current main-frame document.
+
+        Allowed even when ``exec``/``extract`` are denied (including ``authenticated_site``
+        and ``readback_protected`` sessions) because it only invokes actions explicitly
+        published by the page via ``document.modelContext`` rather than evaluating
+        arbitrary agent-supplied JS. Still strictly gated on agent lease ownership,
+        jar revocation, origin confinement, and bounded timeouts/payloads.
+        """
+        session = self.get(session_id)
+        async with self.locks[session_id]:
+            self._raise_if_expired(session)
+            if session.state in TERMINAL_STATES:
+                raise SessionInactiveError(f"session is no longer active ({session.state})")
+            if session.state not in AGENT_COMMAND_STATES or session.lease_owner != LeaseOwner.AGENT:
+                raise AuthorizationError("WebMCP calls are denied unless the agent owns the lease")
+            await self._enforce_jar_not_revoked_locked(session)
+
+            expected_origin = normalize_origin(req.expected_origin)
+            if expected_origin is None or not is_webmcp_eligible_origin(expected_origin):
+                return WebMCPCallResponse(
+                    status="refused",
+                    tool_name=req.tool_name,
+                    reason="wrong_origin",
+                    detail="expected_origin is not a valid WebMCP-eligible origin",
+                    url=session.current_url_redacted,
+                    title=session.current_title_redacted,
+                )
+
+            encoded_args = json.dumps(req.arguments, ensure_ascii=False).encode("utf-8")
+            if len(encoded_args) > WEBMCP_MAX_ARGS_BYTES:
+                return WebMCPCallResponse(
+                    status="refused",
+                    tool_name=req.tool_name,
+                    reason="arguments_too_large",
+                    detail=f"arguments exceed {WEBMCP_MAX_ARGS_BYTES} bytes",
+                    url=session.current_url_redacted,
+                    title=session.current_title_redacted,
+                )
+
+            worker = self.workers.get(session.worker_id or "")
+            if worker is None or worker.closed:
+                session.lease_owner = LeaseOwner.NONE
+                session.state = SessionState.FAILED
+                session.updated_at = now_utc()
+                self._event(session, "worker_failed", "service", metadata={"reason": "missing_worker"})
+                raise ConflictError("worker is not available")
+
+            raw = await worker.webmcp_call(
+                req.tool_name,
+                req.arguments,
+                expected_origin=expected_origin,
+                timeout_seconds=req.timeout_seconds,
+            )
+            reason_raw = raw.get("reason")
+            reason: WebMCPCallReason | None = (
+                cast(WebMCPCallReason, reason_raw)
+                if reason_raw
+                in {
+                    "unsupported",
+                    "tool_not_found",
+                    "tool_error",
+                    "timeout",
+                    "off_scope_blocked",
+                    "arguments_too_large",
+                    "wrong_origin",
+                }
+                else None
+            )
+            response = WebMCPCallResponse(
+                status=raw["status"],
+                tool_name=str(raw.get("tool_name") or req.tool_name),
+                result=raw.get("result"),
+                truncated=bool(raw.get("truncated", False)),
+                url=raw.get("url"),
+                title=raw.get("title"),
+                navigated=bool(raw.get("navigated", False)),
+                reason=reason,
+                detail=raw.get("detail"),
+                target_origin=raw.get("target_origin"),
+            )
+            if response.url:
+                self._update_page_metadata(session, {"url": response.url, "title": response.title})
+            session.idle_expires_at = min(now_utc() + timedelta(minutes=15), session.expires_at)
+            session.updated_at = now_utc()
+            self._event(
+                session,
+                "webmcp_call",
+                "agent",
+                metadata={
+                    "tool_name": response.tool_name,
+                    "status": response.status,
+                    "reason": response.reason,
+                    "navigated": response.navigated,
+                    "truncated": response.truncated,
+                },
+            )
+            return response
 
     # -- cookie jars --------------------------------------------------------
     def _require_jars_enabled(self) -> None:

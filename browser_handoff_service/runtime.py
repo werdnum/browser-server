@@ -26,6 +26,15 @@ import httpx
 from .models import AgentCommandRequest
 from .security import redact_url
 from .ucp import UCPDetector
+from .webmcp import (
+    WEBMCP_CALL_JS,
+    WEBMCP_LIST_JS,
+    WEBMCP_LIST_TIMEOUT_SECONDS,
+    WEBMCP_MAX_DETAIL_CHARS,
+    bound_webmcp_result,
+    is_webmcp_eligible_origin,
+    sanitize_webmcp_tools,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1483,6 +1492,9 @@ class BrowserRuntime(Protocol):
         exp_month: int,
         exp_year: int,
     ) -> dict[str, Any]: ...
+    async def webmcp_call(
+        self, tool_name: str, arguments: dict[str, Any], *, expected_origin: str, timeout_seconds: float
+    ) -> dict[str, Any]: ...
 
 
 DEFAULT_DISPLAY_WIDTH = 1280
@@ -1556,6 +1568,10 @@ class FakeBrowserWorker:
         self.payment_filled: list[dict[str, Any]] = []
         self._payment_nonce: str | None = None
         self.on_payment_fill: Callable[[dict[str, Any]], None] | None = None
+        # WebMCP test fixtures: ``webmcp_tools`` are sanitized and returned on snapshot;
+        # ``webmcp_handler`` handles ``webmcp_call(tool_name, arguments)``.
+        self.webmcp_tools: list[dict[str, Any]] = []
+        self.webmcp_handler: Callable[[str, dict[str, Any]], Any] | None = None
 
     async def _ucp_fetch(self, url: str) -> Any:
         return self.ucp_documents.get(url)
@@ -1668,6 +1684,9 @@ class FakeBrowserWorker:
             hint = await self._ucp.snapshot_hint(self.url)
             if hint is not None:
                 result["ucp"] = hint
+            webmcp_tools = sanitize_webmcp_tools(self.webmcp_tools, origin_of(self.url))
+            if webmcp_tools:
+                result["webmcp_tools"] = webmcp_tools
             return result
         if request.type == "screenshot":
             # 1x1 transparent PNG so callers exercising the bytes path get valid image data.
@@ -2023,6 +2042,102 @@ class FakeBrowserWorker:
                 }
             )
         return {"ok": True, "filled": filled}
+
+    async def webmcp_call(
+        self, tool_name: str, arguments: dict[str, Any], *, expected_origin: str, timeout_seconds: float
+    ) -> dict[str, Any]:
+        from inspect import isawaitable
+
+        if self.closed:
+            raise RuntimeError("worker is closed")
+        page_origin = origin_of(self.url)
+        norm_expected = origin_of(expected_origin)
+        if norm_expected is None or page_origin != norm_expected:
+            return {
+                "status": "refused",
+                "tool_name": tool_name,
+                "reason": "wrong_origin",
+                "detail": f"current document origin ({page_origin}) does not match expected origin ({expected_origin})",
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+            }
+        tools = sanitize_webmcp_tools(self.webmcp_tools, page_origin)
+        if not tools and self.webmcp_handler is None:
+            return {
+                "status": "error",
+                "tool_name": tool_name,
+                "reason": "unsupported",
+                "detail": "document.modelContext is not available on this page",
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+            }
+        if not any(tool["name"] == tool_name for tool in tools):
+            return {
+                "status": "error",
+                "tool_name": tool_name,
+                "reason": "tool_not_found",
+                "detail": "tool is not registered on the current document",
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+            }
+        url_before = self.url
+        try:
+            if self.webmcp_handler is not None:
+                outcome = self.webmcp_handler(tool_name, arguments)
+                if isawaitable(outcome):
+                    outcome = await asyncio.wait_for(outcome, timeout=timeout_seconds)
+            else:
+                outcome = {"ok": True, "tool": tool_name, "arguments": arguments}
+        except TimeoutError:
+            return {
+                "status": "timeout",
+                "tool_name": tool_name,
+                "reason": "timeout",
+                "detail": f"WebMCP tool {tool_name!r} timed out after {timeout_seconds:.1f}s",
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "tool_name": tool_name,
+                "reason": "tool_error",
+                "detail": str(exc),
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+            }
+        if self.url and self.url != url_before and self._off_scope(self.url):
+            blocked_origin = origin_of(self.url)
+            self.url = url_before
+            self.last_blocked = {
+                "blocked": True,
+                "reason": "off-scope navigation blocked",
+                "target_origin": blocked_origin,
+            }
+            return {
+                "status": "refused",
+                "tool_name": tool_name,
+                "reason": "off_scope_blocked",
+                "detail": "tool navigation blocked by session origin confinement",
+                "url": redact_url(self.url)[0] if self.url else None,
+                "title": self.title,
+                "target_origin": blocked_origin,
+            }
+        navigated = self.url != url_before
+        if navigated:
+            self._ref = None
+            self._autofill_nonce = None
+            self._payment_nonce = None
+        bounded, truncated = bound_webmcp_result(outcome)
+        return {
+            "status": "ok",
+            "tool_name": tool_name,
+            "result": bounded,
+            "truncated": truncated,
+            "navigated": navigated,
+            "url": redact_url(self.url)[0] if self.url else None,
+            "title": self.title,
+        }
 
     async def close(self) -> None:
         self.closed = True
@@ -2680,6 +2795,10 @@ class PlaywrightBrowserWorker:
             hint = await self._ucp.snapshot_hint(raw_url)
             if hint is not None:
                 result["ucp"] = hint
+            if not result.get("partial"):
+                webmcp_tools = await self._list_webmcp_tools(page, raw_url)
+                if webmcp_tools:
+                    result["webmcp_tools"] = webmcp_tools
             return result
         if request.type == "screenshot":
             url_before = page.url
@@ -2794,6 +2913,241 @@ class PlaywrightBrowserWorker:
         result = cast(dict[str, Any], await page.evaluate(SNAPSHOT_JS, max(next_ref, self._next_ref)))
         self._next_ref = max(self._next_ref, coerce_next_ref(result["next_ref"]))
         return result
+
+    async def _list_webmcp_tools(self, page: Any, raw_url: str) -> list[dict[str, Any]]:
+        """Read and sanitize same-origin WebMCP tools from ``document.modelContext``.
+
+        Best-effort: returns ``[]`` if the browser or page does not expose WebMCP,
+        or if navigation/timeout interrupts the probe, so ``snapshot`` never fails.
+        """
+        page_origin = origin_of(raw_url)
+        if not is_webmcp_eligible_origin(page_origin):
+            return []
+
+        from patchright.async_api import Error as PlaywrightError
+
+        try:
+            async with asyncio.timeout(WEBMCP_LIST_TIMEOUT_SECONDS):
+                raw = await page.evaluate(WEBMCP_LIST_JS)
+        except (PlaywrightError, TimeoutError):
+            return []
+        return sanitize_webmcp_tools(raw, page_origin)
+
+    async def webmcp_call(
+        self, tool_name: str, arguments: dict[str, Any], *, expected_origin: str, timeout_seconds: float
+    ) -> dict[str, Any]:
+        """Invoke a same-origin WebMCP tool via ``document.modelContext.executeTool``."""
+        from patchright.async_api import Error as PlaywrightError
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        page = self._page
+        if self.closed or page is None:
+            raise RuntimeError("worker is closed")
+
+        norm_expected = origin_of(expected_origin)
+        current_origin = origin_of(page.url)
+        if norm_expected is None or current_origin != norm_expected:
+            return {
+                "status": "refused",
+                "tool_name": tool_name,
+                "reason": "wrong_origin",
+                "detail": f"current document origin ({current_origin}) does not match expected origin ({expected_origin})",
+                "url": redact_url(page.url)[0],
+                "title": await self._safe_title(page),
+            }
+
+        url_before = page.url
+        self._nav_off_scope_block = None
+        nav_seen = False
+        nav_event = asyncio.Event()
+        main_frame = getattr(page, "main_frame", None)
+
+        def _on_frame_navigated(frame: Any) -> None:
+            nonlocal nav_seen
+            if main_frame is None or frame == main_frame:
+                nav_seen = True
+                nav_event.set()
+
+        on_fn = getattr(page, "on", None)
+        remove_fn = getattr(page, "remove_listener", None)
+        listener_attached = False
+        if callable(on_fn):
+            on_fn("framenavigated", _on_frame_navigated)
+            listener_attached = True
+
+        try:
+            try:
+                raw_res = cast(
+                    dict[str, Any],
+                    await asyncio.wait_for(
+                        page.evaluate(
+                            WEBMCP_CALL_JS,
+                            {
+                                "toolName": tool_name,
+                                "arguments": arguments,
+                                "expectedOrigin": norm_expected,
+                                "timeoutMs": int(timeout_seconds * 1000),
+                            },
+                        ),
+                        # Retain a server-side backstop slightly past the in-page AbortSignal deadline
+                        # so a wedged page or frozen renderer cannot hold the session lock forever.
+                        timeout=timeout_seconds + 1.0,
+                    ),
+                )
+            except TimeoutError:
+                if self.confine_origins and self._nav_off_scope_block is not None:
+                    return {
+                        "status": "refused",
+                        "tool_name": tool_name,
+                        "reason": "off_scope_blocked",
+                        "detail": "tool navigation blocked by session origin confinement",
+                        "url": redact_url(page.url)[0],
+                        "title": "",
+                        "target_origin": self._nav_off_scope_block,
+                    }
+                return {
+                    "status": "timeout",
+                    "tool_name": tool_name,
+                    "reason": "timeout",
+                    "detail": f"WebMCP tool {tool_name!r} timed out after {timeout_seconds:.1f}s",
+                    "url": redact_url(page.url)[0],
+                    "title": "",
+                    "navigated": nav_seen or page.url != url_before,
+                }
+            except PlaywrightError as exc:
+                if self.confine_origins and self._nav_off_scope_block is not None:
+                    return {
+                        "status": "refused",
+                        "tool_name": tool_name,
+                        "reason": "off_scope_blocked",
+                        "detail": "tool navigation blocked by session origin confinement",
+                        "url": redact_url(page.url)[0],
+                        "title": await self._safe_title(page),
+                        "target_origin": self._nav_off_scope_block,
+                    }
+                msg = str(exc).lower()
+                if "context was destroyed" in msg or "cannot find context" in msg or "frame was detached" in msg:
+                    if not nav_seen and page.url == url_before and listener_attached:
+                        try:
+                            await asyncio.wait_for(nav_event.wait(), timeout=2.0)
+                        except TimeoutError:
+                            pass
+                    wait_load = getattr(page, "wait_for_load_state", None)
+                    if callable(wait_load):
+                        try:
+                            await wait_load("domcontentloaded", timeout=2000)
+                        except (PlaywrightTimeoutError, PlaywrightError):
+                            pass
+                    if self.confine_origins and self._nav_off_scope_block is not None:
+                        return {
+                            "status": "refused",
+                            "tool_name": tool_name,
+                            "reason": "off_scope_blocked",
+                            "detail": "tool navigation blocked by session origin confinement",
+                            "url": redact_url(page.url)[0],
+                            "title": await self._safe_title(page),
+                            "target_origin": self._nav_off_scope_block,
+                        }
+                    return {
+                        "status": "navigated",
+                        "tool_name": tool_name,
+                        "navigated": True,
+                        "url": redact_url(page.url)[0],
+                        "title": await self._safe_title(page),
+                        "detail": "tool execution triggered a page navigation",
+                    }
+                exc_text = str(exc)
+                return {
+                    "status": "error",
+                    "tool_name": tool_name,
+                    "reason": "tool_error",
+                    "detail": (
+                        exc_text
+                        if len(exc_text) <= WEBMCP_MAX_DETAIL_CHARS
+                        else exc_text[: WEBMCP_MAX_DETAIL_CHARS - 1] + "…"
+                    ),
+                    "url": redact_url(page.url)[0],
+                    "title": await self._safe_title(page),
+                }
+
+            if not isinstance(raw_res, dict) or not raw_res.get("ok"):
+                if self.confine_origins and self._nav_off_scope_block is not None:
+                    return {
+                        "status": "refused",
+                        "tool_name": tool_name,
+                        "reason": "off_scope_blocked",
+                        "detail": "tool navigation blocked by session origin confinement",
+                        "url": redact_url(page.url)[0],
+                        "title": await self._safe_title(page),
+                        "target_origin": self._nav_off_scope_block,
+                    }
+                reason = str(raw_res.get("reason") or "tool_error") if isinstance(raw_res, dict) else "tool_error"
+                if reason not in {"unsupported", "tool_not_found", "tool_error", "timeout", "wrong_origin"}:
+                    reason = "tool_error"
+                detail_raw = (
+                    str(raw_res.get("detail") or "WebMCP tool call failed")
+                    if isinstance(raw_res, dict)
+                    else "WebMCP tool call failed"
+                )
+                detail = (
+                    detail_raw
+                    if len(detail_raw) <= WEBMCP_MAX_DETAIL_CHARS
+                    else detail_raw[: WEBMCP_MAX_DETAIL_CHARS - 1] + "…"
+                )
+                return {
+                    "status": "timeout" if reason == "timeout" else "refused" if reason == "wrong_origin" else "error",
+                    "tool_name": tool_name,
+                    "reason": reason,
+                    "detail": detail,
+                    "url": redact_url(page.url)[0],
+                    "title": await self._safe_title(page),
+                    "navigated": nav_seen or page.url != url_before,
+                }
+
+            # Tools such as Shopify's browse_store(navigate=true) resolve their Promise and
+            # schedule navigation asynchronously right after returning; wait briefly while the
+            # navigation listener is still attached so a post-return navigation or confined-origin
+            # abort is observed before returning.
+            if not nav_seen and page.url == url_before:
+                try:
+                    await asyncio.wait_for(nav_event.wait(), timeout=0.35)
+                except TimeoutError:
+                    pass
+            if nav_seen or page.url != url_before:
+                wait_load = getattr(page, "wait_for_load_state", None)
+                if callable(wait_load):
+                    try:
+                        await wait_load("domcontentloaded", timeout=2000)
+                    except (PlaywrightTimeoutError, PlaywrightError):
+                        pass
+
+            if self.confine_origins and self._nav_off_scope_block is not None:
+                return {
+                    "status": "refused",
+                    "tool_name": tool_name,
+                    "reason": "off_scope_blocked",
+                    "detail": "tool navigation blocked by session origin confinement",
+                    "url": redact_url(page.url)[0],
+                    "title": await self._safe_title(page),
+                    "target_origin": self._nav_off_scope_block,
+                }
+
+            bounded, py_truncated = bound_webmcp_result(raw_res.get("result"))
+            return {
+                "status": "ok",
+                "tool_name": tool_name,
+                "result": bounded,
+                "truncated": bool(raw_res.get("truncated")) or py_truncated,
+                "navigated": nav_seen or page.url != url_before,
+                "url": redact_url(page.url)[0],
+                "title": await self._safe_title(page),
+            }
+        finally:
+            if listener_attached and callable(remove_fn):
+                try:
+                    remove_fn("framenavigated", _on_frame_navigated)
+                except Exception:
+                    pass
 
     async def autofill_prepare(self, fields: list[dict[str, Any]] | None, nonce: str) -> dict[str, Any]:
         """Choose the fill targets on the current main-frame document and pin it with ``nonce``.
