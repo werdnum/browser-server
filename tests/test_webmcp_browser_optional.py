@@ -296,9 +296,10 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert res_151["status"] == "ok"
         assert res_151["result"] == {"books": ["A"]}
 
-        # 3) Verify in-page discovery bounds, in-page output/error bounds, and NaN/Infinity handling
+        # 3) Verify in-page discovery bounds, in-page output/error bounds, AbortSignal cancellation, and NaN/Infinity handling
         await worker._page.evaluate(
             """() => {
+              window.__webmcpAborted = false;
               const hugeTools = [];
               for (let i = 0; i < 60; i++) {
                 hugeTools.push({
@@ -313,11 +314,21 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
                 configurable: true,
                 value: {
                   async getTools() { return hugeTools; },
-                  async executeTool(tool, input) {
+                  async executeTool(tool, input, options) {
                     if (tool.name === 'tool_0') return 'X'.repeat(200000);
                     if (tool.name === 'tool_1') return NaN;
                     if (tool.name === 'tool_2') return Infinity;
                     if (tool.name === 'tool_3') throw new Error('E'.repeat(5000));
+                    if (tool.name === 'tool_4') {
+                      return await new Promise((resolve, reject) => {
+                        if (options && options.signal) {
+                          options.signal.addEventListener('abort', () => {
+                            window.__webmcpAborted = true;
+                            reject(new Error('aborted'));
+                          });
+                        }
+                      });
+                    }
                     return { ok: true };
                   },
                 },
@@ -357,6 +368,11 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert err_out["status"] == "error"
         assert err_out["reason"] == "tool_error"
         assert len(err_out["detail"]) <= WEBMCP_MAX_DETAIL_CHARS
+
+        abort_out = await worker.webmcp_call("tool_4", {}, timeout_seconds=0.3)
+        assert abort_out["status"] == "timeout"
+        assert abort_out["reason"] == "timeout"
+        assert await worker._page.evaluate("() => window.__webmcpAborted") is True
     finally:
         await worker.close()
 

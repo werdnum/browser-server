@@ -2954,8 +2954,17 @@ class PlaywrightBrowserWorker:
                 raw_res = cast(
                     dict[str, Any],
                     await asyncio.wait_for(
-                        page.evaluate(WEBMCP_CALL_JS, {"toolName": tool_name, "arguments": arguments}),
-                        timeout=timeout_seconds,
+                        page.evaluate(
+                            WEBMCP_CALL_JS,
+                            {
+                                "toolName": tool_name,
+                                "arguments": arguments,
+                                "timeoutMs": int(timeout_seconds * 1000),
+                            },
+                        ),
+                        # Retain a server-side backstop slightly past the in-page AbortSignal deadline
+                        # so a wedged page or frozen renderer cannot hold the session lock forever.
+                        timeout=timeout_seconds + 1.0,
                     ),
                 )
             except TimeoutError:
@@ -3041,7 +3050,7 @@ class PlaywrightBrowserWorker:
                         "target_origin": self._nav_off_scope_block,
                     }
                 reason = str(raw_res.get("reason") or "tool_error") if isinstance(raw_res, dict) else "tool_error"
-                if reason not in {"unsupported", "tool_not_found", "tool_error"}:
+                if reason not in {"unsupported", "tool_not_found", "tool_error", "timeout"}:
                     reason = "tool_error"
                 detail_raw = (
                     str(raw_res.get("detail") or "WebMCP tool call failed")
@@ -3054,7 +3063,7 @@ class PlaywrightBrowserWorker:
                     else detail_raw[: WEBMCP_MAX_DETAIL_CHARS - 1] + "…"
                 )
                 return {
-                    "status": "error",
+                    "status": "timeout" if reason == "timeout" else "error",
                     "tool_name": tool_name,
                     "reason": reason,
                     "detail": detail,
