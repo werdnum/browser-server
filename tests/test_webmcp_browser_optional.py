@@ -373,6 +373,24 @@ async def test_real_browser_webmcp_both_api_shapes_and_cross_origin_filter():
         assert abort_out["status"] == "timeout"
         assert abort_out["reason"] == "timeout"
         assert await worker._page.evaluate("() => window.__webmcpAborted") is True
+
+        # 4) getTools() throwing an oversized error must be caught and bounded in-page
+        await worker._page.evaluate(
+            """() => {
+              Object.defineProperty(document, 'modelContext', {
+                configurable: true,
+                value: {
+                  async getTools() { throw new Error('G'.repeat(5000)); },
+                  async executeTool() { return null; },
+                },
+              });
+            }"""
+        )
+        assert await worker._page.evaluate(WEBMCP_LIST_JS) == []
+        gt_err = await worker.webmcp_call("anything", {}, timeout_seconds=5.0)
+        assert gt_err["status"] == "error"
+        assert gt_err["reason"] == "tool_error"
+        assert len(gt_err["detail"]) <= WEBMCP_MAX_DETAIL_CHARS
     finally:
         await worker.close()
 

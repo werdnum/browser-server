@@ -3029,11 +3029,16 @@ class PlaywrightBrowserWorker:
                         "title": await self._safe_title(page),
                         "detail": "tool execution triggered a page navigation",
                     }
+                exc_text = str(exc)
                 return {
                     "status": "error",
                     "tool_name": tool_name,
                     "reason": "tool_error",
-                    "detail": str(exc),
+                    "detail": (
+                        exc_text
+                        if len(exc_text) <= WEBMCP_MAX_DETAIL_CHARS
+                        else exc_text[: WEBMCP_MAX_DETAIL_CHARS - 1] + "…"
+                    ),
                     "url": redact_url(page.url)[0],
                     "title": await self._safe_title(page),
                 }

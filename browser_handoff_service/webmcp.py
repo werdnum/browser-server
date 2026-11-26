@@ -30,7 +30,7 @@ WEBMCP_LIST_TIMEOUT_SECONDS = 2.0
 WEBMCP_CALL_DEFAULT_TIMEOUT_SECONDS = 15.0
 WEBMCP_CALL_MAX_TIMEOUT_SECONDS = 30.0
 
-_ANNOTATION_KEYS = ("readOnlyHint", "consequentialHint", "untrustedContentHint")
+_ANNOTATION_KEYS = ("readOnlyHint", "consequentialHint", "untrustedContentHint", "debugging")
 
 
 def is_webmcp_eligible_origin(origin: str | None) -> bool:
@@ -57,7 +57,12 @@ WEBMCP_LIST_JS = r"""
 async () => {
   const mc = document.modelContext;
   if (!mc || typeof mc.getTools !== 'function') return [];
-  const raw = await mc.getTools();
+  let raw;
+  try {
+    raw = await mc.getTools();
+  } catch {
+    return [];
+  }
   if (!Array.isArray(raw)) return [];
   const MAX_TOOLS = 32;
   const MAX_NAME = 128;
@@ -103,7 +108,7 @@ async () => {
     }
     const annotations = {};
     if (tool.annotations && typeof tool.annotations === 'object') {
-      for (const key of ['readOnlyHint', 'consequentialHint', 'untrustedContentHint']) {
+      for (const key of ['readOnlyHint', 'consequentialHint', 'untrustedContentHint', 'debugging']) {
         if (typeof tool.annotations[key] === 'boolean') {
           annotations[key] = tool.annotations[key];
         }
@@ -172,7 +177,18 @@ async ({ toolName, arguments: argsObj, timeoutMs }) => {
       url: location.href,
     };
   }
-  const raw = await mc.getTools();
+  let raw;
+  try {
+    raw = await mc.getTools();
+  } catch (err) {
+    const rawDetail = err && typeof err.message === 'string' ? err.message : String(err);
+    return {
+      ok: false,
+      reason: 'tool_error',
+      detail: truncDetail(rawDetail),
+      url: location.href,
+    };
+  }
   if (!Array.isArray(raw)) {
     return {
       ok: false,

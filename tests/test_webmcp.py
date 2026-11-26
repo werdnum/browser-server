@@ -56,6 +56,7 @@ def test_sanitize_filters_origin_dedups_and_normalizes_schemas():
                 "readOnlyHint": True,
                 "consequentialHint": False,
                 "untrustedContentHint": True,
+                "debugging": True,
                 "evilExtra": "ignored",
             },
             "origin": "https://shop.example.com",
@@ -90,6 +91,7 @@ def test_sanitize_filters_origin_dedups_and_normalizes_schemas():
         "readOnlyHint": True,
         "consequentialHint": False,
         "untrustedContentHint": True,
+        "debugging": True,
     }
     assert tool["origin"] == "https://shop.example.com"
 
