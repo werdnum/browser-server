@@ -651,12 +651,12 @@ def bound_webmcp_result(raw: Any, *, max_bytes: int = WEBMCP_MAX_RESULT_BYTES) -
         return (value if math.isfinite(value) else None), False
 
     try:
-        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except ValueError:
         # Replace any nested non-finite floats (NaN/Infinity) with JSON null so
         # FastAPI response serialization never raises a 500.
         value = _strip_non_finite(value)
-        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     if len(serialized.encode("utf-8")) <= max_bytes:
         return value, False
     return _truncate_utf8(serialized, max_bytes), True

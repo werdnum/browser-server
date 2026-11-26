@@ -184,6 +184,12 @@ def test_bound_webmcp_result_parses_json_envelope_and_truncates():
     assert isinstance(cut_obj, str)
     assert len(cut_obj.encode("utf-8")) <= WEBMCP_MAX_RESULT_BYTES
 
+    # Compact JSON measurement: an array that fits in compact JSON but not with spaces stays structured
+    dense_zeros = [0] * 22000  # 44,001 bytes compact vs 66,000 bytes with default ", " separators
+    dense_val, dense_truncated = bound_webmcp_result(dense_zeros)
+    assert dense_truncated is False
+    assert dense_val == dense_zeros
+
     # Non-finite floats (NaN/Infinity/-Infinity) normalize to JSON-safe None
     for bad_num in (float("nan"), float("inf"), float("-inf")):
         val, truncated = bound_webmcp_result(bad_num)
